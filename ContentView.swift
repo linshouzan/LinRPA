@@ -1,0 +1,264 @@
+//////////////////////////////////////////////////////////////////
+// 文件名：ContentView.swift
+// 文件说明：这是适用于 macos 14+ 的RPA视图管理 (重构瘦身版)
+// 功能说明：加入了左侧边栏的拖拽排序；负责画板拖拽、吸附和连线逻辑；剥离了配置表单。
+// 代码要求：没有要求修改不用输出代码，请保证代码的逻辑和完整性，保留代码中的所有注释内容
+//////////////////////////////////////////////////////////////////
+
+import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
+
+struct ContentView: View {
+    @State private var engine = WorkflowEngine()
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @State private var isRecordingUI = false // 控制录制按钮状态
+    
+    @State private var draggingStartNodeID: UUID? = nil
+    @State private var draggingStartPort: PortPosition? = nil
+    @State private var dragCurrentPosition: CGPoint? = nil
+    @State private var modifyingConnectionID: UUID? = nil
+    
+    @State private var canvasOffset: CGSize = .zero
+    @State private var canvasPan: CGSize = .zero
+    var totalOffset: CGSize { CGSize(width: canvasOffset.width + canvasPan.width, height: canvasOffset.height + canvasPan.height) }
+    
+    @State private var snapLineX: CGFloat? = nil
+    @State private var snapLineY: CGFloat? = nil
+    @State private var hoveredWorkflowId: UUID? = nil
+    
+    let nodeWidth: CGFloat = 145
+    let nodeHeight: CGFloat = 55
+    let snapDistance: CGFloat = 40.0
+    
+    var body: some View {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
+            List(selection: $engine.selectedWorkflowId) {
+                ForEach($engine.workflows) { $workflow in
+                    NavigationLink(value: workflow.id) {
+                        HStack {
+                            TextField("流程名称", text: $workflow.name).textFieldStyle(.plain)
+                            Spacer()
+                            if hoveredWorkflowId == workflow.id {
+                                Button(action: { engine.deleteWorkflow(id: workflow.id) }) { Image(systemName: "trash").foregroundColor(.red).font(.system(size: 13)) }.buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.vertical, 2).contentShape(Rectangle())
+                        .onHover { isHovering in if isHovering { hoveredWorkflowId = workflow.id } else if hoveredWorkflowId == workflow.id { hoveredWorkflowId = nil } }
+                    }
+                }.onMove { indices, newOffset in engine.moveWorkflow(from: indices, to: newOffset) }
+            }
+            .navigationTitle("我的流程").navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 300)
+            .toolbar { ToolbarItem(placement: .primaryAction) { Button(action: engine.createNewWorkflow) { Image(systemName: "plus") } } }
+        } content: {
+            VStack(spacing: 0) {
+                if !engine.hasAccessibilityPermission { HStack { Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.yellow); Text("⚠️ 缺少辅助功能权限：录制和点击事件将被拦截！").font(.subheadline); Spacer(); Button("刷新") { engine.checkPermissions() }.buttonStyle(.borderedProminent).tint(.orange) }.padding(8).background(Color.red.opacity(0.1)) }
+                
+                // [✨新增] 顶部带录制状态的控制栏
+                HStack {
+                    Text("画布视图").font(.headline)
+                    Spacer()
+                    if engine.hasUnsavedChanges { Button(action: { engine.saveChanges() }) { Label("保存", systemImage: "checkmark.circle.fill") }.buttonStyle(.borderedProminent).tint(.green); Divider().frame(height: 16).padding(.horizontal, 4) }
+                    
+                    Button(action: toggleRecording) { Label(isRecordingUI ? "停止录制" : "动作录制", systemImage: isRecordingUI ? "stop.circle.fill" : "record.circle").foregroundColor(isRecordingUI ? .red : .primary) }.buttonStyle(.bordered).symbolEffect(.pulse, isActive: isRecordingUI)
+                    Divider().frame(height: 16).padding(.horizontal, 4)
+                    
+                    if engine.isRunning { Button(action: { engine.isRunning = false }) { Label("紧急停止", systemImage: "stop.fill") }.buttonStyle(.borderedProminent).tint(.red) }
+                    Button(action: { Task { await engine.runCurrentWorkflow() } }) { Label("执行", systemImage: "play.fill") }.buttonStyle(.borderedProminent).disabled(engine.isRunning || engine.selectedWorkflowId == nil || isRecordingUI)
+                }.padding(8).background(Material.bar)
+                
+                // 画板区 (保留了完整的连线、拖拽、吸附逻辑)
+                if let idx = engine.currentWorkflowIndex {
+                    GeometryReader { geo in
+                        ZStack {
+                            GridBackgroundView(offset: totalOffset).contentShape(Rectangle()).gesture(DragGesture().onChanged { value in canvasPan = value.translation }.onEnded { value in canvasOffset.width += value.translation.width; canvasOffset.height += value.translation.height; canvasPan = .zero })
+                            
+                            let currentWorkflow = engine.workflows[idx]
+                            ZStack {
+                                ForEach(currentWorkflow.connections) { conn in
+                                    if conn.id != modifyingConnectionID {
+                                        let startPos = getPortAbsolutePosition(nodeID: conn.startNodeID, port: conn.startPort, in: currentWorkflow)
+                                        let endPos = getPortAbsolutePosition(nodeID: conn.endNodeID, port: conn.endPort, in: currentWorkflow)
+                                        ZStack { ConnectionLine(start: startPos, end: endPos, startPort: conn.startPort, endPort: conn.endPort).stroke(Color.white.opacity(0.001), lineWidth: 30).contextMenu { Button(role: .destructive) { engine.workflows[idx].connections.removeAll { $0.id == conn.id } } label: { Label("删除", systemImage: "trash") } }; ConnectionArrowLine(start: startPos, end: endPos, startPort: conn.startPort, endPort: conn.endPort, condition: conn.condition).allowsHitTesting(false) }
+                                    }
+                                }
+                                
+                                if let startID = draggingStartNodeID, let startPort = draggingStartPort, let currentPos = dragCurrentPosition { let startPos = getPortAbsolutePosition(nodeID: startID, port: startPort, in: currentWorkflow); let guessEndPort = guessEndPortDirection(start: startPos, current: currentPos); let condition = guessConditionForNewConnection(startID: startID, startPort: startPort, in: currentWorkflow); ConnectionArrowLine(start: startPos, end: currentPos, startPort: startPort, endPort: guessEndPort, condition: condition) }
+                                
+                                ForEach($engine.workflows[idx].actions) { $action in
+                                    let position = getPosition(for: action.id, in: currentWorkflow)
+                                    let isStart = !currentWorkflow.connections.contains(where: { $0.endNodeID == action.id })
+                                    let isEnd = !currentWorkflow.connections.contains(where: { $0.startNodeID == action.id })
+                                    
+                                    CanvasNodeCardView(
+                                        action: $action, isCurrent: engine.currentActionId == action.id, isStart: isStart, isEnd: isEnd, isConnecting: draggingStartNodeID != nil, cardWidth: nodeWidth, cardHeight: nodeHeight,
+                                        onStartConnection: { port in draggingStartNodeID = action.id; draggingStartPort = port }, onDragConnection: { port, translation in let portPos = getPortAbsolutePosition(nodeID: action.id, port: port, in: currentWorkflow); dragCurrentPosition = CGPoint(x: portPos.x + translation.width, y: portPos.y + translation.height) }, onEndConnection: { port, dropTranslation in let portPos = getPortAbsolutePosition(nodeID: action.id, port: port, in: currentWorkflow); let globalDropPoint = CGPoint(x: portPos.x + dropTranslation.width, y: portPos.y + dropTranslation.height); handleConnectionDrop(dropLocation: globalDropPoint, startID: draggingStartNodeID, startPort: draggingStartPort, workflow: currentWorkflow); draggingStartNodeID = nil; draggingStartPort = nil; dragCurrentPosition = nil }, onDelete: { engine.removeAction(id: action.id) }
+                                    ).position(position)
+                                    .gesture(
+                                        DragGesture()
+                                            .onChanged { value in
+                                                var newX = value.location.x; var newY = value.location.y; var foundSnapX: CGFloat? = nil; var foundSnapY: CGFloat? = nil
+                                                for other in currentWorkflow.actions where other.id != action.id { let otherPos = getPosition(for: other.id, in: currentWorkflow); if abs(newX - otherPos.x) < 15 { newX = otherPos.x; foundSnapX = otherPos.x }; if abs(newY - otherPos.y) < 15 { newY = otherPos.y; foundSnapY = otherPos.y } }
+                                                snapLineX = foundSnapX; snapLineY = foundSnapY; engine.nodePositions[action.id] = CGPoint(x: newX, y: newY)
+                                            }
+                                            .onEnded { value in snapLineX = nil; snapLineY = nil; if let pos = engine.nodePositions[action.id] { engine.updateActionPosition(id: action.id, position: pos) } else { engine.updateActionPosition(id: action.id, position: value.location) } }
+                                    )
+                                    .onAppear { if action.positionX == 0 && action.positionY == 0 { let defPos = defaultPosition(in: geo.size, offset: totalOffset); engine.updateActionPosition(id: action.id, position: defPos); engine.nodePositions[action.id] = defPos } }
+                                }
+                                
+                                ForEach(currentWorkflow.connections) { conn in
+                                    let endPos = getPortAbsolutePosition(nodeID: conn.endNodeID, port: conn.endPort, in: currentWorkflow); Circle().fill(Color.white).frame(width: 14, height: 14).overlay(Circle().stroke(Color.blue, lineWidth: 2)).background(Color.white.opacity(0.001).frame(width: 30, height: 30)).position(endPos).opacity(modifyingConnectionID == conn.id ? 0 : 1)
+                                        .gesture(DragGesture().onChanged { value in if modifyingConnectionID != conn.id { modifyingConnectionID = conn.id; draggingStartNodeID = conn.startNodeID; draggingStartPort = conn.startPort }; dragCurrentPosition = CGPoint(x: endPos.x + value.translation.width, y: endPos.y + value.translation.height) }.onEnded { value in let globalDropPoint = CGPoint(x: endPos.x + value.translation.width, y: endPos.y + value.translation.height); let sourceID = conn.startNodeID; let sourcePort = conn.startPort; engine.workflows[idx].connections.removeAll { $0.id == conn.id }; handleConnectionDrop(dropLocation: globalDropPoint, startID: sourceID, startPort: sourcePort, workflow: engine.workflows[idx]); modifyingConnectionID = nil; draggingStartNodeID = nil; draggingStartPort = nil; dragCurrentPosition = nil })
+                                }
+                                
+                                if let snapX = snapLineX { Path { p in p.move(to: CGPoint(x: snapX, y: -5000)); p.addLine(to: CGPoint(x: snapX, y: 5000)) }.stroke(Color.orange.opacity(0.6), style: StrokeStyle(lineWidth: 1, dash: [5, 5])) }
+                                if let snapY = snapLineY { Path { p in p.move(to: CGPoint(x: -5000, y: snapY)); p.addLine(to: CGPoint(x: 5000, y: snapY)) }.stroke(Color.orange.opacity(0.6), style: StrokeStyle(lineWidth: 1, dash: [5, 5])) }
+                            }.offset(totalOffset)
+                        }.frame(maxWidth: .infinity, maxHeight: .infinity).clipped()
+                    }
+                } else { ContentUnavailableView("未选择流程", systemImage: "mouse") }
+                Divider(); LogConsoleView(logs: engine.logs)
+            }.navigationTitle("流程编排").navigationSplitViewColumnWidth(min: 500, ideal: 800)
+        } detail: {
+            List {
+                ForEach(ActionCategory.allCases, id: \.self) { category in
+                    Section(header: Text(category.rawValue).font(.subheadline).bold()) {
+                        let filteredActions = ActionType.allCases.filter { $0.category == category }
+                        ForEach(filteredActions, id: \.self) { type in
+                            Button(action: { withAnimation { engine.addAction(type) } }) {
+                                HStack {
+                                    Image(systemName: type.icon).foregroundColor(category == .aiVision ? .purple : (category == .logicData ? .orange : .blue)).frame(width: 20)
+                                    Text(type.rawValue).font(.system(size: 12))
+                                    Spacer()
+                                }
+                                .padding(8).background(RoundedRectangle(cornerRadius: 6).fill(Color(NSColor.controlBackgroundColor)))
+                            }.buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("组件库").listStyle(.sidebar).navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 300)
+        }.frame(minWidth: 1000, idealWidth: 1200, minHeight: 700, idealHeight: 800).onAppear { engine.checkPermissions() }
+    }
+    
+    // [✨修改] 支持异步触发倒计时与窗口自动隐藏/恢复
+    private func toggleRecording() {
+        if isRecordingUI {
+            MacroRecorder.shared.stopRecording()
+            isRecordingUI = false
+            engine.log("⏹️ 录制结束，已在画板生成操作节点。")
+            // 录制结束后，自动把主窗口弹回来
+            if let mainWindow = NSApp.windows.first(where: { $0.className.contains("AppKitWindow") }) {
+                mainWindow.deminiaturize(nil)
+            }
+        } else {
+            Task {
+                engine.log("⏱️ 准备录制，倒计时 3 秒...")
+                await engine.showCountdownHUD(message: "系统动作录制准备中...")
+                
+                MacroRecorder.shared.startRecording()
+                isRecordingUI = true
+                engine.log("🔴 开始录制，请在系统内操作，完成后点击通知栏或回到应用停止录制...")
+                
+                // 开始录制后自动最小化主窗口，腾出操作视野
+                await MainActor.run {
+                    NSApp.windows.first(where: { $0.className.contains("AppKitWindow") })?.miniaturize(nil)
+                }
+            }
+        }
+    }
+    
+    private func getPosition(for id: UUID, in workflow: Workflow) -> CGPoint { if let pos = engine.nodePositions[id] { return pos }; if let action = workflow.actions.first(where: { $0.id == id }) { return CGPoint(x: action.positionX, y: action.positionY) }; return .zero }
+    private func defaultPosition(in size: CGSize, offset: CGSize) -> CGPoint { return CGPoint(x: size.width / 2 - offset.width + CGFloat.random(in: -30...30), y: size.height / 3 - offset.height + CGFloat.random(in: -30...30)) }
+    private func getPortAbsolutePosition(nodeID: UUID, port: PortPosition, in workflow: Workflow) -> CGPoint { let center = getPosition(for: nodeID, in: workflow); switch port { case .top: return CGPoint(x: center.x, y: center.y - nodeHeight / 2); case .bottom: return CGPoint(x: center.x, y: center.y + nodeHeight / 2); case .left: return CGPoint(x: center.x - nodeWidth / 2, y: center.y); case .right: return CGPoint(x: center.x + nodeWidth / 2, y: center.y) } }
+    private func guessEndPortDirection(start: CGPoint, current: CGPoint) -> PortPosition { let dx = current.x - start.x; let dy = current.y - start.y; if abs(dx) > abs(dy) { return dx > 0 ? .left : .right } else { return dy > 0 ? .top : .bottom } }
+    private func guessConditionForNewConnection(startID: UUID, startPort: PortPosition, in workflow: Workflow) -> ConnectionCondition { guard let sourceAction = workflow.actions.first(where: { $0.id == startID }) else { return .always }; if sourceAction.type == .ocrText || sourceAction.type == .condition { if startPort == .right { return .success }; if startPort == .bottom { return .failure } }; return .always }
+    private func handleConnectionDrop(dropLocation: CGPoint?, startID: UUID?, startPort: PortPosition?, workflow: Workflow) { guard let dropPoint = dropLocation, let sourceID = startID, let sPort = startPort else { return }; var closest: (nodeID: UUID, port: PortPosition, distance: CGFloat)? = nil; for targetNode in workflow.actions { if targetNode.id == sourceID { continue }; for port in PortPosition.allCases { let targetPortPos = getPortAbsolutePosition(nodeID: targetNode.id, port: port, in: workflow); let distance = hypot(targetPortPos.x - dropPoint.x, targetPortPos.y - dropPoint.y); if distance <= snapDistance { if closest == nil || distance < closest!.distance { closest = (targetNode.id, port, distance) } } } }; if let bestMatch = closest { let condition = guessConditionForNewConnection(startID: sourceID, startPort: sPort, in: workflow); engine.addConnection(source: sourceID, sourcePort: sPort, target: bestMatch.nodeID, targetPort: bestMatch.port, condition: condition) } }
+}
+
+struct CanvasNodeCardView: View {
+    @Binding var action: RPAAction
+    var isCurrent: Bool; var isStart: Bool; var isEnd: Bool; var isConnecting: Bool
+    let cardWidth: CGFloat; let cardHeight: CGFloat
+    var onStartConnection: (PortPosition) -> Void; var onDragConnection: (PortPosition, CGSize) -> Void; var onEndConnection: (PortPosition, CGSize) -> Void; var onDelete: () -> Void
+    @State private var showSettings = false
+    
+    @State private var breathePhase: CGFloat = 0
+
+    // [✨UI架构优化] 统一提取节点的主题色，让呼吸、阴影和图标完美契合，消除色彩割裂感
+    var themeColor: Color {
+        switch action.type {
+        case .aiVision, .ocrText: return .purple
+        case .webAgent: return .indigo
+        case .condition: return .orange
+        case .uiInteraction: return .cyan
+        case .runShell, .runAppleScript: return .green
+        default: return .blue
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            HStack(spacing: 8) {
+                Image(systemName: action.type.icon).font(.system(size: 16)).foregroundColor(isCurrent ? .white : themeColor)
+                TextField(action.displayTitle, text: $action.customName).font(.system(size: 12, weight: .bold)).foregroundColor(isCurrent ? .white : .primary).textFieldStyle(.plain)
+                Spacer(minLength: 0)
+                Button(action: { showSettings.toggle() }) { Image(systemName: "gearshape.fill").foregroundColor(isCurrent ? .white.opacity(0.8) : .gray) }.buttonStyle(.plain)
+            }
+            .padding(.horizontal, 10).frame(width: cardWidth, height: cardHeight)
+            .background(RoundedRectangle(cornerRadius: 8).fill(isCurrent ? themeColor.opacity(0.9) : Color(NSColor.controlBackgroundColor)))
+            
+            // [✨特效优化] 边框和发光阴影采用 themeColor 同色系过渡，呼吸感更高级自然
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(isCurrent ? themeColor.opacity(0.6 + breathePhase * 0.4) : (isStart ? Color.green.opacity(0.8) : (isEnd ? Color.orange.opacity(0.8) : Color.gray.opacity(0.3))), lineWidth: isCurrent ? (2 + breathePhase * 1.5) : 1))
+            .shadow(color: isCurrent ? themeColor.opacity(0.5 - breathePhase * 0.2) : .black.opacity(0.05), radius: isCurrent ? (6 + breathePhase * 8) : 2, y: 2)
+            .scaleEffect(isCurrent ? (1.02 + breathePhase * 0.02) : 1.0)
+            .animation(.easeOut(duration: 0.2), value: isCurrent)
+            .contextMenu { Button(role: .destructive, action: onDelete) { Label("删除节点", systemImage: "trash") } }
+            
+            if isStart || isEnd { Text(isStart ? "▶ 起点" : "🏁 终点").font(.system(size: 8, weight: .bold)).foregroundColor(.white).padding(.horizontal, 4).padding(.vertical, 2).background(isStart ? Color.green : Color.orange).clipShape(Capsule()).offset(x: cardWidth / 2 - 10, y: -cardHeight / 2 - 6) }
+            ForEach(PortPosition.allCases, id: \.self) { port in let portOffset = getPortLocalOffset(port: port); Circle().fill(Color(NSColor.controlBackgroundColor)).frame(width: 10, height: 10).overlay(Circle().stroke(themeColor.opacity(0.6), lineWidth: 2)).scaleEffect(isConnecting ? 1.3 : 1.0).animation(.spring(), value: isConnecting).offset(x: portOffset.width, y: portOffset.height).overlay(Color.white.opacity(0.001).frame(width: 25, height: 25).offset(x: portOffset.width, y: portOffset.height).gesture(DragGesture(minimumDistance: 0).onChanged { value in if value.translation.width == 0 && value.translation.height == 0 { onStartConnection(port) } else { onDragConnection(port, value.translation) } }.onEnded { value in onEndConnection(port, value.translation) })); if action.type == .ocrText || action.type == .condition { if port == .right { Text("✅").font(.system(size: 8)).foregroundColor(.green).offset(x: portOffset.width + 12, y: portOffset.height) } else if port == .bottom { Text("❌").font(.system(size: 8)).foregroundColor(.red).offset(x: portOffset.width, y: portOffset.height + 12) } } }
+        }
+        .onChange(of: isCurrent) { _, current in
+            if current { breathePhase = 0; withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) { breathePhase = 1 } }
+            else { withAnimation(.easeOut(duration: 0.2)) { breathePhase = 0 } }
+        }
+        .onAppear { if isCurrent { withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) { breathePhase = 1 } } }
+        .popover(isPresented: $showSettings, arrowEdge: .trailing) { ActionSettingsPopoverView(action: $action, showSettings: $showSettings) }
+    }
+    private func getPortLocalOffset(port: PortPosition) -> CGSize { switch port { case .top: return CGSize(width: 0, height: -cardHeight / 2); case .bottom: return CGSize(width: 0, height: cardHeight / 2); case .left: return CGSize(width: -cardWidth / 2, height: 0); case .right: return CGSize(width: cardWidth / 2, height: 0) } }
+}
+
+// [✨性能核心优化] 重构控制台视图，解决 AI 打字机引发的 UI 假死与资源暴涨
+struct LogConsoleView: View {
+    var logs: [String]
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                // 必须使用 LazyVStack，否则几百行日志每次更新 String 都会引发全量计算
+                LazyVStack(alignment: .leading, spacing: 4) {
+                    // 使用数组索引作为 ID，确保正在流式附加的最后一行日志不会丢失身份导致整个 View 重建
+                    ForEach(logs.indices, id: \.self) { index in
+                        let log = logs[index]
+                        Text(log).font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(log.contains("❌") ? .red : (log.contains("🎯") ? .green : (log.contains("🧠") ? .purple : .primary)))
+                            .id(index)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading).padding()
+            }
+            .frame(height: 120).background(Color(NSColor.windowBackgroundColor))
+            // 监听新增行数时平滑滚动
+            .onChange(of: logs.count) { _, _ in
+                if !logs.isEmpty { withAnimation { proxy.scrollTo(logs.count - 1, anchor: .bottom) } }
+            }
+            // 监听最后一行流式打字时的无动画极速滚动，降低渲染负担
+            .onChange(of: logs.last) { _, _ in
+                if !logs.isEmpty { proxy.scrollTo(logs.count - 1, anchor: .bottom) }
+            }
+        }
+    }
+}
+
+struct ConnectionLine: Shape { var start: CGPoint; var end: CGPoint; var startPort: PortPosition; var endPort: PortPosition; func path(in rect: CGRect) -> Path { var path = Path(); path.move(to: start); path.addCurve(to: end, control1: CGPoint(x: start.x + startPort.controlOffset.width, y: start.y + startPort.controlOffset.height), control2: CGPoint(x: end.x + endPort.controlOffset.width, y: end.y + endPort.controlOffset.height)); return path } }
+struct ConnectionArrowLine: View { var start: CGPoint; var end: CGPoint; var startPort: PortPosition; var endPort: PortPosition; var condition: ConnectionCondition; var body: some View { let c1 = CGPoint(x: start.x + startPort.controlOffset.width, y: start.y + startPort.controlOffset.height); let c2 = CGPoint(x: end.x + endPort.controlOffset.width, y: end.y + endPort.controlOffset.height); let t: CGFloat = 0.9; let mt: CGFloat = 1.0 - t; let arrowX = mt*mt*mt*start.x + 3.0*mt*mt*t*c1.x + 3.0*mt*t*t*c2.x + t*t*t*end.x; let arrowY = mt*mt*mt*start.y + 3.0*mt*mt*t*c1.y + 3.0*mt*t*t*c2.y + t*t*t*end.y; let dX = 3.0*mt*mt*(c1.x - start.x) + 6.0*mt*t*(c2.x - c1.x) + 3.0*t*t*(end.x - c2.x); let dY = 3.0*mt*mt*(c1.y - start.y) + 6.0*mt*t*(c2.y - c1.y) + 3.0*t*t*(end.y - c2.y); let angle = atan2(dY, dX); let strokeColor = condition == .success ? Color.green : (condition == .failure ? Color.red : Color.blue); ZStack { ConnectionLine(start: start, end: end, startPort: startPort, endPort: endPort).stroke(strokeColor.opacity(0.8), style: StrokeStyle(lineWidth: 2, dash: condition == .failure ? [4, 4] : [])); Image(systemName: "play.fill").font(.system(size: 12)).foregroundColor(strokeColor).rotationEffect(.radians(Double(angle))).position(x: arrowX, y: arrowY) } } }
+struct GridBackgroundView: View { let gridSize: CGFloat = 20; var offset: CGSize; var body: some View { GeometryReader { geometry in Path { path in let w = geometry.size.width; let h = geometry.size.height; let startX = offset.width.truncatingRemainder(dividingBy: gridSize); let startY = offset.height.truncatingRemainder(dividingBy: gridSize); for x in stride(from: startX - gridSize, through: w + gridSize, by: gridSize) { path.move(to: CGPoint(x: x, y: 0)); path.addLine(to: CGPoint(x: x, y: h)) }; for y in stride(from: startY - gridSize, through: h + gridSize, by: gridSize) { path.move(to: CGPoint(x: 0, y: y)); path.addLine(to: CGPoint(x: w, y: y)) } }.stroke(Color.gray.opacity(0.04), lineWidth: 1) }.background(Color(NSColor.textBackgroundColor)) } }
