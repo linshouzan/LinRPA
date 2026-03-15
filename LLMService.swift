@@ -22,9 +22,10 @@ class LLMService: NSObject {
     static let shared = LLMService()
     
     // 全局默认配置 (可在此处统一修改)
-    var defaultHost = "http://127.0.0.1:11434/v1/chat/completions"
-    var defaultModel = "qwen3-vl:4b"
-    var defaultApiKey = "sk-local-token"
+    // [✨修改] 动态桥接全局配置中心
+    var defaultHost: String { AppSettings.shared.aiHost }
+    var defaultModel: String { AppSettings.shared.aiModel }
+    var defaultApiKey: String { AppSettings.shared.aiApiKey }
     
     private lazy var session: URLSession = {
         let config = URLSessionConfiguration.default

@@ -529,28 +529,47 @@ struct WebAgentExecutor: RPAActionExecutor {
             let historyStr = actionHistory.isEmpty ? "无" : actionHistory.enumerated().map{ "\($0.offset+1). \($0.element)" }.joined(separator: "\n")
 
             let prompt = """
-            你是一个顶级 Web RPA 机器人。结合给定的【屏幕截图】和【DOM列表】，决定接下来的动作。
-            注意：截图中可交互元素已被打上红色数字方框，请通过图片找到正确元素，并参考DOM列表提取目标ID。
-            
-            【任务目标】: \(taskDesc)
-            【操作手册】: \(manualText.isEmpty ? "无" : manualText)
-            【历史操作记录】:
-            \(historyStr)
-            【当前可见元素 (ID与截图红框对应)】:
-            \(domContext)
-            
-            【可选动作空间】:
-            - click: 点击目标ID
-            - input: 在目标ID输入文字
-            - scroll_down: 页面向下滚动
-            - scroll_up: 页面向上滚动
-            - finish: 任务已成功完成
-            - fail: 任务无法完成，请求人类接管
-            
-            【指令要求】:
-            你可以一次性输出多个动作以加快执行效率（例如：连续输入用户名和密码）。
-            请严格输出合法的 JSON 数组（Array）。如果某个动作会导致页面跳转、刷新或弹窗，请务必将其作为数组的最后一个动作！
-            """
+                你是一个顶级 Web RPA 机器人。结合给定的【屏幕截图】和【DOM列表】，决定下一步动作。
+                注意：截图中可交互元素已被打上红色数字方框，请通过图片找到正确元素，并参考DOM列表提取目标ID。
+                
+                【任务目标】: \(taskDesc)
+                【操作手册】: \(manualText.isEmpty ? "无" : manualText)
+                【历史操作记录】:
+                \(historyStr)
+                【当前可见元素 (ID与截图红框对应)】:
+                \(domContext)
+                
+                【可选动作空间】:
+                - click: 点击目标ID
+                - input: 在目标ID输入文字
+                - scroll_down: 页面向下滚动 (如果找不到目标)
+                - scroll_up: 页面向上滚动
+                - finish: 任务已成功完成
+                - fail: 任务无法完成，请求人类接管
+                
+                【严格输出要求】:
+                1. 必须且只能输出合法的 JSON 格式数据。
+                2. 绝对不要输出 Markdown 代码块（如 ```json ）。
+                3. 不要包含任何前缀、后缀或解释性文字。
+                
+                期望的 JSON 格式如下：
+                [{
+                  "thought": "账号",
+                  "action_type": "input",
+                  "target_id": "0",
+                  "input_value": "sys"
+                },{
+                  "thought": "密码",
+                  "action_type": "input",
+                  "target_id": "1",
+                  "input_value": "123456"
+                },{
+                  "thought": "登录按钮",
+                  "action_type": "click",
+                  "target_id": "2",
+                  "input_value": ""
+                }]
+                """
             
             context.log("🧠 [WebAgent] 大脑运转中...")
             context.log("🌊 正在思考: ")
@@ -678,12 +697,18 @@ struct WebAgentExecutor: RPAActionExecutor {
     }
     
     private func extractJSON(from text: String) -> String? {
+        // [✨核心防线 1] 如果模型包含 </think> 标签，强行抛弃思考过程，只取其后的内容
+        var cleanText = text
+        if let thinkEndRange = text.range(of: "</think>") {
+            cleanText = String(text[thinkEndRange.upperBound...])
+        }
+        
         let pattern = "(?s)(\\{.*\\}|\\[.*\\])"
         if let regex = try? NSRegularExpression(pattern: pattern, options: []),
-           let match = regex.firstMatch(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count)) {
-            return (text as NSString).substring(with: match.range)
+           let match = regex.firstMatch(in: cleanText, options: [], range: NSRange(location: 0, length: text.utf16.count)) {
+            return (cleanText as NSString).substring(with: match.range)
         }
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleanText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

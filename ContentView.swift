@@ -32,6 +32,9 @@ struct ContentView: View {
     @State private var tempFolderName = ""
     @State private var targetFolderToRename = ""
     
+    @StateObject private var appSettings = AppSettings.shared
+    @State private var showGlobalSettings = false
+    
     let nodeWidth: CGFloat = 145
     let nodeHeight: CGFloat = 55
     let snapDistance: CGFloat = 40.0
@@ -163,6 +166,33 @@ struct ContentView: View {
                 HStack {
                     Text("画布视图").font(.headline)
                     Spacer()
+                    
+                    // [✨新增] 内置浏览器独立入口，随时手动调出，防止丢失焦点
+                    Button(action: {
+                        DispatchQueue.main.async {
+                            BrowserWindowController.showSharedWindow()
+                        }
+                    }) {
+                        Label("内置浏览器", systemImage: "safari.fill")
+                            .foregroundColor(.blue)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 6)
+                    .help("手动打开或唤起内置开发者浏览器")
+                    
+                    // [✨新增] 全局设置入口
+                    Button(action: { showGlobalSettings.toggle() }) {
+                        Label("设置", systemImage: "gearshape.fill")
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 6)
+                    .popover(isPresented: $showGlobalSettings, arrowEdge: .bottom) {
+                        GlobalSettingsPopoverView()
+                    }
+                    
+                    Divider().frame(height: 16).padding(.horizontal, 4)
+                    
                     if engine.hasUnsavedChanges { Button(action: { engine.saveChanges() }) { Label("保存", systemImage: "checkmark.circle.fill") }.buttonStyle(.borderedProminent).tint(.green); Divider().frame(height: 16).padding(.horizontal, 4) }
                     
                     Button(action: toggleRecording) { Label(isRecordingUI ? "停止录制" : "动作录制", systemImage: isRecordingUI ? "stop.circle.fill" : "record.circle").foregroundColor(isRecordingUI ? .red : .primary) }.buttonStyle(.bordered).symbolEffect(.pulse, isActive: isRecordingUI)
@@ -334,18 +364,83 @@ struct CanvasNodeCardView: View {
 }
 
 // [✨性能核心优化] 重构控制台视图，解决 AI 打字机引发的 UI 假死与资源暴涨
+// MARK: - [✨新增] 日志解析节点模型
+struct ParsedLogNode: Identifiable {
+    let id = UUID()
+    var isThink: Bool
+    var text: String
+}
+
+// MARK: - [✨新增] 单行日志渲染视图（支持深度思考折叠）
+struct LogRowView: View {
+    let text: String
+    @State private var isThinkExpanded = false // 默认折叠
+    
+    var body: some View {
+        let nodes = parseLog(text)
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(nodes) { node in
+                if node.isThink {
+                    DisclosureGroup(isExpanded: $isThinkExpanded) {
+                        Text(node.text)
+                            .foregroundColor(.purple.opacity(0.8))
+                            .font(.system(size: 11, design: .monospaced))
+                            .padding(.leading, 4)
+                            .padding(.vertical, 2)
+                    } label: {
+                        Text("🧠 [AI 深度思考过程]").foregroundColor(.purple).font(.system(size: 11, weight: .bold))
+                    }
+                } else {
+                    if !node.text.isEmpty {
+                        Text(node.text)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(node.text.contains("❌") ? .red : (node.text.contains("🎯") ? .green : (node.text.contains("🧠") ? .purple : .primary)))
+                    }
+                }
+            }
+        }
+    }
+    
+    // 动态解析带有 <think> 标签的流式字符串
+    private func parseLog(_ text: String) -> [ParsedLogNode] {
+        var result: [ParsedLogNode] = []
+        var currentText = text
+        while let startRange = currentText.range(of: "<think>") {
+            let before = String(currentText[..<startRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !before.isEmpty { result.append(ParsedLogNode(isThink: false, text: before)) }
+            
+            let remaining = String(currentText[startRange.upperBound...])
+            if let endRange = remaining.range(of: "</think>") {
+                // 已闭合的思考块
+                let thinkText = String(remaining[..<endRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                result.append(ParsedLogNode(isThink: true, text: thinkText))
+                currentText = String(remaining[endRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            } else {
+                // 尚未闭合的思考块（正在流式输出中）
+                let streamingThink = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
+                result.append(ParsedLogNode(isThink: true, text: streamingThink + " ..."))
+                currentText = ""
+                break
+            }
+        }
+        if !currentText.isEmpty {
+            result.append(ParsedLogNode(isThink: false, text: currentText))
+        }
+        return result
+    }
+}
+
+// [✨性能与体验核心优化] 重构控制台视图
 struct LogConsoleView: View {
     var logs: [String]
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                // 必须使用 LazyVStack，否则几百行日志每次更新 String 都会引发全量计算
-                LazyVStack(alignment: .leading, spacing: 4) {
-                    // 使用数组索引作为 ID，确保正在流式附加的最后一行日志不会丢失身份导致整个 View 重建
+                // 必须使用 LazyVStack，保证性能
+                LazyVStack(alignment: .leading, spacing: 6) {
                     ForEach(logs.indices, id: \.self) { index in
-                        let log = logs[index]
-                        Text(log).font(.system(size: 11, design: .monospaced))
-                            .foregroundColor(log.contains("❌") ? .red : (log.contains("🎯") ? .green : (log.contains("🧠") ? .purple : .primary)))
+                        // 使用全新的折叠行视图
+                        LogRowView(text: logs[index])
                             .id(index)
                     }
                 }
@@ -367,3 +462,52 @@ struct LogConsoleView: View {
 struct ConnectionLine: Shape { var start: CGPoint; var end: CGPoint; var startPort: PortPosition; var endPort: PortPosition; func path(in rect: CGRect) -> Path { var path = Path(); path.move(to: start); path.addCurve(to: end, control1: CGPoint(x: start.x + startPort.controlOffset.width, y: start.y + startPort.controlOffset.height), control2: CGPoint(x: end.x + endPort.controlOffset.width, y: end.y + endPort.controlOffset.height)); return path } }
 struct ConnectionArrowLine: View { var start: CGPoint; var end: CGPoint; var startPort: PortPosition; var endPort: PortPosition; var condition: ConnectionCondition; var body: some View { let c1 = CGPoint(x: start.x + startPort.controlOffset.width, y: start.y + startPort.controlOffset.height); let c2 = CGPoint(x: end.x + endPort.controlOffset.width, y: end.y + endPort.controlOffset.height); let t: CGFloat = 0.9; let mt: CGFloat = 1.0 - t; let arrowX = mt*mt*mt*start.x + 3.0*mt*mt*t*c1.x + 3.0*mt*t*t*c2.x + t*t*t*end.x; let arrowY = mt*mt*mt*start.y + 3.0*mt*mt*t*c1.y + 3.0*mt*t*t*c2.y + t*t*t*end.y; let dX = 3.0*mt*mt*(c1.x - start.x) + 6.0*mt*t*(c2.x - c1.x) + 3.0*t*t*(end.x - c2.x); let dY = 3.0*mt*mt*(c1.y - start.y) + 6.0*mt*t*(c2.y - c1.y) + 3.0*t*t*(end.y - c2.y); let angle = atan2(dY, dX); let strokeColor = condition == .success ? Color.green : (condition == .failure ? Color.red : Color.blue); ZStack { ConnectionLine(start: start, end: end, startPort: startPort, endPort: endPort).stroke(strokeColor.opacity(0.8), style: StrokeStyle(lineWidth: 2, dash: condition == .failure ? [4, 4] : [])); Image(systemName: "play.fill").font(.system(size: 12)).foregroundColor(strokeColor).rotationEffect(.radians(Double(angle))).position(x: arrowX, y: arrowY) } } }
 struct GridBackgroundView: View { let gridSize: CGFloat = 20; var offset: CGSize; var body: some View { GeometryReader { geometry in Path { path in let w = geometry.size.width; let h = geometry.size.height; let startX = offset.width.truncatingRemainder(dividingBy: gridSize); let startY = offset.height.truncatingRemainder(dividingBy: gridSize); for x in stride(from: startX - gridSize, through: w + gridSize, by: gridSize) { path.move(to: CGPoint(x: x, y: 0)); path.addLine(to: CGPoint(x: x, y: h)) }; for y in stride(from: startY - gridSize, through: h + gridSize, by: gridSize) { path.move(to: CGPoint(x: 0, y: y)); path.addLine(to: CGPoint(x: w, y: y)) } }.stroke(Color.gray.opacity(0.04), lineWidth: 1) }.background(Color(NSColor.textBackgroundColor)) } }
+
+// MARK: - [✨新增] 极客级全局设置面板
+struct GlobalSettingsPopoverView: View {
+    @ObservedObject var settings = AppSettings.shared
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Image(systemName: "gearshape.fill").foregroundColor(.blue)
+                Text("系统全局设置").font(.headline)
+            }
+            Divider()
+            
+            VStack(alignment: .leading, spacing: 12) {
+                Label("AI 模型底座配置", systemImage: "brain.head.profile").font(.subheadline).bold()
+                
+                HStack {
+                    Text("API 地址:").font(.caption).frame(width: 70, alignment: .trailing)
+                    TextField("如 http://127.0.0.1...", text: $settings.aiHost).textFieldStyle(.roundedBorder)
+                }
+                HStack {
+                    Text("模型名称:").font(.caption).frame(width: 70, alignment: .trailing)
+                    TextField("如 qwen3-vl:4b", text: $settings.aiModel).textFieldStyle(.roundedBorder)
+                }
+                HStack {
+                    Text("API Key:").font(.caption).frame(width: 70, alignment: .trailing)
+                    SecureField("sk-...", text: $settings.aiApiKey).textFieldStyle(.roundedBorder)
+                }
+                Text("默认兼容 OpenAI 格式 API (如 Ollama, DeepSeek, 阿里百炼等)").font(.caption2).foregroundColor(.secondary).padding(.leading, 78)
+            }
+            .padding(10)
+            .background(Color(NSColor.controlBackgroundColor))
+            .cornerRadius(8)
+            
+            VStack(alignment: .leading, spacing: 12) {
+                Label("引擎运行偏好", systemImage: "cpu").font(.subheadline).bold()
+                Toggle("执行流程时，自动最小化主窗口 (防止遮挡屏幕视觉)", isOn: $settings.minimizeOnRun)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+            }
+            .padding(10)
+            .background(Color(NSColor.controlBackgroundColor))
+            .cornerRadius(8)
+            
+        }
+        .padding()
+        .frame(width: 400)
+    }
+}

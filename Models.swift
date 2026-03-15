@@ -5,6 +5,8 @@
 // 代码要求：保留了所有的极客级小组件和底层原生 UI 元素拾取防死锁逻辑。
 //////////////////////////////////////////////////////////////////
 
+import SwiftUI
+import Combine
 import Foundation
 import AppKit
 
@@ -199,4 +201,17 @@ class StorageManager {
         }
         return workflows
     }
+}
+
+// MARK: - [✨新增] 全局应用设置管理器
+class AppSettings: ObservableObject {
+    static let shared = AppSettings()
+    
+    // AI 模型配置
+    @AppStorage("ai_host") var aiHost: String = "http://127.0.0.1:11434/v1/chat/completions"
+    @AppStorage("ai_model") var aiModel: String = "qwen3-vl:4b"
+    @AppStorage("ai_api_key") var aiApiKey: String = "sk-local-token"
+    
+    // 运行偏好 (默认运行时不最小化窗口)
+    @AppStorage("minimize_on_run") var minimizeOnRun: Bool = false
 }

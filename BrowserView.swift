@@ -997,8 +997,22 @@ class BrowserWindowController: NSWindowController, NSWindowDelegate {
         if sharedController == nil {
             sharedController = BrowserWindowController()
         }
-        sharedController?.showWindow(nil)
-        sharedController?.window?.makeKeyAndOrderFront(nil)
+        
+        // [✨修复] 强制渲染与唤醒防线
+        if let window = sharedController?.window {
+            // 1. 如果窗口被最小化到了程序坞，强制恢复
+            if window.isMiniaturized {
+                window.deminiaturize(nil)
+            }
+            // 2. 如果窗口被关闭/隐藏，强制显示
+            if !window.isVisible {
+                sharedController?.showWindow(nil)
+            }
+            // 3. 强制提到最前并获取焦点
+            window.makeKeyAndOrderFront(nil)
+        }
+        
+        // 激活当前 App 忽略其他遮挡应用
         NSApp.activate(ignoringOtherApps: true)
     }
     
@@ -1011,6 +1025,7 @@ class BrowserWindowController: NSWindowController, NSWindowDelegate {
         newWindow.setFrameAutosaveName("DevBrowserMainFrame")
         newWindow.center()
         newWindow.contentViewController = hostingController
+        // [✨关键] 保证关闭时不释放内存，仅隐藏，以便下次秒开并保留状态
         newWindow.isReleasedWhenClosed = false
         self.init(window: newWindow)
         newWindow.delegate = self

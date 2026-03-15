@@ -344,9 +344,12 @@ class WorkflowEngine {
         // 2. 根据设置决定是否隐藏主窗口防遮挡
         let autoMinimize = UserDefaults.standard.bool(forKey: "autoMinimizeOnRun")
         if autoMinimize {
+            // [✨修改] 根据全局设置判断是否需要自动隐藏主窗口
             await MainActor.run {
-                if let mainWindow = NSApp.windows.first(where: { $0.className.contains("AppKitWindow") }) {
-                    mainWindow.miniaturize(nil)
+                if AppSettings.shared.minimizeOnRun {
+                    if let mainWindow = NSApp.windows.first(where: { $0.className.contains("AppKitWindow") }) {
+                        mainWindow.miniaturize(nil)
+                    }
                 }
             }
         }
