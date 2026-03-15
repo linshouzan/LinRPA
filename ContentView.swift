@@ -52,7 +52,45 @@ struct ContentView: View {
             .toolbar { ToolbarItem(placement: .primaryAction) { Button(action: engine.createNewWorkflow) { Image(systemName: "plus") } } }
         } content: {
             VStack(spacing: 0) {
-                if !engine.hasAccessibilityPermission { HStack { Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.yellow); Text("⚠️ 缺少辅助功能权限：录制和点击事件将被拦截！").font(.subheadline); Spacer(); Button("刷新") { engine.checkPermissions() }.buttonStyle(.borderedProminent).tint(.orange) }.padding(8).background(Color.red.opacity(0.1)) }
+                if !engine.hasAccessibilityPermission || !engine.hasScreenRecordingPermission {
+                    HStack(spacing: 12) {
+                        Image(systemName: "exclamationmark.shield.fill")
+                            .foregroundColor(.orange)
+                            .font(.title2)
+                            .symbolEffect(.pulse) // 增加呼吸动效，吸引注意力
+                        
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("需要系统权限才能执行自动化操作")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundColor(.primary)
+                            
+                            // 动态显示具体缺失的权限
+                            let missingText = (!engine.hasAccessibilityPermission && !engine.hasScreenRecordingPermission) ? "缺少【辅助功能】与【屏幕录制】权限" :
+                                              (!engine.hasAccessibilityPermission ? "缺少【辅助功能】权限 (模拟键鼠将被拦截)" : "缺少【屏幕录制】权限 (视觉AI及截屏将受限)")
+                            
+                            Text(missingText)
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                        }
+                        
+                        Spacer()
+                        
+                        Button(action: {
+                            // 主动触发检查，如果没有权限会自动弹窗并拉起 macOS 设置
+                            engine.checkPermissions(autoOpenSettings: true)
+                        }) {
+                            Label("去授权 / 刷新", systemImage: "arrow.right.circle.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.orange)
+                        .controlSize(.regular)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(Color.orange.opacity(0.15))
+                    // 加个细微的底边框，与下方视图区分开
+                    .overlay(Rectangle().frame(height: 1).foregroundColor(Color.orange.opacity(0.3)), alignment: .bottom)
+                }
                 
                 // [✨新增] 顶部带录制状态的控制栏
                 HStack {

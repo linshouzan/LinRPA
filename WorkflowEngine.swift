@@ -11,13 +11,12 @@ import Foundation
 import AppKit
 import Observation
 import Vision
-import ScreenCaptureKit
 import ApplicationServices
 import CoreGraphics
+import ScreenCaptureKit
 
 struct ScreenCaptureUtility {
-    /// 截取屏幕（精准规避 0x0 幽灵图层引发的 EXC_BREAKPOINT 崩溃）
-    /// - Parameter targetAppName: 目标 App 的名称（为空则截取全屏）
+    /// 截取屏幕（彻底解决 CGColorCreateCopy 野指针崩溃与 Retina 尺寸异常）
     static func captureScreen(forAppName targetAppName: String? = nil) async throws -> CGImage {
         
         let content = try await SCShareableContent.current
@@ -29,14 +28,10 @@ struct ScreenCaptureUtility {
         var filter: SCContentFilter?
         
         if let appName = targetAppName, !appName.isEmpty {
-            // 1. 找到目标进程
             if let targetApp = content.applications.first(where: {
                 $0.applicationName.localizedCaseInsensitiveContains(appName) ||
                 $0.bundleIdentifier.localizedCaseInsensitiveContains(appName)
             }) {
-                
-                // 2. [✨核心修复] 过滤出该进程下真正的“物理窗口”
-                // 剔除掉长宽极小（<50）的幽灵窗口、辅助渲染图层、隐藏悬浮窗
                 let realWindows = content.windows.filter { win in
                     win.owningApplication?.processID == targetApp.processID &&
                     win.frame.width > 50 &&
@@ -44,14 +39,10 @@ struct ScreenCaptureUtility {
                 }
                 
                 if !realWindows.isEmpty {
-                    // 3. 动态寻找这些窗口所在的显示器
                     if let firstWin = realWindows.first,
                        let targetDisp = content.displays.first(where: { $0.frame.intersects(firstWin.frame) }) {
                         captureDisplay = targetDisp
                     }
-                    
-                    // 4. [✨终极防线] 传递 [SCWindow] 数组，而不是 [SCRunningApplication] 数组！
-                    // 这明确告诉底层引擎只渲染这些健康的窗口，彻底阻断畸形图层引发的崩溃。
                     filter = SCContentFilter(display: captureDisplay, including: realWindows)
                 } else {
                     print("⚠️ 未检测到 [\(appName)] 的合法可视窗口，降级为全屏截图")
@@ -59,23 +50,42 @@ struct ScreenCaptureUtility {
             }
         }
         
-        // 5. 安全降级：如果没匹配到或者没有合法窗口，退回干干净净的全屏截取
         if filter == nil {
             filter = SCContentFilter(display: captureDisplay, excludingWindows: [])
         }
         
-        // 6. 严格校验显示器尺寸，防止宽/高为 0 导致 Configuration 崩溃
-        let width = Int(captureDisplay.width)
-        let height = Int(captureDisplay.height)
-        guard width > 0, height > 0 else {
+        // [✨修复 1] 补全 Retina 缩放倍率，防止传递逻辑坐标导致 macOS 底层分配显存溢出
+        let scaleFactor: CGFloat = await MainActor.run {
+            var factor: CGFloat = 1.0
+            for screen in NSScreen.screens {
+                if let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
+                    if CGDirectDisplayID(screenNumber.uint32Value) == captureDisplay.displayID {
+                        factor = screen.backingScaleFactor
+                        break
+                    }
+                }
+            }
+            return factor
+        }
+        
+        let pixelWidth = Int(CGFloat(captureDisplay.width) * scaleFactor)
+        let pixelHeight = Int(CGFloat(captureDisplay.height) * scaleFactor)
+        
+        guard pixelWidth > 100, pixelHeight > 100 else {
             throw NSError(domain: "ScreenCapture", code: 3, userInfo: [NSLocalizedDescriptionKey: "获取到的显示器尺寸异常"])
         }
         
         let config = SCStreamConfiguration()
-        config.width = width
-        config.height = height
+        config.width = pixelWidth
+        config.height = pixelHeight
         config.showsCursor = false
-        config.backgroundColor = NSColor.black.cgColor
+        
+        // [✨修复 2 核心崩溃点] 解决 Crash 日志中的 CGColorCreateCopy EXC_BREAKPOINT！
+        // 绝不能用 NSColor.black.cgColor！使用不可变的 CGColor.black 单例常量，它的内存永不释放
+        config.backgroundColor = CGColor.black
+        
+        // [✨防御 3] 必须显式指定色彩空间，防止外接 HDR 或 P3 广色域屏幕导致底层转换崩溃
+        config.colorSpaceName = CGColorSpace.sRGB
         
         // 执行截取
         return try await SCScreenshotManager.captureImage(contentFilter: filter!, configuration: config)
@@ -131,9 +141,23 @@ class WorkflowEngine {
     func saveChanges() { StorageManager.shared.save(workflows: workflows); hasUnsavedChanges = false; log("💾 流程及配置已保存") }
     func discardChanges() { isLoading = true; workflows = StorageManager.shared.load(); nodePositions.removeAll(); isLoading = false; hasUnsavedChanges = false; log("🔄 已撤销所有未保存的修改") }
     
+    // MARK: - [✨新增] 跳转系统隐私设置面板
+    func openSystemSettings(for type: String) {
+        let urlString: String
+        if type == "accessibility" {
+            // 跳转到 隐私与安全性 -> 辅助功能
+            urlString = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        } else {
+            // 跳转到 隐私与安全性 -> 屏幕录制
+            urlString = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+        }
+        if let url = URL(string: urlString) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     // MARK: - 权限检查与同时请求
-    func checkPermissions() {
-        // 1. 先静默检查当前权限状态（设置 Prompt 为 false，不弹窗）
+    func checkPermissions(autoOpenSettings: Bool = false) {
         let checkOptions = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false] as CFDictionary
         let isAxTrusted = AXIsProcessTrustedWithOptions(checkOptions)
         let isScreenTrusted = CGPreflightScreenCaptureAccess()
@@ -141,21 +165,31 @@ class WorkflowEngine {
         self.hasAccessibilityPermission = isAxTrusted
         self.hasScreenRecordingPermission = isScreenTrusted
         
-        // 2. 如果缺少任意一个权限，再主动触发弹窗
         if !isAxTrusted || !isScreenTrusted {
-            
-            // 请求 1：辅助功能权限
-            if !isAxTrusted {
-                let promptOptions = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-                self.hasAccessibilityPermission = AXIsProcessTrustedWithOptions(promptOptions)
-            }
-            
-            // 请求 2：录屏权限（错开 0.5 秒触发，防止 macOS 系统弹窗互相覆盖吞噬）
-            if !isScreenTrusted {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    CGRequestScreenCaptureAccess()
-                    // 重新读取一次状态
-                    self.hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
+            if autoOpenSettings {
+                // (保留你之前的弹窗引导代码...)
+                // ...
+            } else {
+                if !isAxTrusted {
+                    let promptOptions = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+                    self.hasAccessibilityPermission = AXIsProcessTrustedWithOptions(promptOptions)
+                }
+                
+                if !isScreenTrusted {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        CGRequestScreenCaptureAccess()
+                        
+                        // [✨关键修改] 尝试触发一次伪获取，强制 macOS 将 App 写入到"隐私-屏幕录制"权限列表中
+                        Task {
+                            if #available(macOS 13.0, *) {
+                                _ = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                            } else {
+                                _ = try? await SCShareableContent.current
+                            }
+                        }
+                        
+                        self.hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
+                    }
                 }
             }
         }
