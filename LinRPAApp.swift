@@ -1,9 +1,6 @@
 //
 //  LinRPAApp.swift
-//  LinRPA
-//
-//  Created by 林守赞 on 2026/3/13.
-//
+//  LinRPA主程序
 
 import SwiftUI
 
@@ -15,3 +12,5 @@ struct LinRPAApp: App {
         }
     }
 }
+
+

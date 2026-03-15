@@ -102,6 +102,7 @@ class WorkflowEngine {
     
     // [✨全局变量池]
     var variables: [String: String] = [:]
+    var folders: [String] = ["默认文件夹"] { didSet { UserDefaults.standard.set(folders, forKey: "RPA_Folders") } }
     
     var hasAccessibilityPermission: Bool = false
     var hasScreenRecordingPermission: Bool = false
@@ -117,9 +118,44 @@ class WorkflowEngine {
     init() {
         isLoading = true; workflows = StorageManager.shared.load(); selectedWorkflowId = workflows.first?.id; isLoading = false
         hasUnsavedChanges = false; checkPermissions(); setupHotkeys()
+        // 初始化时加载文件夹
+        if let savedFolders = UserDefaults.standard.stringArray(forKey: "RPA_Folders") {
+            self.folders = savedFolders
+        }
+        if !self.folders.contains("默认文件夹") { self.folders.insert("默认文件夹", at: 0) }
         
         // 绑定录制器回调
         MacroRecorder.shared.onActionRecorded = { [weak self] action in self?.addRecordedAction(action) }
+    }
+    
+    // 【✨新增】文件夹 CRUD 方法
+    func addFolder(name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, !folders.contains(trimmed) else { return }
+        folders.append(trimmed)
+    }
+    
+    func renameFolder(oldName: String, newName: String) {
+        let trimmed = newName.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, !folders.contains(trimmed), oldName != "默认文件夹" else { return }
+        
+        // 1. 改文件夹列表
+        if let idx = folders.firstIndex(of: oldName) { folders[idx] = trimmed }
+        // 2. 批量把该文件夹下的工作流归属修改掉
+        for i in 0..<workflows.count {
+            if workflows[i].folderName == oldName { workflows[i].folderName = trimmed }
+        }
+        saveChanges()
+    }
+    
+    func deleteFolder(name: String) {
+        guard name != "默认文件夹" else { return } // 默认文件夹不允许删除
+        folders.removeAll { $0 == name }
+        // 自动把里面的文件踢回默认文件夹
+        for i in 0..<workflows.count {
+            if workflows[i].folderName == name { workflows[i].folderName = "默认文件夹" }
+        }
+        saveChanges()
     }
     
     private func setupHotkeys() {
@@ -156,8 +192,9 @@ class WorkflowEngine {
         }
     }
 
-    // MARK: - 权限检查与同时请求
-    func checkPermissions(autoOpenSettings: Bool = false) {
+    // MARK: - 权限检查与阶梯式引导
+    func checkPermissions(isUserInitiated: Bool = false) {
+        // 1. 静默检查当前权限状态（设置 Prompt 为 false，绝对不弹窗）
         let checkOptions = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false] as CFDictionary
         let isAxTrusted = AXIsProcessTrustedWithOptions(checkOptions)
         let isScreenTrusted = CGPreflightScreenCaptureAccess()
@@ -165,32 +202,26 @@ class WorkflowEngine {
         self.hasAccessibilityPermission = isAxTrusted
         self.hasScreenRecordingPermission = isScreenTrusted
         
-        if !isAxTrusted || !isScreenTrusted {
-            if autoOpenSettings {
-                // (保留你之前的弹窗引导代码...)
-                // ...
-            } else {
-                if !isAxTrusted {
-                    let promptOptions = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-                    self.hasAccessibilityPermission = AXIsProcessTrustedWithOptions(promptOptions)
-                }
+        // 2. 如果是用户主动点击“刷新”按钮触发的检查
+        if isUserInitiated {
+            if !isAxTrusted {
+                // 引导 1：没有辅助权限，跳转到系统设置 -> 隐私 -> 辅助功能
+                let urlString = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+                if let url = URL(string: urlString) { NSWorkspace.shared.open(url) }
                 
-                if !isScreenTrusted {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        CGRequestScreenCaptureAccess()
-                        
-                        // [✨关键修改] 尝试触发一次伪获取，强制 macOS 将 App 写入到"隐私-屏幕录制"权限列表中
-                        Task {
-                            if #available(macOS 13.0, *) {
-                                _ = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-                            } else {
-                                _ = try? await SCShareableContent.current
-                            }
-                        }
-                        
-                        self.hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
-                    }
-                }
+                // 顺便触发一次系统弹窗（如果用户之前从未被弹过的话）
+                let promptOptions = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+                AXIsProcessTrustedWithOptions(promptOptions)
+                
+            } else if !isScreenTrusted {
+                // 引导 2：有辅助权限但没有录屏权限，跳转到系统设置 -> 隐私 -> 屏幕录制
+                let urlString = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+                if let url = URL(string: urlString) { NSWorkspace.shared.open(url) }
+                
+                // 触发录屏请求系统弹窗
+                CGRequestScreenCaptureAccess()
+            } else {
+                self.log("✅ 所有必要权限均已授权！")
             }
         }
     }
@@ -209,7 +240,7 @@ class WorkflowEngine {
         if type == .setVariable { param = "myVar|测试数据" }
         if type == .httpRequest { param = "https://api.github.com|GET" }
         if type == .uiInteraction { param = "Safari|||click" }
-        if type == .webAgent { param = "在这里描述你需要它完成的任务...|Safari|true|" }
+        if type == .webAgent { param = "在这里描述你需要它完成的任务...|InternalBrowser|true|" }
         if type == .openURL { param = "https://www.bing.com|InternalBrowser" }
         workflows[idx].actions.append(RPAAction(type: type, parameter: param, customName: ""))
     }
@@ -293,42 +324,110 @@ class WorkflowEngine {
         panel.close()
     }
     
+    // MARK: - 工作流执行引擎 (支持子流程递归调用)
+        
+    /// 主流程执行入口 (由用户点击 UI 触发)
     func runCurrentWorkflow() async {
-        guard let idx = currentWorkflowIndex, !isRunning else { return }
-        let workflow = workflows[idx]
-        guard !workflow.actions.isEmpty else { return }
+        guard let id = selectedWorkflowId, !isRunning else { return }
         
-        isRunning = true; logs.removeAll(); variables.removeAll()
-        if !AXIsProcessTrusted() { log("❌ 致命错误：未获得辅助功能权限！"); isRunning = false; return }
-        await MainActor.run { if let mainWindow = NSApp.windows.first(where: { $0.className.contains("AppKitWindow") }) { mainWindow.miniaturize(nil) } }
+        // 1. 状态重置与前置校验
+        isRunning = true
+        logs.removeAll()
+        variables.removeAll() // 清空全局变量池
         
+        if !AXIsProcessTrusted() {
+            log("❌ 致命错误：未获得辅助功能权限！")
+            isRunning = false
+            return
+        }
+        
+        // 2. 根据设置决定是否隐藏主窗口防遮挡
+        let autoMinimize = UserDefaults.standard.bool(forKey: "autoMinimizeOnRun")
+        if autoMinimize {
+            await MainActor.run {
+                if let mainWindow = NSApp.windows.first(where: { $0.className.contains("AppKitWindow") }) {
+                    mainWindow.miniaturize(nil)
+                }
+            }
+        }
+        
+        // 3. 倒计时（给予用户准备与中止时间）
         log("⏱️ 准备执行，倒计时 3 秒...")
         await showCountdownHUD()
+        
+        // 如果倒计时期间用户按下了停止快捷键
         guard isRunning else { return }
         
-        log("🚀 开始执行工作流: \(workflow.name)")
+        // 4. 调用独立的核心引擎方法执行该流程
+        _ = await runWorkflow(by: id)
+        
+        // 5. 流程结束收尾
+        if isRunning { log("✅ 所有流程执行完成！") }
+        currentActionId = nil
+        isRunning = false
+    }
+    
+    /// 独立工作流执行方法 (供主流程和子流程调度器调用)
+    /// - Parameter id: 要执行的 Workflow 的 UUID
+    /// - Returns: 是否顺利执行完成
+    func runWorkflow(by id: UUID) async -> Bool {
+        guard let workflow = workflows.first(where: { $0.id == id }) else {
+            log("❌ 找不到 ID 为 \(id) 的工作流")
+            return false
+        }
+        
+        guard !workflow.actions.isEmpty else {
+            log("⚠️ 工作流 [\(workflow.name)] 是空的，跳过。")
+            return true
+        }
+        
+        log("🚀 开始执行工作流: [\(workflow.name)]")
+        
+        // 1. 寻找启动节点 (没有被其他节点当作终点连线的节点即为起点)
         let allTargetIDs = Set(workflow.connections.map { $0.endNodeID })
         var startNodes = workflow.actions.filter { !allTargetIDs.contains($0.id) }
-        if startNodes.isEmpty { if let firstAction = workflow.actions.first { startNodes = [firstAction]; log("⚠️ 未检测到明确起点，强制从第一节点发起。") } else { isRunning = false; return } }
         
+        if startNodes.isEmpty {
+            if let firstAction = workflow.actions.first {
+                startNodes = [firstAction]
+                log("⚠️ 未检测到明确起点，强制从第一节点发起。")
+            } else {
+                return false
+            }
+        }
+        
+        // 2. 构建执行队列
         var executionQueue: [UUID] = startNodes.map { $0.id }
+        
+        // 3. 核心流转循环
         while !executionQueue.isEmpty && isRunning {
             let actionID = executionQueue.removeFirst()
             guard let action = workflow.actions.first(where: { $0.id == actionID }) else { continue }
+            
+            // UI 高亮当前节点
             currentActionId = action.id
             log("▶️ 执行: [\(action.displayTitle)]")
             
-            // [✨核心修改] 委托给解耦的 Executor 执行
+            // 委托给解耦的 Executor 执行具体物理动作
             let executor = ActionExecutorFactory.getExecutor(for: action.type)
             let executeResult = await executor.execute(action: action, context: self)
             
+            // 节点间的缓冲等待
             try? await Task.sleep(for: .milliseconds(50))
             
-            let nextConnections = workflow.connections.filter { $0.startNodeID == actionID && ($0.condition == .always || $0.condition == executeResult) }
-            for conn in nextConnections { executionQueue.append(conn.endNodeID) }
+            // 根据执行结果（success / failure / always）寻找下一条符合条件的连线
+            let nextConnections = workflow.connections.filter {
+                $0.startNodeID == actionID && ($0.condition == .always || $0.condition == executeResult)
+            }
+            
+            // 将下一个节点压入执行队列
+            for conn in nextConnections {
+                executionQueue.append(conn.endNodeID)
+            }
         }
-        if isRunning { log("✅ 所有流程执行完成！") }
-        currentActionId = nil; isRunning = false
+        
+        // 如果 isRunning 依然为 true，说明是自然流转完成，否则是被用户强行中断
+        return isRunning
     }
     
     // MARK: - 基础底层能力（已向外部开放）
@@ -596,5 +695,13 @@ class WorkflowEngine {
                 try? await Task.sleep(for: .seconds(1))
             }
         }
+    }
+    
+    // MARK: - WebAgent 辅助：获取页面可见文本用于断言
+    @MainActor
+    func getPageText(browser: String) async -> String {
+        // 使用 innerText 可以过滤掉隐藏元素，完美模拟用户的“视觉可见文本”
+        let script = "document.body.innerText"
+        return (try? await executeJS(browser: browser, script: script)) ?? ""
     }
 }

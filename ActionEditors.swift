@@ -19,30 +19,45 @@ struct ActionSettingsPopoverView: View {
             let parts = action.parameter.components(separatedBy: "|")
             let url = parts.count > 0 ? parts[0] : action.parameter
             let browser = parts.count > 1 ? parts[1] : "InternalBrowser"
+            let silent = parts.count > 2 ? (parts[2] == "true") : false // [✨新增]
             
             VStack(alignment: .leading, spacing: 10) {
-                TextField("网址 (例如: https://bing.com)", text: Binding(get: { url }, set: { action.parameter = "\($0)|\(browser)" }))
+                TextField("网址 (例如: https://bing.com)", text: Binding(get: { url }, set: { action.parameter = "\($0)|\(browser)|\(silent ? "true" : "false")" }))
                     .textFieldStyle(.roundedBorder)
                 
                 HStack {
                     Text("目标浏览器:").font(.caption)
-                    Picker("", selection: Binding(get: { browser }, set: { action.parameter = "\(url)|\($0)" })) {
+                    Picker("", selection: Binding(get: { browser }, set: { action.parameter = "\(url)|\($0)|\(silent ? "true" : "false")" })) {
                         Text("🚀 内置开发者浏览器").tag("InternalBrowser")
                         Text("系统默认浏览器").tag("System")
                         Text("Safari").tag("Safari")
                         Text("Google Chrome").tag("Google Chrome")
                     }.labelsHidden().frame(width: 160)
                 }
-                Text("如果选择内置浏览器，将自动新建标签页。").font(.caption2).foregroundColor(.secondary)
+                
+                Toggle("🥷 后台静默运行 (不激活浏览器到最前)", isOn: Binding(get: { silent }, set: { action.parameter = "\(url)|\(browser)|\($0 ? "true" : "false")" }))
+                    .toggleStyle(.switch).controlSize(.mini).tint(.blue)
+            }
+        case .openApp:
+            let parts = action.parameter.components(separatedBy: "|")
+            let appName = parts.count > 0 ? parts[0] : action.parameter
+            let silent = parts.count > 1 ? (parts[1] == "true") : false // [✨新增]
+            
+            VStack(alignment: .leading, spacing: 10) {
+                TextField("App 名称 (例如: Safari, Finder)", text: Binding(get: { appName }, set: { action.parameter = "\($0)|\(silent ? "true" : "false")" }))
+                    .textFieldStyle(.roundedBorder)
+                
+                Toggle("🥷 后台静默运行 (不唤醒到前台)", isOn: Binding(get: { silent }, set: { action.parameter = "\(appName)|\($0 ? "true" : "false")" }))
+                    .toggleStyle(.switch).controlSize(.mini).tint(.blue)
+                Text("开启后会在后台启动程序，不打断您当前的工作。").font(.caption2).foregroundColor(.secondary)
             }
         case .webAgent: WebAgentEditor(action: $action)
-        case .uiInteraction: // [✨修改] 原生 UI 自动化表单（支持模式和索引）
+        case .uiInteraction: // 原生 UI 自动化表单（支持模式和索引）
             let parts = action.parameter.components(separatedBy: "|")
             let targetApp = parts.count > 0 ? parts[0] : ""
             let targetRole = parts.count > 1 ? parts[1] : ""
             let targetTitle = parts.count > 2 ? parts[2] : ""
             let interactionType = parts.count > 3 ? parts[3] : "click"
-            // [✨新增参数]
             let matchMode = parts.count > 4 ? parts[4] : "exact"
             let targetIndex = parts.count > 5 ? parts[5] : "-1" // -1 代表不限
             
@@ -75,7 +90,7 @@ struct ActionSettingsPopoverView: View {
                     TextField("元素文本(可为空)", text: Binding(get: { targetTitle }, set: { updateParam(targetApp, targetRole, $0, interactionType, matchMode, targetIndex) })).textFieldStyle(.roundedBorder)
                 }
                 
-                // [✨核心新增] 匹配规则与索引配置区
+                // 匹配规则与索引配置区
                 HStack {
                     Text("匹配规则:").font(.caption).frame(width: 60, alignment: .leading)
                     Picker("", selection: Binding(get: { matchMode }, set: { updateParam(targetApp, targetRole, targetTitle, interactionType, $0, targetIndex) })) {
@@ -105,22 +120,16 @@ struct ActionSettingsPopoverView: View {
                         }
                     }
                     
-                    // [✨新增] 如果用户已经选择了目标 App，先将其强制激活到最前端
+                    // 如果用户已经选择了目标 App，先将其强制激活到最前端
                     if !targetApp.isEmpty,
                        let appToActivate = NSWorkspace.shared.runningApplications.first(where: { $0.localizedName == targetApp }) {
-                        
-                        // 强制激活目标应用（忽略其他挡在前面的应用）
                         appToActivate.activate(options: .activateIgnoringOtherApps)
-                        
-                        // 延迟 0.3 秒，等待系统的窗口切换动画完成后，再呼出拾取器透明遮罩
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                             startPicking()
                         }
                     } else {
-                        // 如果没有选择 App，直接呼出拾取器
                         startPicking()
                     }
-                    
                 }) {
                     Label("🕵️ 瞄准拾取 UI 元素", systemImage: "viewfinder")
                         .frame(maxWidth: .infinity)
@@ -155,68 +164,94 @@ struct ActionSettingsPopoverView: View {
                 HStack {
                     TextField("输入文本", text: $action.parameter)
                         .textFieldStyle(.roundedBorder)
-                    
                     Menu {
-                        // 基础功能
                         Button("[ENTER] 回车") { action.parameter += "[ENTER]" }
                         Button("[BACKSPACE] 退格") { action.parameter += "[BACKSPACE]" }
-                        
                         Divider()
-                        
-                        // 组合快捷键
                         Group {
                             Button("全选 (CMD+A)") { action.parameter += "[CMD+A]" }
                             Button("复制 (CMD+C)") { action.parameter += "[CMD+C]" }
                             Button("粘贴 (CMD+V)") { action.parameter += "[CMD+V]" }
                         }
-                        
                         Divider()
-                        
-                        // 导航快捷键
                         Group {
                             Button("跳至顶端 (CMD+UP)") { action.parameter += "[CMD+UP]" }
                             Button("跳至底端 (CMD+DOWN)") { action.parameter += "[CMD+DOWN]" }
                         }
-                        
                         Divider()
-                        
                         Button("剪贴板变量") { action.parameter += "{{clipboard}}" }
-                    } label: {
-                        Image(systemName: "keyboard.badge.ellipsis")
-                    }
-                    .fixedSize()
+                    } label: { Image(systemName: "keyboard.badge.ellipsis") }.fixedSize()
                 }
-                Text("支持组合键如 [CMD+A]、[BACKSPACE] 及变量")
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary)
+                Text("支持组合键如 [CMD+A]、[BACKSPACE] 及变量").font(.system(size: 10)).foregroundColor(.secondary)
             }
         case .wait: HStack { TextField("秒数", text: $action.parameter).textFieldStyle(.roundedBorder); Text("秒") }
+        case .callWorkflow:
+            VStack(alignment: .leading, spacing: 10) {
+                Text("选择要执行的子工作流：").font(.caption)
+                
+                let allWorkflows = StorageManager.shared.load()
+                
+                // 【✨核心修复 1】通过当前 action 的 ID 反查它属于哪个工作流，从而拿到“当前工作流 ID”
+                let currentWorkflowId = allWorkflows.first(where: { wf in
+                    wf.actions.contains(where: { $0.id == action.id })
+                })?.id.uuidString ?? ""
+                
+                // 使用原生的 Picker 绑定
+                Picker("", selection: $action.parameter) {
+                    Text("请选择...").tag("")
+                    
+                    ForEach(allWorkflows) { wf in
+                        // 【✨核心修复 2】只排除“当前工作流”自己，彻底杜绝死循环，且不会导致选中后变空白
+                        if wf.id.uuidString != currentWorkflowId {
+                            Text(wf.name).tag(wf.id.uuidString)
+                        }
+                    }
+                }
+                .labelsHidden()
+                
+                Text("执行到此节点时，将挂起当前流程，等待子流程执行完毕后继续。").font(.caption2).foregroundColor(.secondary)
+            }
         default: TextField("参数设置", text: $action.parameter).textFieldStyle(.roundedBorder)
         }
     }
 }
 
-// MARK: - [✨新增] Web 智能体极客编辑器
+// MARK: - [✨优化] Web 智能体 3.0 编辑器
 struct WebAgentEditor: View {
     @Binding var action: RPAAction
     
     var body: some View {
-        // [✨修改] maxSplits 改为 4，以支持第 5 个参数 (截屏模式)
-        let parts = action.parameter.split(separator: "|", maxSplits: 4, omittingEmptySubsequences: false).map(String.init)
-        let taskDesc = parts.count > 0 ? parts[0] : ""
-        let browser = parts.count > 1 ? parts[1] : "Safari"
-        let requireConfirm = parts.count > 2 ? (parts[2] == "true") : true
-        let manualText = parts.count > 3 ? parts[3] : ""
-        let captureMode = parts.count > 4 ? parts[4] : "app" // 默认只截取 App
+        // maxSplits 改为 6，以支持 7 个参数 (加入静默模式)
+        let parts = action.parameter.split(separator: "|", maxSplits: 6, omittingEmptySubsequences: false).map(String.init)
         
-        let updateParam = { (task: String, brs: String, conf: Bool, man: String, mode: String) in
-            action.parameter = "\(task)|\(brs)|\(conf ? "true" : "false")|\(man)|\(mode)"
+        // 1. 任务目标
+        let taskDesc = parts.count > 0 ? parts[0] : ""
+        // 2. 目标浏览器 (默认内置极速浏览器)
+        let browser = parts.count > 1 ? (parts[1].isEmpty ? "InternalBrowser" : parts[1]) : "InternalBrowser"
+        // 3. 人工确认
+        let requireConfirm = parts.count > 2 ? (parts[2] == "true") : true
+        // 4. 操作手册 RAG
+        let manualText = parts.count > 3 ? parts[3] : ""
+        // 5. 视觉范围
+        let captureMode = parts.count > 4 ? parts[4] : "app"
+        // 6. 断言关键字
+        let successKeywords = parts.count > 5 ? parts[5] : ""
+        
+        // 7. [✨核心逻辑] 静默模式：默认开启。如果选择了全屏截取，强制为 false。
+        let rawSilent = parts.count > 6 ? (parts[6] == "true") : true
+        let silentMode = (captureMode == "fullscreen") ? false : rawSilent
+        
+        // 更新参数的闭包
+        let updateParam = { (task: String, brs: String, conf: Bool, man: String, mode: String, kw: String, silent: Bool) in
+            action.parameter = "\(task)|\(brs)|\(conf ? "true" : "false")|\(man)|\(mode)|\(kw)|\(silent ? "true" : "false")"
         }
         
         VStack(alignment: .leading, spacing: 16) {
+            
+            // --- 任务目标 ---
             VStack(alignment: .leading, spacing: 6) {
                 Label("🎯 智能体任务目标", systemImage: "flag.checkered").font(.subheadline).bold()
-                TextEditor(text: Binding(get: { taskDesc }, set: { updateParam($0, browser, requireConfirm, manualText, captureMode) }))
+                TextEditor(text: Binding(get: { taskDesc }, set: { updateParam($0, browser, requireConfirm, manualText, captureMode, successKeywords, silentMode) }))
                     .font(.system(size: 12))
                     .frame(height: 60)
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
@@ -225,32 +260,54 @@ struct WebAgentEditor: View {
             
             Divider()
             
+            // --- 操作手册 ---
             VStack(alignment: .leading, spacing: 6) {
                 Label("📚 注入操作手册 (可选 RAG)", systemImage: "book.pages").font(.subheadline).bold()
-                TextEditor(text: Binding(get: { manualText }, set: { updateParam(taskDesc, browser, requireConfirm, $0, captureMode) }))
+                TextEditor(text: Binding(get: { manualText }, set: { updateParam(taskDesc, browser, requireConfirm, $0, captureMode, successKeywords, silentMode) }))
                     .font(.system(size: 11, design: .monospaced))
-                    .frame(height: 100)
+                    .frame(height: 60)
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
-                Text("粘贴此系统的操作要求或注意事项，Agent 遇到卡点时会自动查阅。").font(.caption2).foregroundColor(.secondary)
+                Text("粘贴此系统的操作要求，Agent 遇到卡点时会自动查阅。").font(.caption2).foregroundColor(.secondary)
             }
             
             Divider()
             
+            // --- 成功断言 ---
+            VStack(alignment: .leading, spacing: 6) {
+                Label("✅ 执行成功断言 (本地极速校验)", systemImage: "checkmark.seal.fill").font(.subheadline).bold()
+                TextField("标志性文字 (如: 提交成功) 多词用逗号隔开", text: Binding(get: { successKeywords }, set: { updateParam(taskDesc, browser, requireConfirm, manualText, captureMode, $0, silentMode) }))
+                    .textFieldStyle(.roundedBorder)
+                Text("AI 每次交互后会暂停并提取页面文字，若命中此关键词则立即判定成功结束任务，杜绝死循环。").font(.caption2).foregroundColor(.secondary)
+            }
+            
+            Divider()
+            
+            // --- 底层交互控制 ---
             VStack(alignment: .leading, spacing: 10) {
                 Label("⚙️ 底层交互控制", systemImage: "cpu").font(.subheadline).bold()
                 
-                Picker("目标浏览器:", selection: Binding(get: { browser }, set: { updateParam(taskDesc, $0, requireConfirm, manualText, captureMode) })) {
+                Picker("目标浏览器:", selection: Binding(get: { browser }, set: { updateParam(taskDesc, $0, requireConfirm, manualText, captureMode, successKeywords, silentMode) })) {
                     Text("🚀 内置开发者浏览器 (极速原生)").tag("InternalBrowser")
                     Text("Safari (AppleScript Bridge)").tag("Safari")
                 }.frame(width: 250)
 
-                // [✨新增] 截屏范围配置项
-                Picker("视觉范围:", selection: Binding(get: { captureMode }, set: { updateParam(taskDesc, browser, requireConfirm, manualText, $0) })) {
+                // 当视觉范围改变时，同步处理静默模式的强制状态
+                Picker("视觉范围:", selection: Binding(get: { captureMode }, set: { newMode in
+                    let finalSilent = (newMode == "fullscreen") ? false : silentMode
+                    updateParam(taskDesc, browser, requireConfirm, manualText, newMode, successKeywords, finalSilent)
+                })) {
                     Text("仅截取目标程序 (专注无干扰)").tag("app")
                     Text("全屏截取 (视野大，但容易误判)").tag("fullscreen")
                 }.frame(width: 280)
 
-                Toggle("🛡️ 开启 Human-in-the-loop (执行关键动作前人工确认)", isOn: Binding(get: { requireConfirm }, set: { updateParam(taskDesc, browser, $0, manualText, captureMode) }))
+                // [✨联动核心] 禁用与强制取消
+                Toggle("🥷 开启后台静默运行 (不抢夺前台焦点)", isOn: Binding(get: { silentMode }, set: { updateParam(taskDesc, browser, requireConfirm, manualText, captureMode, successKeywords, $0) }))
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .tint(.blue)
+                    .disabled(captureMode == "fullscreen") // 全屏时不可选
+
+                Toggle("🛡️ 开启 Human-in-the-loop (执行动作前人工确认)", isOn: Binding(get: { requireConfirm }, set: { updateParam(taskDesc, browser, $0, manualText, captureMode, successKeywords, silentMode) }))
                     .toggleStyle(.switch)
                     .controlSize(.small)
                     .tint(.purple)
@@ -317,23 +374,18 @@ class ScreenRegionPicker {
     }
 }
 
-// MARK: - [✨坚如磐石版] 原生 UI 元素拾取器 (防死锁 + 安全析构)
-
+// MARK: - 原生 UI 元素拾取器
 class UIElementPickerOverlayView: NSView {
     var highlightRect: NSRect = .zero { didSet { needsDisplay = true } }
-    
-    // 缓存数据，保证主线程点击时绝对安全，避免 IPC 阻塞
     var cachedAppName = ""
     var cachedRole = ""
     var cachedTitle = ""
-    
     private let axQueue = DispatchQueue(label: "com.rpa.axqueue", qos: .userInteractive)
     private var isFetching = false
     
     func updateHighlight(at point: CGPoint) {
         guard !isFetching else { return }
         isFetching = true
-        
         axQueue.async { [weak self] in
             guard let self = self else { return }
             self.fetchElement(at: point)
@@ -343,239 +395,100 @@ class UIElementPickerOverlayView: NSView {
     private func fetchElement(at point: CGPoint) {
         let systemWide = AXUIElementCreateSystemWide()
         var element: AXUIElement?
-        
         let error = AXUIElementCopyElementAtPosition(systemWide, Float(point.x), Float(point.y), &element)
-        
-        // 1. 如果没获取到元素，安全释放锁
         guard error == .success, let axElement = element else {
-            DispatchQueue.main.async { [weak self] in
-                self?.highlightRect = .zero
-                self?.cachedAppName = ""
-                self?.isFetching = false
-            }
+            DispatchQueue.main.async { [weak self] in self?.highlightRect = .zero; self?.cachedAppName = ""; self?.isFetching = false }
             return
         }
         
-        // 2. 防呆：绝对禁止拾取 RPA 自身的 UI，防止死循环
         var pid: pid_t = 0
         if AXUIElementGetPid(axElement, &pid) == .success, pid == ProcessInfo.processInfo.processIdentifier {
-            DispatchQueue.main.async { [weak self] in
-                self?.highlightRect = .zero
-                self?.cachedAppName = ""
-                self?.isFetching = false
-            }
+            DispatchQueue.main.async { [weak self] in self?.highlightRect = .zero; self?.cachedAppName = ""; self?.isFetching = false }
             return
         }
         
-        // 3. 获取属性
-        var role = ""
-        var title = ""
-        let appName = NSRunningApplication(processIdentifier: pid)?.localizedName ?? ""
-        
+        var role = ""; var title = ""; let appName = NSRunningApplication(processIdentifier: pid)?.localizedName ?? ""
         var attrVal: CFTypeRef? = nil
-        if AXUIElementCopyAttributeValue(axElement, kAXRoleAttribute as CFString, &attrVal) == .success {
-            role = attrVal as? String ?? ""
+        if AXUIElementCopyAttributeValue(axElement, kAXRoleAttribute as CFString, &attrVal) == .success { role = attrVal as? String ?? "" }
+        if AXUIElementCopyAttributeValue(axElement, kAXTitleAttribute as CFString, &attrVal) == .success { title = attrVal as? String ?? "" }
+        
+        var position = CGPoint.zero; var size = CGSize.zero
+        if AXUIElementCopyAttributeValue(axElement, kAXPositionAttribute as CFString, &attrVal) == .success, let val = attrVal, CFGetTypeID(val) == AXValueGetTypeID() {
+            let axVal = val as! AXValue; if AXValueGetType(axVal) == .cgPoint { AXValueGetValue(axVal, .cgPoint, &position) }
         }
-        if AXUIElementCopyAttributeValue(axElement, kAXTitleAttribute as CFString, &attrVal) == .success {
-            title = attrVal as? String ?? ""
+        if AXUIElementCopyAttributeValue(axElement, kAXSizeAttribute as CFString, &attrVal) == .success, let val = attrVal, CFGetTypeID(val) == AXValueGetTypeID() {
+            let axVal = val as! AXValue; if AXValueGetType(axVal) == .cgSize { AXValueGetValue(axVal, .cgSize, &size) }
         }
         
-        var position = CGPoint.zero
-        // 严格检验内存 DNA，防范 32 字节 CGRect 塞入 16 字节 CGPoint 导致的栈溢出
-        if AXUIElementCopyAttributeValue(axElement, kAXPositionAttribute as CFString, &attrVal) == .success,
-           let val = attrVal, CFGetTypeID(val) == AXValueGetTypeID() {
-            let axVal = val as! AXValue
-            if AXValueGetType(axVal) == .cgPoint { AXValueGetValue(axVal, .cgPoint, &position) }
-        }
-        
-        var size = CGSize.zero
-        if AXUIElementCopyAttributeValue(axElement, kAXSizeAttribute as CFString, &attrVal) == .success,
-           let val = attrVal, CFGetTypeID(val) == AXValueGetTypeID() {
-            let axVal = val as! AXValue
-            if AXValueGetType(axVal) == .cgSize { AXValueGetValue(axVal, .cgSize, &size) }
-        }
-        
-        // 4. 切回主线程渲染，并释放 Fetching 锁
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             if size.width > 0 && size.height > 0 {
-                self.cachedAppName = appName
-                self.cachedRole = role
-                self.cachedTitle = title
-                if let screen = NSScreen.main {
-                    let y = screen.frame.height - position.y - size.height
-                    self.highlightRect = NSRect(x: position.x, y: y, width: size.width, height: size.height)
-                }
-            } else {
-                self.highlightRect = .zero
-                self.cachedAppName = ""
-            }
+                self.cachedAppName = appName; self.cachedRole = role; self.cachedTitle = title
+                if let screen = NSScreen.main { self.highlightRect = NSRect(x: position.x, y: screen.frame.height - position.y - size.height, width: size.width, height: size.height) }
+            } else { self.highlightRect = .zero; self.cachedAppName = "" }
             self.isFetching = false
         }
     }
     
     override func draw(_ dirtyRect: NSRect) {
         NSColor.clear.set(); bounds.fill()
-        if highlightRect != .zero {
-            NSColor.systemRed.withAlphaComponent(0.4).setStroke()
-            NSColor.systemRed.withAlphaComponent(0.1).setFill()
-            let path = NSBezierPath(rect: highlightRect)
-            path.lineWidth = 3.0
-            path.stroke()
-            path.fill()
-        }
+        if highlightRect != .zero { NSColor.systemRed.withAlphaComponent(0.4).setStroke(); NSColor.systemRed.withAlphaComponent(0.1).setFill(); let path = NSBezierPath(rect: highlightRect); path.lineWidth = 3.0; path.stroke(); path.fill() }
     }
 }
 
 class UIElementPicker {
     static let shared = UIElementPicker()
-    private var window: NSWindow?
-    private var overlayView: UIElementPickerOverlayView?
-    private var eventTap: CFMachPort?
-    private var runLoopSource: CFRunLoopSource?
-    
-    private var isPicking = false
-    fileprivate var isCleaningUp = false
+    private var window: NSWindow?; private var overlayView: UIElementPickerOverlayView?
+    private var eventTap: CFMachPort?; private var runLoopSource: CFRunLoopSource?
+    private var isPicking = false; fileprivate var isCleaningUp = false
     private var pickCompletion: ((String, String, String) -> Void)?
     
     @MainActor func pickElement(completion: @escaping (String, String, String) -> Void) {
         guard !isPicking else { return }
-        isPicking = true
-        isCleaningUp = false
-        pickCompletion = completion
-        
+        isPicking = true; isCleaningUp = false; pickCompletion = completion
         NSApp.windows.first(where: { $0.className.contains("AppKitWindow") })?.miniaturize(nil)
         
         let totalRect = NSScreen.screens.reduce(CGRect.zero) { $0.union($1.frame) }
         let win = NSWindow(contentRect: totalRect, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        win.level = .screenSaver
-        win.backgroundColor = .clear
-        win.isOpaque = false
-        win.hasShadow = false
-        win.ignoresMouseEvents = true
-        win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        win.level = .screenSaver; win.backgroundColor = .clear; win.isOpaque = false; win.hasShadow = false; win.ignoresMouseEvents = true; win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]; win.isReleasedWhenClosed = false
         
-        // [✨修复 1：关闭窗口自动释放陷阱] 防止调用 close() 和 window=nil 造成的双重释放 (Double Free) 崩溃！
-        win.isReleasedWhenClosed = false
+        let overlay = UIElementPickerOverlayView(); win.contentView = overlay; win.makeKeyAndOrderFront(nil)
+        self.window = win; self.overlayView = overlay
         
-        let overlay = UIElementPickerOverlayView()
-        win.contentView = overlay
-        win.makeKeyAndOrderFront(nil)
-        
-        self.window = win
-        self.overlayView = overlay
-        
-        // [✨修复 2：补全鼠标拦截闭环] 必须同时拦截 Down 和 Up 事件！
-        let eventMask = (1 << CGEventType.leftMouseDown.rawValue) |
-                        (1 << CGEventType.leftMouseUp.rawValue) |
-                        (1 << CGEventType.mouseMoved.rawValue) |
-                        (1 << CGEventType.keyDown.rawValue)
-        
+        let eventMask = (1 << CGEventType.leftMouseDown.rawValue) | (1 << CGEventType.leftMouseUp.rawValue) | (1 << CGEventType.mouseMoved.rawValue) | (1 << CGEventType.keyDown.rawValue)
         let callback: CGEventTapCallBack = { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
             guard let ref = refcon else { return Unmanaged.passUnretained(event) }
             let picker = Unmanaged<UIElementPicker>.fromOpaque(ref).takeUnretainedValue()
-            
-            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                if !picker.isCleaningUp, let tap = picker.eventTap {
-                    CGEvent.tapEnable(tap: tap, enable: true)
-                }
-                return Unmanaged.passUnretained(event)
-            }
-            
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput { if !picker.isCleaningUp, let tap = picker.eventTap { CGEvent.tapEnable(tap: tap, enable: true) }; return Unmanaged.passUnretained(event) }
             if picker.isCleaningUp { return Unmanaged.passUnretained(event) }
-            
-            if type == .mouseMoved {
-                let loc = event.location
-                DispatchQueue.main.async { picker.overlayView?.updateHighlight(at: loc) }
-                return Unmanaged.passUnretained(event)
-                
-            } else if type == .leftMouseDown {
-                // 拦截按下，并触发拾取
-                DispatchQueue.main.async { picker.handleMouseDown() }
-                return nil
-                
-            } else if type == .leftMouseUp {
-                // [✨修复 2] 拦截抬起，阻止半截事件流入系统导致崩溃
-                return nil
-                
-            } else if type == .keyDown {
-                if event.getIntegerValueField(.keyboardEventKeycode) == 53 { // ESC 退出
-                    DispatchQueue.main.async { picker.cancelPicking() }
-                    return nil
-                }
-            }
+            if type == .mouseMoved { DispatchQueue.main.async { picker.overlayView?.updateHighlight(at: event.location) }; return Unmanaged.passUnretained(event) }
+            else if type == .leftMouseDown { DispatchQueue.main.async { picker.handleMouseDown() }; return nil }
+            else if type == .leftMouseUp { return nil }
+            else if type == .keyDown { if event.getIntegerValueField(.keyboardEventKeycode) == 53 { DispatchQueue.main.async { picker.cancelPicking() }; return nil } }
             return Unmanaged.passUnretained(event)
         }
         
-        eventTap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
-            options: .defaultTap,
-            eventsOfInterest: CGEventMask(eventMask),
-            callback: callback,
-            userInfo: Unmanaged.passUnretained(self).toOpaque()
-        )
-        
-        if let tap = eventTap {
-            runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-            CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
-            CGEvent.tapEnable(tap: tap, enable: true)
-        } else {
-            cancelPicking()
-        }
+        eventTap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap, eventsOfInterest: CGEventMask(eventMask), callback: callback, userInfo: Unmanaged.passUnretained(self).toOpaque())
+        if let tap = eventTap { runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0); CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes); CGEvent.tapEnable(tap: tap, enable: true) } else { cancelPicking() }
     }
     
     func handleMouseDown() {
         guard !isCleaningUp else { return }
-        isCleaningUp = true
-        
-        if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
-        
-        let appName = overlayView?.cachedAppName ?? ""
-        let role = overlayView?.cachedRole ?? ""
-        let title = overlayView?.cachedTitle ?? ""
-        
-        if appName.isEmpty {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { self.performCleanup() }
-            return
-        }
-        
-        self.pickCompletion?(appName, role, title)
-        
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            self.performCleanup()
-        }
+        isCleaningUp = true; if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
+        let appName = overlayView?.cachedAppName ?? ""; let role = overlayView?.cachedRole ?? ""; let title = overlayView?.cachedTitle ?? ""
+        if appName.isEmpty { DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { self.performCleanup() }; return }
+        self.pickCompletion?(appName, role, title); DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { self.performCleanup() }
     }
     
     func cancelPicking() {
         guard !isCleaningUp else { return }
-        isCleaningUp = true
-        
-        if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
-        
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            self.performCleanup()
-        }
+        isCleaningUp = true; if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { self.performCleanup() }
     }
     
     private func performCleanup() {
-        if let tap = eventTap {
-            // [✨修复 3：完美底层剥离] 必须先从 RunLoop 移除，再废弃端口
-            if let runLoop = runLoopSource {
-                CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoop, .commonModes)
-            }
-            CFMachPortInvalidate(tap)
-            eventTap = nil
-        }
-        runLoopSource = nil
-        
-        window?.close()
-        window = nil
-        overlayView = nil
-        isPicking = false
-        isCleaningUp = false
-        pickCompletion = nil
-        
+        if let tap = eventTap { if let runLoop = runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoop, .commonModes) }; CFMachPortInvalidate(tap); eventTap = nil }
+        runLoopSource = nil; window?.close(); window = nil; overlayView = nil; isPicking = false; isCleaningUp = false; pickCompletion = nil
         NSApp.windows.first(where: { $0.className.contains("AppKitWindow") })?.deminiaturize(nil)
     }
 }

@@ -26,7 +26,7 @@ enum ActionType: String, CaseIterable, Codable {
     case writeClipboard = "写入剪贴板"
     case ocrText = "识别屏幕文字"
     case aiVision = "AI屏幕视觉分析"
-    case webAgent = "🌟 Web智能体自主操作" // [✨新增] Web Agent 3.0
+    case webAgent = "Web智能体自主操作" // [✨新增] Web Agent 3.0
     case condition = "条件判断分支"
     case wait = "等待延时"
     case runShell = "执行Shell脚本"
@@ -34,13 +34,14 @@ enum ActionType: String, CaseIterable, Codable {
     case setVariable = "设置全局变量"
     case httpRequest = "发送HTTP请求"
     case uiInteraction = "原生UI元素交互"
+    case callWorkflow = "调用子工作流"
     
     var category: ActionCategory {
         switch self {
         case .openApp, .openURL, .showNotification, .uiInteraction: return .system
         case .typeText, .mouseOperation, .readClipboard, .writeClipboard: return .mouseKeyboard
         case .ocrText, .aiVision, .webAgent: return .aiVision
-        case .condition, .wait, .runShell, .runAppleScript, .setVariable, .httpRequest: return .logicData
+        case .condition, .wait, .runShell, .runAppleScript, .setVariable, .httpRequest, .callWorkflow: return .logicData
         }
     }
     
@@ -63,6 +64,7 @@ enum ActionType: String, CaseIterable, Codable {
         case .setVariable: return "tray.full.fill"
         case .httpRequest: return "network"
         case .uiInteraction: return "macwindow.on.rectangle"
+        case .callWorkflow: return "arrow.triangle.merge"
         }
     }
 }
@@ -149,13 +151,37 @@ struct RPAAction: Identifiable, Codable, Equatable, Hashable {
 }
 
 struct Workflow: Identifiable, Codable, Hashable {
-    var id = UUID()
+    var id: UUID
     var name: String
+    var folderName: String
     var actions: [RPAAction]
     var connections: [WorkflowConnection]
     
-    init(name: String, actions: [RPAAction] = [], connections: [WorkflowConnection] = []) {
-        self.name = name; self.actions = actions; self.connections = connections
+    // 手动映射字段
+    enum CodingKeys: String, CodingKey {
+        case id, name, folderName, actions, connections
+    }
+    
+    // 默认初始化
+    init(id: UUID = UUID(), name: String, folderName: String = "默认文件夹", actions: [RPAAction] = [], connections: [WorkflowConnection] = []) {
+        self.id = id
+        self.name = name
+        self.folderName = folderName
+        self.actions = actions
+        self.connections = connections
+    }
+    
+    // 【✨核心修复】兼容旧版本 JSON 数据的解码器
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        self.name = try container.decodeIfPresent(String.self, forKey: .name) ?? "未命名流程"
+        
+        // 如果旧 JSON 里没有 folderName 字段，自动赋值为 "默认文件夹" 而不是崩溃
+        self.folderName = try container.decodeIfPresent(String.self, forKey: .folderName) ?? "默认文件夹"
+        
+        self.actions = try container.decodeIfPresent([RPAAction].self, forKey: .actions) ?? []
+        self.connections = try container.decodeIfPresent([WorkflowConnection].self, forKey: .connections) ?? []
     }
 }
 

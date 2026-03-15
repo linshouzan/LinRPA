@@ -27,69 +27,136 @@ struct ContentView: View {
     @State private var snapLineY: CGFloat? = nil
     @State private var hoveredWorkflowId: UUID? = nil
     
+    @State private var showNewFolderAlert = false
+    @State private var showRenameFolderAlert = false
+    @State private var tempFolderName = ""
+    @State private var targetFolderToRename = ""
+    
     let nodeWidth: CGFloat = 145
     let nodeHeight: CGFloat = 55
     let snapDistance: CGFloat = 40.0
     
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
-            List(selection: $engine.selectedWorkflowId) {
-                ForEach($engine.workflows) { $workflow in
-                    NavigationLink(value: workflow.id) {
-                        HStack {
-                            TextField("流程名称", text: $workflow.name).textFieldStyle(.plain)
-                            Spacer()
-                            if hoveredWorkflowId == workflow.id {
-                                Button(action: { engine.deleteWorkflow(id: workflow.id) }) { Image(systemName: "trash").foregroundColor(.red).font(.system(size: 13)) }.buttonStyle(.plain)
+            // 替换 ContentView 中的 List 区域
+            VStack(spacing: 0) {
+                // 头部工具栏
+                HStack {
+                    Text("RPA 流程库").font(.headline)
+                    Spacer()
+                    Menu {
+                        Button("新建工作流", action: { engine.createNewWorkflow() })
+                        Button("新建文件夹", action: { tempFolderName = ""; showNewFolderAlert = true })
+                    } label: {
+                        Image(systemName: "plus.circle.fill").imageScale(.large).foregroundColor(.blue)
+                    }.menuStyle(.borderlessButton)
+                    Spacer()
+                    Button(action: {
+                        // 唤起 macOS 原生设置窗口
+                        if #available(macOS 13.0, *) {
+                            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                        } else {
+                            NSApp.sendAction(#selector(NSWindowController.showWindow(_:)), to: nil, from: nil)
+                        }
+                    }) {
+                        Image(systemName: "gearshape.fill")
+                            .foregroundColor(.secondary)
+                    }
+                    .help("全局设置")
+                }
+                .padding()
+                
+                Divider()
+                
+                // 列表区域
+                List(selection: $engine.selectedWorkflowId) {
+                    // 按照 engine 维护的 folders 顺序渲染
+                    ForEach(engine.folders, id: \.self) { folderName in
+                        Section {
+                            let folderWorkflows = engine.workflows.filter { $0.folderName == folderName }
+                            
+                            ForEach(folderWorkflows) { workflow in
+                                NavigationLink(value: workflow.id) {
+                                    HStack {
+                                        Image(systemName: "bolt.square.fill").foregroundColor(.yellow)
+                                        TextField("流程名称", text: Binding(
+                                            get: { workflow.name },
+                                            set: { newVal in
+                                                if let idx = engine.workflows.firstIndex(where: { $0.id == workflow.id }) {
+                                                    engine.workflows[idx].name = newVal
+                                                }
+                                            }
+                                        )).textFieldStyle(.plain)
+                                        Spacer()
+                                    }
+                                    .padding(.vertical, 4)
+                                    // 【右键菜单】允许修改工作流的归属文件夹
+                                    .contextMenu {
+                                        Menu("移动到文件夹...") {
+                                            ForEach(engine.folders.filter { $0 != folderName }, id: \.self) { targetFolder in
+                                                Button(targetFolder) {
+                                                    if let idx = engine.workflows.firstIndex(where: { $0.id == workflow.id }) {
+                                                        engine.workflows[idx].folderName = targetFolder
+                                                        engine.saveChanges()
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Button("删除此流程", role: .destructive) { engine.deleteWorkflow(id: workflow.id) }
+                                    }
+                                }
+                            }
+                        } header: {
+                            // 文件夹 Header 与操作菜单
+                            HStack {
+                                Text(folderName).font(.subheadline).bold()
+                                Spacer()
+                                if folderName != "默认文件夹" {
+                                    Menu {
+                                        Button("重命名") {
+                                            targetFolderToRename = folderName
+                                            tempFolderName = folderName
+                                            showRenameFolderAlert = true
+                                        }
+                                        Button("删除文件夹 (流程将移至默认)", role: .destructive) {
+                                            engine.deleteFolder(name: folderName)
+                                        }
+                                    } label: {
+                                        Image(systemName: "ellipsis")
+                                            .foregroundColor(.secondary)
+                                    }.menuStyle(.borderlessButton).frame(width: 20)
+                                }
                             }
                         }
-                        .padding(.vertical, 2).contentShape(Rectangle())
-                        .onHover { isHovering in if isHovering { hoveredWorkflowId = workflow.id } else if hoveredWorkflowId == workflow.id { hoveredWorkflowId = nil } }
                     }
-                }.onMove { indices, newOffset in engine.moveWorkflow(from: indices, to: newOffset) }
+                }
+                .listStyle(.sidebar)
+            }
+            // 新建文件夹弹窗
+            .alert("新建文件夹", isPresented: $showNewFolderAlert) {
+                TextField("文件夹名称", text: $tempFolderName)
+                Button("取消", role: .cancel) { }
+                Button("确定") { engine.addFolder(name: tempFolderName) }
+            }
+            // 重命名文件夹弹窗
+            .alert("重命名文件夹", isPresented: $showRenameFolderAlert) {
+                TextField("新文件夹名称", text: $tempFolderName)
+                Button("取消", role: .cancel) { }
+                Button("确定") { engine.renameFolder(oldName: targetFolderToRename, newName: tempFolderName) }
             }
             .navigationTitle("我的流程").navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 300)
             .toolbar { ToolbarItem(placement: .primaryAction) { Button(action: engine.createNewWorkflow) { Image(systemName: "plus") } } }
         } content: {
             VStack(spacing: 0) {
                 if !engine.hasAccessibilityPermission || !engine.hasScreenRecordingPermission {
-                    HStack(spacing: 12) {
-                        Image(systemName: "exclamationmark.shield.fill")
-                            .foregroundColor(.orange)
-                            .font(.title2)
-                            .symbolEffect(.pulse) // 增加呼吸动效，吸引注意力
-                        
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("需要系统权限才能执行自动化操作")
-                                .font(.system(size: 13, weight: .bold))
-                                .foregroundColor(.primary)
-                            
-                            // 动态显示具体缺失的权限
-                            let missingText = (!engine.hasAccessibilityPermission && !engine.hasScreenRecordingPermission) ? "缺少【辅助功能】与【屏幕录制】权限" :
-                                              (!engine.hasAccessibilityPermission ? "缺少【辅助功能】权限 (模拟键鼠将被拦截)" : "缺少【屏幕录制】权限 (视觉AI及截屏将受限)")
-                            
-                            Text(missingText)
-                                .font(.system(size: 11))
-                                .foregroundColor(.secondary)
-                        }
-                        
+                    HStack {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.yellow)
+                        Text(engine.hasAccessibilityPermission ? "⚠️ 缺少屏幕录制权限：Agent 视觉与截图将失效！" : "⚠️ 缺少辅助功能权限：录制和点击事件将被拦截！").font(.subheadline)
                         Spacer()
-                        
-                        Button(action: {
-                            // 主动触发检查，如果没有权限会自动弹窗并拉起 macOS 设置
-                            engine.checkPermissions(autoOpenSettings: true)
-                        }) {
-                            Label("去授权 / 刷新", systemImage: "arrow.right.circle.fill")
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.orange)
-                        .controlSize(.regular)
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(Color.orange.opacity(0.15))
-                    // 加个细微的底边框，与下方视图区分开
-                    .overlay(Rectangle().frame(height: 1).foregroundColor(Color.orange.opacity(0.3)), alignment: .bottom)
+                        Button("去授权并刷新") {
+                            engine.checkPermissions(isUserInitiated: true)
+                        }.buttonStyle(.borderedProminent).tint(.orange)
+                    }.padding(8).background(Color.red.opacity(0.1))
                 }
                 
                 // [✨新增] 顶部带录制状态的控制栏

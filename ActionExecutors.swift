@@ -37,6 +37,7 @@ struct ActionExecutorFactory {
         case .readClipboard: return ReadClipboardExecutor()
         case .runShell: return RunShellExecutor()
         case .runAppleScript: return RunAppleScriptExecutor()
+        case .callWorkflow: return CallWorkflowExecutor()
         }
     }
 }
@@ -244,55 +245,87 @@ struct MouseOperationExecutor: RPAActionExecutor {
 
 struct OpenAppExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
-        let appName = context.parseVariables(action.parameter).isEmpty ? "Safari" : context.parseVariables(action.parameter)
-        let task = Process(); task.launchPath = "/usr/bin/open"; task.arguments = ["-a", appName]; try? task.run()
-        let script = "tell application \"\(appName)\" to activate"
-        var errorInfo: NSDictionary?; NSAppleScript(source: script)?.executeAndReturnError(&errorInfo)
-        context.log("📂 激活应用: \(appName)"); try? await Task.sleep(for: .seconds(1.5))
+        let parts = context.parseVariables(action.parameter).components(separatedBy: "|")
+        let appName = parts.count > 0 ? (parts[0].isEmpty ? "Safari" : parts[0]) : "Safari"
+        let silent = parts.count > 1 ? (parts[1] == "true") : false
+        
+        let task = Process()
+        task.launchPath = "/usr/bin/open"
+        // [✨核心优化] -g 参数控制静默唤起
+        if silent {
+            task.arguments = ["-g", "-a", appName]
+        } else {
+            task.arguments = ["-a", appName]
+        }
+        try? task.run()
+        
+        if !silent {
+            let script = "tell application \"\(appName)\" to activate"
+            var errorInfo: NSDictionary?
+            NSAppleScript(source: script)?.executeAndReturnError(&errorInfo)
+            context.log("📂 激活并前置应用: \(appName)")
+            try? await Task.sleep(for: .seconds(1.5))
+        } else {
+            context.log("🥷 静默唤起应用 (后台): \(appName)")
+            try? await Task.sleep(for: .seconds(0.5)) // 静默启动不需要那么长的强制缓冲
+        }
+        
         return .always
     }
 }
 
 struct OpenURLExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
-        let parsedParam = context.parseVariables(action.parameter)
-        let parts = parsedParam.components(separatedBy: "|")
-        let urlStr = parts.count > 0 ? parts[0] : parsedParam
+        let parts = context.parseVariables(action.parameter).components(separatedBy: "|")
+        let urlStr = parts.count > 0 ? parts[0] : parts.joined()
         let browser = parts.count > 1 ? parts[1] : "InternalBrowser"
+        let silent = parts.count > 2 ? (parts[2] == "true") : false
         
         guard let encodedURLString = urlStr.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
               let url = URL(string: encodedURLString) else {
-            context.log("❌ 无效的 URL 格式: \(urlStr)")
+            context.log("❌ 无效的 URL 格式")
             return .failure
         }
         
         if browser == "InternalBrowser" {
             await MainActor.run {
-                BrowserWindowController.showSharedWindow()
-                BrowserViewModel.shared.addNewTab(request: URLRequest(url: url), makeActive: true)
+                if !silent { BrowserWindowController.showSharedWindow() }
+                // makeActive 决定了 Tab 是否抢焦点
+                BrowserViewModel.shared.addNewTab(request: URLRequest(url: url), makeActive: !silent)
             }
-            context.log("🌐 [内置浏览器] 打开网址: \(urlStr)")
-            try? await Task.sleep(for: .seconds(1.5))
+            context.log("🌐 [内置浏览器] \(silent ? "🥷静默" : "")打开网址: \(urlStr)")
+            try? await Task.sleep(for: .seconds(silent ? 0.5 : 1.5))
             
         } else if browser == "System" {
-            NSWorkspace.shared.open(url)
-            context.log("🌐 [系统默认浏览器] 打开网址: \(urlStr)")
+            // [✨修复] 使用 Process 执行底层命令代替会抛出异常的 NSWorkspace，更加稳定
+            let task = Process()
+            task.launchPath = "/usr/bin/open"
+            if silent {
+                task.arguments = ["-g", url.absoluteString] // -g 参数保证后台静默不抢焦点
+            } else {
+                task.arguments = [url.absoluteString]
+            }
+            try? task.run()
+            
+            context.log("🌐 [系统默认浏览器] \(silent ? "🥷静默" : "")打开网址: \(urlStr)")
             try? await Task.sleep(for: .seconds(1.0))
             
         } else {
             let task = Process()
             task.launchPath = "/usr/bin/open"
-            task.arguments = ["-a", browser, url.absoluteString]
+            if silent {
+                task.arguments = ["-g", "-a", browser, url.absoluteString]
+            } else {
+                task.arguments = ["-a", browser, url.absoluteString]
+            }
             do {
                 try task.run()
-                context.log("🌐 [\(browser)] 打开网址: \(urlStr)")
+                context.log("🌐 [\(browser)] \(silent ? "🥷静默" : "")打开网址: \(urlStr)")
                 try? await Task.sleep(for: .seconds(1.5))
             } catch {
-                context.log("❌ 无法唤起 \(browser) 浏览器: \(error.localizedDescription)")
                 return .failure
             }
         }
-        
         return .always
     }
 }
@@ -386,7 +419,6 @@ struct RunAppleScriptExecutor: RPAActionExecutor {
     }
 }
 
-// MARK: - 重构的 AI 分析执行器
 struct AIVisionExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         do {
@@ -399,14 +431,11 @@ struct AIVisionExecutor: RPAActionExecutor {
             var fullResult = ""
             var chunkBuffer = ""
             
-            // 打印起始前缀
             context.log("🌊 正在思考: ")
             
-            // [✨优化] 采用底层时间戳，规避高频创建 Date 对象的内存抖动
             var lastReportTime = CFAbsoluteTimeGetCurrent()
             
             for try await chunk in stream {
-                // [✨核心阻断] 每收到一帧数据，检查引擎是否已被用户急停。一旦急停，立刻 break，回收网络连接
                 guard context.isRunning else {
                     await MainActor.run { context.log("\n🛑 流程已终止，AI 响应流已切断。") }
                     break
@@ -416,7 +445,6 @@ struct AIVisionExecutor: RPAActionExecutor {
                 chunkBuffer += chunk
                 
                 let now = CFAbsoluteTimeGetCurrent()
-                // 100 毫秒节流阀，既能保证视觉上的丝滑打字感，又不会将主线程打爆
                 if now - lastReportTime > 0.1 {
                     let textToAppend = chunkBuffer
                     chunkBuffer = ""
@@ -425,7 +453,6 @@ struct AIVisionExecutor: RPAActionExecutor {
                 }
             }
             
-            // 如果终止了，直接返回 failure
             guard context.isRunning else { return .failure }
             
             if !chunkBuffer.isEmpty {
@@ -441,20 +468,38 @@ struct AIVisionExecutor: RPAActionExecutor {
     }
 }
 
-// MARK: - 重构的 Web 智能体 3.0 执行器
+// MARK: - [✨优化] Web 智能体 3.0 执行器 (支持批处理合并确认与静默运行)
 struct WebAgentExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
-        // [✨修改] 同样把 maxSplits 改为 4，获取第 5 个参数
-        let parts = action.parameter.split(separator: "|", maxSplits: 4, omittingEmptySubsequences: false).map(String.init)
+        let parts = action.parameter.split(separator: "|", maxSplits: 6, omittingEmptySubsequences: false).map(String.init)
         let taskDesc = parts.count > 0 ? parts[0] : ""
-        let browser = parts.count > 1 ? parts[1] : "InternalBrowser"
+        let browser = parts.count > 1 ? (parts[1].isEmpty ? "InternalBrowser" : parts[1]) : "InternalBrowser"
         let requireConfirm = parts.count > 2 ? (parts[2] == "true") : true
         let manualText = parts.count > 3 ? parts[3] : ""
-        let captureMode = parts.count > 4 ? parts[4] : "app" // 提取截屏模式
+        let captureMode = parts.count > 4 ? parts[4] : "app"
+        let successKeywords = parts.count > 5 ? parts[5] : ""
+        let silentMode = parts.count > 6 ? (parts[6] == "true") : false
         
         context.log("🌟 [WebAgent 3.0] 准备接管 [\(browser == "InternalBrowser" ? "内置浏览器" : "Safari")]...")
-        context.log("🔍 正在检查并唤醒目标浏览器窗口...")
-        await context.activateBrowser(browser)
+        
+        if !silentMode || captureMode == "fullscreen" {
+            if silentMode && captureMode == "fullscreen" {
+                context.log("⚠️ 检测到全屏视觉模式，强制关闭静默运行，正在唤醒窗口...")
+            } else {
+                context.log("🔍 正在唤醒目标浏览器窗口至最前...")
+            }
+            await context.activateBrowser(browser)
+        } else {
+            context.log("🥷 [静默模式] 已开启。Agent 将在后台遮挡状态下感知与操作。")
+            if browser == "InternalBrowser" {
+                await MainActor.run {
+                    if BrowserViewModel.shared.tabs.isEmpty {
+                        BrowserWindowController.showSharedWindow()
+                        BrowserViewModel.shared.addNewTab()
+                    }
+                }
+            }
+        }
         
         let maxSteps = 10
         var currentStep = 0
@@ -473,18 +518,10 @@ struct WebAgentExecutor: RPAActionExecutor {
             
             try? await Task.sleep(for: .milliseconds(300))
             
-            // [✨修改] 根据用户选择的截屏模式决定传参
-            let targetCaptureApp: String?
-            if captureMode == "fullscreen" {
-                targetCaptureApp = nil
-                context.log("📸 [WebAgent] 当前配置为：全屏截取视野")
-            } else {
-                targetCaptureApp = browser == "InternalBrowser" ? ProcessInfo.processInfo.processName : browser
-                context.log("📸 [WebAgent] 当前配置为：仅截取 [\(targetCaptureApp!)] 程序层")
-            }
+            let targetCaptureApp: String? = captureMode == "fullscreen" ? nil : (browser == "InternalBrowser" ? ProcessInfo.processInfo.processName : browser)
             
             guard let screenCGImage = try? await ScreenCaptureUtility.captureScreen(forAppName: targetCaptureApp) else {
-                context.log("❌ [WebAgent] 截屏失败，请检查屏幕录制权限或窗口是否存活。")
+                context.log("❌ [WebAgent] 截屏失败，请检查状态。")
                 return .failure
             }
             await context.cleanupSoM(browser: browser)
@@ -492,7 +529,7 @@ struct WebAgentExecutor: RPAActionExecutor {
             let historyStr = actionHistory.isEmpty ? "无" : actionHistory.enumerated().map{ "\($0.offset+1). \($0.element)" }.joined(separator: "\n")
 
             let prompt = """
-            你是一个顶级 Web RPA 机器人。结合给定的【屏幕截图】和【DOM列表】，决定下一步动作。
+            你是一个顶级 Web RPA 机器人。结合给定的【屏幕截图】和【DOM列表】，决定接下来的动作。
             注意：截图中可交互元素已被打上红色数字方框，请通过图片找到正确元素，并参考DOM列表提取目标ID。
             
             【任务目标】: \(taskDesc)
@@ -505,21 +542,17 @@ struct WebAgentExecutor: RPAActionExecutor {
             【可选动作空间】:
             - click: 点击目标ID
             - input: 在目标ID输入文字
-            - scroll_down: 页面向下滚动 (如果找不到目标)
+            - scroll_down: 页面向下滚动
             - scroll_up: 页面向上滚动
             - finish: 任务已成功完成
             - fail: 任务无法完成，请求人类接管
             
-            输出合法的 JSON:
-            {
-              "thought": "结合图文和历史记录的思考过程",
-              "action_type": "click/input/scroll_down/scroll_up/finish/fail",
-              "target_id": "红框上的数字ID",
-              "input_value": "如果是input，填写内容"
-            }
+            【指令要求】:
+            你可以一次性输出多个动作以加快执行效率（例如：连续输入用户名和密码）。
+            请严格输出合法的 JSON 数组（Array）。如果某个动作会导致页面跳转、刷新或弹窗，请务必将其作为数组的最后一个动作！
             """
             
-            context.log("🧠 [WebAgent] 大脑运转中 (图文多模态推理)...")
+            context.log("🧠 [WebAgent] 大脑运转中...")
             context.log("🌊 正在思考: ")
             do {
                 let nsImage = NSImage(cgImage: screenCGImage, size: .zero)
@@ -528,17 +561,10 @@ struct WebAgentExecutor: RPAActionExecutor {
                 
                 var aiResponse = ""
                 var chunkBuffer = ""
-                
-                // [✨优化] 采用底层时间戳
                 var lastReportTime = CFAbsoluteTimeGetCurrent()
                 
                 for try await chunk in stream {
-                    // [✨核心阻断] 同步感知紧急停止
-                    guard context.isRunning else {
-                        await MainActor.run { context.log("\n🛑 流程已终止，WebAgent 大脑已掉线。") }
-                        break
-                    }
-                    
+                    guard context.isRunning else { break }
                     aiResponse += chunk
                     chunkBuffer += chunk
                     
@@ -550,51 +576,97 @@ struct WebAgentExecutor: RPAActionExecutor {
                         lastReportTime = now
                     }
                 }
-                
-                // 如果被强制终止了，直接抛出失败打断整个 while 循环
                 guard context.isRunning else { return .failure }
+                if !chunkBuffer.isEmpty { await MainActor.run { context.appendLogChunk(chunkBuffer) } }
                 
-                if !chunkBuffer.isEmpty {
-                    await MainActor.run { context.appendLogChunk(chunkBuffer) }
-                }
-                
-                guard let jsonStr = extractJSON(from: aiResponse),
-                      let jsonData = jsonStr.data(using: .utf8),
-                      let plan = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+                guard let jsonStr = extractJSON(from: aiResponse), let jsonData = jsonStr.data(using: .utf8) else {
                     context.log("\n⚠️ [WebAgent] JSON 格式异常，重试。")
-                    actionHistory.append("上一步模型输出格式错误，请严格输出 JSON。")
+                    actionHistory.append("模型输出格式错误，请严格输出 JSON 数组。")
                     continue
                 }
                 
-                let thought = plan["thought"] as? String ?? ""
-                let actionType = plan["action_type"] as? String ?? "fail"
-                let targetId = plan["target_id"] as? String ?? ""
-                let inputValue = plan["input_value"] as? String ?? ""
+                var actionPlans: [[String: Any]] = []
+                if let array = try? JSONSerialization.jsonObject(with: jsonData) as? [[String: Any]] {
+                    actionPlans = array
+                } else if let dict = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
+                    actionPlans = [dict]
+                } else { continue }
                 
-                context.log("\n💡 思考结果: \(thought)")
-                
-                if actionType == "finish" {
-                    context.log("✅ [WebAgent] 自主判断任务完成！")
-                    isTaskCompleted = true
-                    break
-                } else if actionType == "fail" {
-                    context.log("🛑 [WebAgent] 主动请求人工介入。")
-                    return .failure
-                }
-                
-                if requireConfirm {
-                    let confirmMsg = "准备: [\(actionType)] ID: \(targetId) \(inputValue)\n思考: \(thought)"
-                    if !(await context.requestUserConfirmation(title: "Agent 请求操作", message: confirmMsg)) {
-                        context.log("🛑 用户终止操作。")
+                // [✨核心优化] 批处理汇总人工确认：只弹一次窗！
+                if requireConfirm && !actionPlans.isEmpty {
+                    var summaryMsg = "AI 规划了以下 \(actionPlans.count) 个连续动作：\n\n"
+                    for (i, plan) in actionPlans.enumerated() {
+                        let aType = plan["action_type"] as? String ?? ""
+                        let tId = plan["target_id"] as? String ?? ""
+                        let iVal = plan["input_value"] as? String ?? ""
+                        let thought = plan["thought"] as? String ?? ""
+                        summaryMsg += "\(i + 1). [\(aType)] 目标:\(tId) \(iVal.isEmpty ? "" : "输入:'\(iVal)'")\n   ↳ 思考: \(thought)\n"
+                    }
+                    
+                    if !(await context.requestUserConfirmation(title: "Agent 批量动作确认", message: summaryMsg)) {
+                        context.log("🛑 用户终止了此批次动作的执行。")
                         return .failure
                     }
                 }
                 
-                context.log("⚙️ 执行: \(actionType) -> [\(targetId)]")
-                actionHistory.append("[\(actionType)] 目标ID:\(targetId) 输入:\(inputValue)")
+                context.log("\n💡 收到 \(actionPlans.count) 个动作，开始批处理...")
+                var didExecuteAnyAction = false
+                var shouldBreakOuterLoop = false
                 
-                await context.injectActionJS(browser: browser, action: actionType, targetId: targetId, value: inputValue)
-                await context.waitForPageToStabilize(browser: browser)
+                for (index, plan) in actionPlans.enumerated() {
+                    guard context.isRunning else { break }
+                    
+                    let thought = plan["thought"] as? String ?? ""
+                    let actionType = plan["action_type"] as? String ?? "fail"
+                    let targetId = plan["target_id"] as? String ?? ""
+                    let inputValue = plan["input_value"] as? String ?? ""
+                    
+                    context.log("--- 动作 \(index + 1)/\(actionPlans.count) ---")
+                    context.log("🤔 思考: \(thought)")
+                    
+                    if actionType == "finish" {
+                        context.log("✅ [WebAgent] 自主判断任务完成！")
+                        isTaskCompleted = true
+                        shouldBreakOuterLoop = true
+                        break
+                    } else if actionType == "fail" {
+                        context.log("🛑 [WebAgent] 主动请求人工介入。")
+                        return .failure
+                    }
+                    
+                    context.log("⚙️ 执行: \(actionType) -> [\(targetId)]")
+                    actionHistory.append("[\(actionType)] 目标ID:\(targetId) 输入:\(inputValue)")
+                    
+                    await context.injectActionJS(browser: browser, action: actionType, targetId: targetId, value: inputValue)
+                    didExecuteAnyAction = true
+                    
+                    try? await Task.sleep(for: .milliseconds(300))
+                }
+                
+                if shouldBreakOuterLoop { break }
+                
+                if didExecuteAnyAction {
+                    context.log("⏳ 批处理执行完毕，等待页面渲染响应...")
+                    try? await Task.sleep(for: .seconds(1.5))
+                    await context.waitForPageToStabilize(browser: browser)
+                    
+                    if !successKeywords.isEmpty {
+                        let keywords = successKeywords.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+                        if !keywords.isEmpty {
+                            let visibleText = await context.getPageText(browser: browser)
+                            for kw in keywords {
+                                if visibleText.contains(kw) {
+                                    context.log("✅ [WebAgent] 断言命中 [\(kw)]，提前结束任务。")
+                                    isTaskCompleted = true
+                                    shouldBreakOuterLoop = true
+                                    break
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if shouldBreakOuterLoop { break }
                 
             } catch {
                 context.log("❌ [WebAgent] 推理失败: \(error.localizedDescription)")
@@ -606,12 +678,30 @@ struct WebAgentExecutor: RPAActionExecutor {
     }
     
     private func extractJSON(from text: String) -> String? {
-        let pattern = "\\{(?:[^{}]|(?:\\{[^{}]*\\}))*\\}"
-        if let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) {
-            let nsString = text as NSString
-            let results = regex.matches(in: text, options: [], range: NSRange(location: 0, length: nsString.length))
-            if let firstMatch = results.first { return nsString.substring(with: firstMatch.range) }
+        let pattern = "(?s)(\\{.*\\}|\\[.*\\])"
+        if let regex = try? NSRegularExpression(pattern: pattern, options: []),
+           let match = regex.firstMatch(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count)) {
+            return (text as NSString).substring(with: match.range)
         }
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
+
+struct CallWorkflowExecutor: RPAActionExecutor {
+    func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
+        // 【✨核心修复】强力清除可能的隐藏空格和换行符
+        let targetIdStr = context.parseVariables(action.parameter).trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        guard let targetId = UUID(uuidString: targetIdStr) else {
+            context.log("❌ 调用的子工作流 ID 格式无效: [\(targetIdStr)]")
+            return .failure
+        }
+        
+        context.log("🔗 开始进入子工作流: \(targetIdStr)...")
+        let success = await context.runWorkflow(by: targetId)
+        context.log("🔗 子工作流执行完毕，返回主流程。")
+        
+        return success ? .success : .failure
+    }
+}
+
