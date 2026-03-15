@@ -698,16 +698,23 @@ struct WebAgentExecutor: RPAActionExecutor {
     
     private func extractJSON(from text: String) -> String? {
         // [✨核心防线 1] 如果模型包含 </think> 标签，强行抛弃思考过程，只取其后的内容
+        // 1. 剥离思考过程
         var cleanText = text
         if let thinkEndRange = text.range(of: "</think>") {
             cleanText = String(text[thinkEndRange.upperBound...])
         }
         
+        // [✨架构师建议] 2. 增强容错：大模型经常无视 Prompt 强行输出 Markdown 代码块，主动清理它
+        //cleanText = cleanText.replacingOccurrences(of: cleanText.trimmingCharacters(in: .whitespacesAndNewlines))
+        
+        // 3. 正则提取 JSON 数组或对象
         let pattern = "(?s)(\\{.*\\}|\\[.*\\])"
         if let regex = try? NSRegularExpression(pattern: pattern, options: []),
-           let match = regex.firstMatch(in: cleanText, options: [], range: NSRange(location: 0, length: text.utf16.count)) {
+           // ✅ 修复点：严格使用 cleanText 自身的 utf16 长度
+           let match = regex.firstMatch(in: cleanText, options: [], range: NSRange(location: 0, length: cleanText.utf16.count)) {
             return (cleanText as NSString).substring(with: match.range)
         }
+        
         return cleanText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
