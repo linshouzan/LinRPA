@@ -378,3 +378,20 @@ public struct WebAgentParams: Codable, Equatable {
         return ""
     }
 }
+
+// [✨新增] 字符串算法拓展，用于 OCR 模糊纠错计算
+extension String {
+    /// 计算两个字符串之间的 Levenshtein 距离（需要改动多少个字符才能一致）
+    func editDistance(to target: String) -> Int {
+        let empty = [Int](repeating:0, count: target.count)
+        var last = [Int](0...target.count)
+        for (i, char1) in self.enumerated() {
+            var cur = [i + 1] + empty
+            for (j, char2) in target.enumerated() {
+                cur[j + 1] = char1 == char2 ? last[j] : Swift.min(last[j], cur[j], last[j + 1]) + 1
+            }
+            last = cur
+        }
+        return last.last ?? 0
+    }
+}

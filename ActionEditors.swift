@@ -335,26 +335,64 @@ struct MouseActionEditor: View {
 struct OCRActionEditor: View {
     @Binding var action: RPAAction
     @State private var isPickingRegion = false
+    
     var body: some View {
+        // 解析最多 12 个参数，兼容旧版本短参数
         let parts = action.parameter.components(separatedBy: "|")
         let targetText = parts.count > 0 ? parts[0] : action.parameter
-        let shouldClick = parts.count > 1 ? (parts[1] == "true") : true
+        let legacyShouldClick = parts.count > 1 ? (parts[1] == "true") : true
         let regionStr = parts.count > 2 ? parts[2] : ""
-        // [✨新增] 提取第4个参数：目标 App
         let targetApp = parts.count > 3 ? parts[3] : ""
         
-        let updateParam = { (t: String, c: Bool, r: String, app: String) in
-            action.parameter = "\(t)|\(c ? "true" : "false")|\(r)|\(app)"
+        let actionType = parts.count > 4 ? parts[4] : (legacyShouldClick ? "leftClick" : "none")
+        let matchMode = parts.count > 5 ? parts[5] : "contains"
+        let timeout = parts.count > 6 ? parts[6] : "5.0"
+        let targetIndex = parts.count > 7 ? parts[7] : "-1"
+        let variableName = parts.count > 8 ? parts[8] : "ocr_result"
+        let autoScroll = parts.count > 9 ? (parts[9] == "true") : false
+        let fuzzyTolerance = parts.count > 10 ? parts[10] : "1"
+        let enhanceContrast = parts.count > 11 ? (parts[11] == "true") : false
+        
+        let updateParam = { (t: String, aType: String, r: String, app: String, mode: String, tm: String, idx: String, varName: String, scroll: Bool, fuzzy: String, enhance: Bool) in
+            // 维持第二位参数 boolean 状态以兼容旧版引擎的粗略判定
+            let c = (aType != "none" && aType != "waitVanish" && aType != "read")
+            action.parameter = "\(t)|\(c ? "true" : "false")|\(r)|\(app)|\(aType)|\(mode)|\(tm)|\(idx)|\(varName)|\(scroll ? "true" : "false")|\(fuzzy)|\(enhance ? "true" : "false")"
         }
         
         VStack(alignment: .leading, spacing: 12) {
-            TextField("要识别的文字内容", text: Binding(get: { targetText }, set: { updateParam($0, shouldClick, regionStr, targetApp) }))
-                .textFieldStyle(.roundedBorder)
             
-            // [✨新增] 限定目标 App 的快捷选择框
+            // 1. 目标设定与匹配规则
+            VStack(alignment: .leading, spacing: 8) {
+                TextField("要识别的目标文字 (支持正则)", text: Binding(get: { targetText }, set: { updateParam($0, actionType, regionStr, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast) }))
+                    .textFieldStyle(.roundedBorder)
+                
+                HStack {
+                    Picker("匹配模式:", selection: Binding(get: { matchMode }, set: { updateParam(targetText, actionType, regionStr, targetApp, $0, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast) })) {
+                        Text("包含 (Contains)").tag("contains")
+                        Text("精确等于 (Exact)").tag("exact")
+                        Text("模糊纠错 (Fuzzy)").tag("fuzzy")
+                        Text("正则 (Regex)").tag("regex")
+                    }.frame(width: 180)
+                    
+                    if matchMode == "fuzzy" {
+                        Text("容错字数:").font(.caption).foregroundColor(.orange)
+                        TextField("1", text: Binding(get: { fuzzyTolerance }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, $0, enhanceContrast) }))
+                            .textFieldStyle(.roundedBorder).frame(width: 30)
+                    }
+                    
+                    Spacer()
+                    
+                    Text("命中序号:").font(.caption)
+                    TextField("-1为智能", text: Binding(get: { targetIndex }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, timeout, $0, variableName, autoScroll, fuzzyTolerance, enhanceContrast) }))
+                        .textFieldStyle(.roundedBorder).frame(width: 60)
+                        .help("0代表第1个匹配项，1代表第2个... -1代表交由特征图智能比对")
+                }
+            }
+            
+            // 2. 目标 App 过滤器
             HStack {
                 Text("限定 App:").font(.caption).frame(width: 60, alignment: .leading)
-                TextField("App名称 (留空为全屏识别)", text: Binding(get: { targetApp }, set: { updateParam(targetText, shouldClick, regionStr, $0) }))
+                TextField("留空为全屏智能扫描", text: Binding(get: { targetApp }, set: { updateParam(targetText, actionType, regionStr, $0, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast) }))
                     .textFieldStyle(.roundedBorder)
                 
                 Menu {
@@ -362,30 +400,74 @@ struct OCRActionEditor: View {
                         .filter { $0.activationPolicy == .regular }
                         .compactMap { $0.localizedName }.sorted()
                     ForEach(runningApps, id: \.self) { appName in
-                        Button(appName) { updateParam(targetText, shouldClick, regionStr, appName) }
+                        Button(appName) { updateParam(targetText, actionType, regionStr, appName, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast) }
                     }
                 } label: { Image(systemName: "list.bullet.rectangle.portrait") }
                 .fixedSize()
-                .help("从当前运行的程序中选择，选择后只识别该程序的窗口画面。")
+                .help("选择后将利用底层能力过滤其他遮挡窗口，仅识别该程序画面。")
             }
-            
-            Toggle("识别成功后伴随鼠标点击", isOn: Binding(get: { shouldClick }, set: { updateParam(targetText, $0, regionStr, targetApp) }))
             
             Divider()
             
+            // 3. 动作与变量设置区
             HStack {
-                TextField("区域限制 (X,Y,宽,高)", text: Binding(get: { regionStr }, set: { updateParam(targetText, shouldClick, $0, targetApp) }))
+                Picker("命中后动作:", selection: Binding(get: { actionType }, set: { updateParam(targetText, $0, regionStr, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast) })) {
+                    Text("左键点击").tag("leftClick")
+                    Text("双击").tag("doubleClick")
+                    Text("右键点击").tag("rightClick")
+                    Text("鼠标悬停 (Hover)").tag("move")
+                    Divider()
+                    Text("读取文本存入变量").tag("read")
+                    Text("仅等待出现").tag("none")
+                    Text("等待消失 (Wait Vanish)").tag("waitVanish")
+                }.pickerStyle(.menu).frame(width: 180)
+                
+                Spacer()
+                
+                Text("最大等待:").font(.caption)
+                TextField("秒", text: Binding(get: { timeout }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, $0, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast) }))
+                    .textFieldStyle(.roundedBorder).frame(width: 40)
+            }
+            
+            // 如果选择提取文本，动态显示变量设置框
+            if actionType == "read" {
+                HStack {
+                    Image(systemName: "text.insert").foregroundColor(.orange)
+                    Text("保存至变量:").font(.caption).foregroundColor(.secondary)
+                    TextField("例如: order_id", text: Binding(get: { variableName }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, timeout, targetIndex, $0, autoScroll, fuzzyTolerance, enhanceContrast) }))
+                        .textFieldStyle(.roundedBorder)
+                }
+                .padding(.vertical, 4)
+                .transition(.opacity)
+            }
+            
+            Divider()
+            
+            // 4. 空间与拾取区
+            HStack {
+                TextField("视觉搜索区域 (X,Y,宽,高)", text: Binding(get: { regionStr }, set: { updateParam(targetText, actionType, $0, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast) }))
                     .textFieldStyle(.roundedBorder)
                 Button(action: {
                     isPickingRegion = true
                     ScreenRegionPicker.shared.pickRegion { rect in
-                        if let r = rect { updateParam(targetText, shouldClick, "\(Int(r.minX)), \(Int(r.minY)), \(Int(r.width)), \(Int(r.height))", targetApp) }
+                        if let r = rect { updateParam(targetText, actionType, "\(Int(r.minX)), \(Int(r.minY)), \(Int(r.width)), \(Int(r.height))", targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast) }
                         isPickingRegion = false
                     }
-                }) { Image(systemName: "viewfinder") }.buttonStyle(.bordered)
+                }) { Label("框选", systemImage: "viewfinder") }.buttonStyle(.bordered)
             }
             
-            OCRMiniDesktop(regionStr: Binding(get: { regionStr }, set: { updateParam(targetText, shouldClick, $0, targetApp) }), offsetX: $action.offsetX, offsetY: $action.offsetY)
+            OCRMiniDesktop(regionStr: Binding(get: { regionStr }, set: { updateParam(targetText, actionType, $0, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast) }), offsetX: $action.offsetX, offsetY: $action.offsetY)
+            
+            // 5. 高级能力开关
+            HStack {
+                Toggle("未找到时自动滚屏", isOn: Binding(get: { autoScroll }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, timeout, targetIndex, variableName, $0, fuzzyTolerance, enhanceContrast) }))
+                    .toggleStyle(.switch).controlSize(.small)
+                
+                Spacer()
+                
+                Toggle("🌟 图像锐化增强 (暗黑模式/低对比度)", isOn: Binding(get: { enhanceContrast }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, $0) }))
+                    .toggleStyle(.switch).controlSize(.small).tint(.orange)
+            }
         }
     }
 }
@@ -393,18 +475,125 @@ struct OCRActionEditor: View {
 struct NotificationEditor: View { @Binding var parameter: String; var body: some View { let parts = parameter.components(separatedBy: "|"); let style = parts.count > 0 ? parts[0] : "banner"; let title = parts.count > 1 ? parts[1] : ""; let bodyText = parts.count > 2 ? parts[2] : ""; VStack(alignment: .leading, spacing: 10) { Picker("提醒", selection: Binding(get: { style }, set: { parameter = "\($0)|\(title)|\(bodyText)" })) { Text("横幅").tag("banner"); Text("对话框").tag("dialog") }.pickerStyle(.segmented); TextField("标题", text: Binding(get: { title }, set: { parameter = "\(style)|\($0)|\(bodyText)" })).textFieldStyle(.roundedBorder); TextField("正文 (支持 {{var}})", text: Binding(get: { bodyText }, set: { parameter = "\(style)|\(title)|\($0)" })).textFieldStyle(.roundedBorder) } } }
 struct ConditionEditor: View { @Binding var parameter: String; var body: some View { let parts = parameter.components(separatedBy: "|"); let leftValue = parts.count > 0 ? parts[0] : "{{clipboard}}"; let op = parts.count > 1 ? parts[1] : "contains"; let rightValue = parts.count > 2 ? parts[2] : ""; HStack { TextField("左值", text: Binding(get: { leftValue }, set: { parameter = "\($0)|\(op)|\(rightValue)" })).textFieldStyle(.roundedBorder); Picker("", selection: Binding(get: { op }, set: { parameter = "\(leftValue)|\($0)|\(rightValue)" })) { Text("包含").tag("contains"); Text("等于").tag("==") }.frame(width: 80); TextField("对比值", text: Binding(get: { rightValue }, set: { parameter = "\(leftValue)|\(op)|\($0)" })).textFieldStyle(.roundedBorder) } } }
 
+// MARK: - [✨修复] 框选视图安全重构
 class RegionPickerView: NSView {
-    var startPointCG: CGPoint?; var currentPointCG: CGPoint?; var startPointView: CGPoint?; var currentPointView: CGPoint?; var completion: ((CGRect) -> Void)?
-    override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
-    override func mouseDown(with event: NSEvent) { startPointView = event.locationInWindow; startPointCG = CGEvent(source: nil)?.location; currentPointView = startPointView; currentPointCG = startPointCG }
-    override func mouseDragged(with event: NSEvent) { currentPointView = event.locationInWindow; currentPointCG = CGEvent(source: nil)?.location; needsDisplay = true }
-    override func mouseUp(with event: NSEvent) { currentPointView = event.locationInWindow; currentPointCG = CGEvent(source: nil)?.location; needsDisplay = true; guard let scg = startPointCG, let ccg = currentPointCG else { completion?(.zero); return }; let w = abs(ccg.x - scg.x); let h = abs(ccg.y - scg.y); if w > 5 && h > 5 { completion?(CGRect(x: min(scg.x, ccg.x), y: min(scg.y, ccg.y), width: w, height: h)) } else { completion?(.zero) } }
-    override func draw(_ dirtyRect: NSRect) { NSColor(white: 0, alpha: 0.4).set(); bounds.fill(); if let start = startPointView, let current = currentPointView { let rect = NSRect(x: min(start.x, current.x), y: min(start.y, current.y), width: abs(current.x - start.x), height: abs(current.y - start.y)); NSColor.clear.set(); rect.fill(using: .copy); NSColor.systemRed.setStroke(); let path = NSBezierPath(rect: rect); path.lineWidth = 2.0; path.stroke() } }
+    var startPointCG: CGPoint?
+    var currentPointCG: CGPoint?
+    var startPointView: CGPoint?
+    var currentPointView: CGPoint?
+    var completion: ((CGRect) -> Void)?
+    
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .crosshair)
+    }
+    
+    override func mouseDown(with event: NSEvent) {
+        startPointView = event.locationInWindow
+        startPointCG = CGEvent(source: nil)?.location
+        currentPointView = startPointView
+        currentPointCG = startPointCG
+    }
+    
+    override func mouseDragged(with event: NSEvent) {
+        currentPointView = event.locationInWindow
+        currentPointCG = CGEvent(source: nil)?.location
+        needsDisplay = true
+    }
+    
+    override func mouseUp(with event: NSEvent) {
+        currentPointView = event.locationInWindow
+        currentPointCG = CGEvent(source: nil)?.location
+        needsDisplay = true
+        
+        guard let scg = startPointCG, let ccg = currentPointCG else {
+            completion?(.zero)
+            return
+        }
+        
+        let w = abs(ccg.x - scg.x)
+        let h = abs(ccg.y - scg.y)
+        
+        if w > 5 && h > 5 {
+            completion?(CGRect(x: min(scg.x, ccg.x), y: min(scg.y, ccg.y), width: w, height: h))
+        } else {
+            completion?(.zero)
+        }
+    }
+    
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor(white: 0, alpha: 0.4).set()
+        bounds.fill()
+        
+        if let start = startPointView, let current = currentPointView {
+            let rect = NSRect(
+                x: min(start.x, current.x),
+                y: min(start.y, current.y),
+                width: abs(current.x - start.x),
+                height: abs(current.y - start.y)
+            )
+            NSColor.clear.set()
+            rect.fill(using: .copy)
+            NSColor.systemRed.setStroke()
+            let path = NSBezierPath(rect: rect)
+            path.lineWidth = 2.0
+            path.stroke()
+        }
+    }
 }
+
 class ScreenRegionPicker {
-    static let shared = ScreenRegionPicker(); private var window: NSWindow?; private var eventMonitor: Any?
+    static let shared = ScreenRegionPicker()
+    private var window: NSWindow?
+    private var eventMonitor: Any?
+    
     @MainActor func pickRegion(completion: @escaping (CGRect?) -> Void) {
-        if window != nil { return }; NSApp.windows.first(where: { $0.className.contains("AppKitWindow") })?.miniaturize(nil); var totalRect = CGRect.zero; for screen in NSScreen.screens { totalRect = totalRect.union(screen.frame) }; let win = NSWindow(contentRect: totalRect, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false); win.level = .screenSaver; win.backgroundColor = .clear; win.isOpaque = false; win.hasShadow = false; win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]; let view = RegionPickerView(); let cleanup = { [weak self] (rect: CGRect?) in self?.window?.close(); self?.window = nil; if let monitor = self?.eventMonitor { NSEvent.removeMonitor(monitor); self?.eventMonitor = nil }; completion(rect); NSApp.windows.first(where: { $0.className.contains("AppKitWindow") })?.deminiaturize(nil) }; view.completion = { rect in cleanup(rect == .zero ? nil : rect) }; win.contentView = view; win.makeKeyAndOrderFront(nil); self.window = win; self.eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in if event.keyCode == 53 { cleanup(nil); return nil }; return event }
+        if window != nil { return }
+        
+        NSApp.windows.first(where: { $0.className.contains("AppKitWindow") })?.miniaturize(nil)
+        
+        var totalRect = CGRect.zero
+        for screen in NSScreen.screens {
+            totalRect = totalRect.union(screen.frame)
+        }
+        
+        let win = NSWindow(contentRect: totalRect, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        win.level = .screenSaver
+        win.backgroundColor = .clear
+        win.isOpaque = false
+        win.hasShadow = false
+        win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        
+        let view = RegionPickerView()
+        
+        // [✨核心修复] 异步延迟释放，彻底杜绝 mouseUp 事件周期内销毁窗口导致的崩溃
+        let cleanup = { [weak self] (rect: CGRect?) in
+            DispatchQueue.main.async {
+                if let monitor = self?.eventMonitor {
+                    NSEvent.removeMonitor(monitor)
+                    self?.eventMonitor = nil
+                }
+                self?.window?.close()
+                self?.window = nil
+                completion(rect)
+                NSApp.windows.first(where: { $0.className.contains("AppKitWindow") })?.deminiaturize(nil)
+            }
+        }
+        
+        view.completion = { rect in
+            cleanup(rect == .zero ? nil : rect)
+        }
+        
+        win.contentView = view
+        win.makeKeyAndOrderFront(nil)
+        self.window = win
+        
+        self.eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            if event.keyCode == 53 { // ESC 键取消
+                cleanup(nil)
+                return nil
+            }
+            return event
+        }
     }
 }
 

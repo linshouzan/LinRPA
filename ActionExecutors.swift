@@ -195,37 +195,95 @@ struct OCRTextExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         let parsedParam = context.parseVariables(action.parameter)
         let parts = parsedParam.components(separatedBy: "|")
+        
+        // 解析全部 12 个参数
         let targetText = parts.count > 0 ? parts[0] : parsedParam
-        let shouldClick = parts.count > 1 ? (parts[1] == "true") : true
         let regionStr = parts.count > 2 ? parts[2] : ""
-        // [✨新增] 解析第四个参数：目标 App
         let targetApp = parts.count > 3 ? parts[3] : ""
         
-        var regionRect: CGRect? = nil
+        let actionType = parts.count > 4 ? parts[4] : (parts.count > 1 && parts[1] == "true" ? "leftClick" : "none")
+        let matchMode = parts.count > 5 ? parts[5] : "contains"
+        let timeout = Double(parts.count > 6 ? parts[6] : "5.0") ?? 5.0
+        let targetIndex = Int(parts.count > 7 ? parts[7] : "-1") ?? -1
+        let variableName = parts.count > 8 ? parts[8] : "ocr_result"
+        let autoScroll = parts.count > 9 ? (parts[9] == "true") : false
+        let fuzzyTolerance = Int(parts.count > 10 ? parts[10] : "1") ?? 1
+        let enhanceContrast = parts.count > 11 ? (parts[11] == "true") : false
         
+        var regionRect: CGRect? = nil
         if !regionStr.isEmpty {
             let coords = regionStr.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
             if coords.count == 4 { regionRect = CGRect(x: coords[0], y: coords[1], width: coords[2], height: coords[3]) }
         }
         
-        if targetApp.isEmpty {
-            context.log("📸 OCR 寻找 (全屏范围): '\(targetText)'")
-        } else {
-            context.log("📸 OCR 寻找 (仅限定 \(targetApp)): '\(targetText)'")
-            // 如果限定了目标应用，虽然底层可以透视拦截，但若需要伴随物理点击，建议将其强制激活到最前端，防止点击落空
-            if shouldClick, let app = NSWorkspace.shared.runningApplications.first(where: { $0.localizedName == targetApp }) {
+        let modeDesc = matchMode == "fuzzy" ? "容错:\(fuzzyTolerance)" : matchMode
+        context.log("📸 OCR 寻找 [\((targetApp.isEmpty ? "全屏" : targetApp))]: '\(targetText)' (模式:\(modeDesc), 操作:\(actionType), 滚屏:\(autoScroll ? "开" : "关"), 图像增强:\(enhanceContrast ? "开" : "关"))")
+        
+        // 如果指定了应用且不是被动等待，尝试将其唤起至前台
+        if !targetApp.isEmpty && actionType != "none" && actionType != "waitVanish" {
+            if let app = NSWorkspace.shared.runningApplications.first(where: { $0.localizedName == targetApp }) {
                 app.activate(options: .activateIgnoringOtherApps)
-                try? await Task.sleep(for: .milliseconds(300))
+                try? await Task.sleep(nanoseconds: 300_000_000)
             }
         }
         
-        // [✨修改] 将 appName 注入底层的 findTextOnScreen 函数
-        if let point = await context.findTextOnScreen(text: targetText, sampleBase64: action.sampleImageBase64, region: regionRect, appName: targetApp.isEmpty ? nil : targetApp) {
-            let finalPoint = CGPoint(x: point.x + action.offsetX, y: point.y + action.offsetY)
-            context.log("🎯 找到落点: (\(Int(finalPoint.x)), \(Int(finalPoint.y)))")
-            if shouldClick { await context.simulateMouseOperation(type: "leftClick", at: finalPoint) }
-            return .success
+        let startTime = Date()
+        var attemptCount = 0
+        
+        // ---------------------------------------------------------
+        // 特殊分支：等待元素消失
+        // ---------------------------------------------------------
+        if actionType == "waitVanish" {
+            while Date().timeIntervalSince(startTime) < timeout && context.isRunning {
+                attemptCount += 1
+                let result = await context.findTextOnScreen(text: targetText, sampleBase64: action.sampleImageBase64, region: regionRect, appName: targetApp.isEmpty ? nil : targetApp, matchMode: matchMode, targetIndex: targetIndex, fuzzyTolerance: fuzzyTolerance, enhanceContrast: enhanceContrast)
+                
+                if result == nil {
+                    context.log("✅ 成功：第 \(attemptCount) 次轮询确认目标文字已从屏幕消失。")
+                    return .success
+                }
+                // 等待 0.5s 后再次验证
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+            context.log("❌ 超时 (\(timeout)s)，目标文字依然存在。")
+            return .failure
         }
+        
+        // ---------------------------------------------------------
+        // 正常分支：寻找元素并交互/读取 (包含自动滚屏逻辑)
+        // ---------------------------------------------------------
+        while Date().timeIntervalSince(startTime) < timeout && context.isRunning {
+            attemptCount += 1
+            
+            if let result = await context.findTextOnScreen(text: targetText, sampleBase64: action.sampleImageBase64, region: regionRect, appName: targetApp.isEmpty ? nil : targetApp, matchMode: matchMode, targetIndex: targetIndex, fuzzyTolerance: fuzzyTolerance, enhanceContrast: enhanceContrast) {
+                
+                let finalPoint = CGPoint(x: result.point.x + action.offsetX, y: result.point.y + action.offsetY)
+                
+                if actionType == "read" {
+                    context.variables[variableName] = result.text
+                    context.log("📖 第 \(attemptCount) 次寻找成功，提取文字存入 {{\(variableName)}}: \(result.text)")
+                } else if actionType != "none" {
+                    context.log("🎯 第 \(attemptCount) 次寻找成功，落点: (\(Int(finalPoint.x)), \(Int(finalPoint.y)))，执行 \(actionType)")
+                    await context.simulateMouseOperation(type: actionType, at: finalPoint)
+                } else {
+                    context.log("🎯 第 \(attemptCount) 次寻找成功发现目标 (仅等待)。")
+                }
+                return .success
+            }
+            
+            // 未找到的情况：判断是否启用智能滚屏
+            if autoScroll {
+                context.log("⏬ 未发现文字，尝试向下滚动屏幕寻找...")
+                await context.simulateScroll(type: "scrollDown", amount: 5)
+                // 滚动后多等待一点时间，让 UI 动画平滑停止、文字渲染完毕
+                try? await Task.sleep(nanoseconds: 800_000_000)
+            } else {
+                // 原地轮询，等待 0.5 秒
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+        
+        context.log("❌ OCR 寻找超时 (\(timeout)s)，未发现目标文字。")
         return .failure
     }
 }

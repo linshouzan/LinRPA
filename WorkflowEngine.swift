@@ -450,26 +450,71 @@ class WorkflowEngine {
     
     // MARK: - 基础底层能力（已向外部开放）
     
-    func findTextOnScreen(text: String, sampleBase64: String, region: CGRect?, appName: String? = nil) async -> CGPoint? {
+    // [✨终极提升] 图像预处理增强，解决低对比度和深色模式识别难问题
+    private func enhanceImageForOCR(cgImage: CGImage) -> CGImage {
+        let ciImage = CIImage(cgImage: cgImage)
+        let context = CIContext(options: nil)
         
-        // [✨修改] 将 appName 传给底层的 ScreenCaptureUtility，它会自动构建 SCContentFilter 将非目标 App 过滤为纯黑
-        guard let fullCGImage = try? await ScreenCaptureUtility.captureScreen(forAppName: appName) else { return nil }
+        // 1. 去色 (黑白化)
+        guard let noirFilter = CIFilter(name: "CIPhotoEffectNoir") else { return cgImage }
+        noirFilter.setValue(ciImage, forKey: kCIInputImageKey)
         
-        let bounds = CGDisplayBounds(CGMainDisplayID())
-        var targetCGImage = fullCGImage; var cropOffset = CGPoint.zero; var cropSize = bounds.size
+        // 2. 极致对比度拉升
+        guard let colorControls = CIFilter(name: "CIColorControls") else { return cgImage }
+        colorControls.setValue(noirFilter.outputImage, forKey: kCIInputImageKey)
+        colorControls.setValue(2.0, forKey: kCIInputContrastKey) // 拉高对比度
         
-        if let r = region {
-            let safeRect = r.intersection(bounds)
-            if !safeRect.isNull, let cropped = fullCGImage.cropping(to: safeRect) {
-                targetCGImage = cropped; cropOffset = safeRect.origin; cropSize = safeRect.size
-            }
+        if let output = colorControls.outputImage,
+           let resultCG = context.createCGImage(output, from: output.extent) {
+            return resultCG
         }
-        
-        return await withCheckedContinuation { continuation in
-            let request = VNRecognizeTextRequest { (req, err) in
-                guard let obs = req.results as? [VNRecognizedTextObservation] else { continuation.resume(returning: nil); return }
+        return cgImage
+    }
+    
+    // [✨终极升级] 增加 fuzzy 模式与容错距离
+    func findTextOnScreen(text: String, sampleBase64: String, region: CGRect?, appName: String? = nil, matchMode: String = "contains", targetIndex: Int = -1, fuzzyTolerance: Int = 0, enhanceContrast: Bool = false) async -> (point: CGPoint, text: String)? {
+            
+            guard let fullCGImage = try? await ScreenCaptureUtility.captureScreen(forAppName: appName) else { return nil }
+            
+            let bounds = CGDisplayBounds(CGMainDisplayID())
+            var targetCGImage = fullCGImage; var cropOffset = CGPoint.zero; var cropSize = bounds.size
+            
+            if let r = region {
+                let safeRect = r.intersection(bounds)
+                if !safeRect.isNull, let cropped = fullCGImage.cropping(to: safeRect) {
+                    targetCGImage = cropped; cropOffset = safeRect.origin; cropSize = safeRect.size
+                }
+            }
+            
+            // [✨终极提升] 根据配置应用预处理
+            let finalImageToScan = enhanceContrast ? enhanceImageForOCR(cgImage: targetCGImage) : targetCGImage
+            
+            return await withCheckedContinuation { continuation in
+                let request = VNRecognizeTextRequest { [weak self] (req, err) in
+                guard let self = self, let obs = req.results as? [VNRecognizedTextObservation] else { continuation.resume(returning: nil); return }
                 
-                let matches = obs.filter { $0.topCandidates(1).first?.string.localizedCaseInsensitiveContains(text) == true }
+                // 1. 根据匹配模式过滤
+                let matches = obs.filter { observation in
+                    let candidateText = observation.topCandidates(1).first?.string ?? ""
+                    
+                    if matchMode == "exact" {
+                        return candidateText == text
+                    } else if matchMode == "regex" {
+                        return candidateText.range(of: text, options: [.regularExpression, .caseInsensitive]) != nil
+                    } else if matchMode == "fuzzy" {
+                        // [✨新增] 模糊容错匹配：只要候选词中有一段连续的子串与目标词的编辑距离小于等于容错值
+                        // 简单处理：判断整个候选词与目标词的距离，或目标词在候选词中近似存在
+                        if candidateText.contains(text) { return true }
+                        if candidateText.count >= text.count / 2 {
+                            let distance = candidateText.editDistance(to: text)
+                            return distance <= fuzzyTolerance
+                        }
+                        return false
+                    } else {
+                        return candidateText.localizedCaseInsensitiveContains(text)
+                    }
+                }
+                
                 if matches.isEmpty { continuation.resume(returning: nil); return }
                 
                 let getScreenPoint = { (match: VNRecognizedTextObservation) -> CGPoint in
@@ -478,12 +523,17 @@ class WorkflowEngine {
                     return CGPoint(x: cropOffset.x + localX, y: cropOffset.y + localY)
                 }
                 
-                if matches.count == 1 || sampleBase64.isEmpty {
-                    continuation.resume(returning: getScreenPoint(matches.first!))
+                if targetIndex >= 0 && targetIndex < matches.count {
+                    let match = matches[targetIndex]
+                    continuation.resume(returning: (getScreenPoint(match), match.topCandidates(1).first?.string ?? ""))
                     return
                 }
                 
-                // 距离优先算法 (多匹配项时比对特征图)
+                if matches.count == 1 || sampleBase64.isEmpty {
+                    continuation.resume(returning: (getScreenPoint(matches.first!), matches.first!.topCandidates(1).first?.string ?? ""))
+                    return
+                }
+                
                 if let sampleData = Data(base64Encoded: sampleBase64),
                    let sampleNSImage = NSImage(data: sampleData),
                    let sampleCG = sampleNSImage.cgImage(forProposedRect: nil, context: nil, hints: nil) {
@@ -495,12 +545,14 @@ class WorkflowEngine {
                             minDistance = dist; bestMatch = match
                         }
                     }
-                    continuation.resume(returning: getScreenPoint(bestMatch))
+                    continuation.resume(returning: (getScreenPoint(bestMatch), bestMatch.topCandidates(1).first?.string ?? ""))
                 } else {
-                    continuation.resume(returning: getScreenPoint(matches.first!))
+                    continuation.resume(returning: (getScreenPoint(matches.first!), matches.first!.topCandidates(1).first?.string ?? ""))
                 }
             }
+            request.recognitionLevel = .accurate
             request.recognitionLanguages = ["zh-Hans", "en-US"]
+            request.usesLanguageCorrection = true
             try? VNImageRequestHandler(cgImage: targetCGImage, options: [:]).perform([request])
         }
     }
