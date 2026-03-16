@@ -216,7 +216,46 @@ class AppSettings: ObservableObject {
     @AppStorage("minimize_on_run") var minimizeOnRun: Bool = false
     
     // WebAgent的AI提示词
-    @AppStorage("webAgentPrompt") var webAgentPrompt: String = ""
+    @AppStorage("webAgentPrompt") var webAgentPrompt: String = """
+    你是一个顶级 Web RPA 智能体。结合给定的【屏幕截图】和【DOM列表】，你需要规划接下来的一个或多个连续动作。
+    注意：截图中可交互元素已被打上红色数字方框，请通过图片找到正确元素，并参考DOM列表提取目标ID。
+    
+    【任务目标】: {{TaskDesc}}
+    【成功视觉断言】: {{SuccessAssertion}}
+    【操作手册】: {{Manual}}
+    【历史操作记录】:
+    {{History}}
+    
+    ⚠️ 关键指令 ⚠️
+    1. 如果任务需要多步连贯操作（例如：先 hover，再 click，再 input），请在 steps 数组中一次性输出多个动作。
+    2. 如果历史记录中你刚执行过动作，但当前截图里没有任何变化，说明该ID可能无效。请重新寻找其他ID，或者换物理操作，如click换成native_click。
+    3. 如果屏幕上找不到需要的元素，请尝试输出 scroll_down。
+    
+    🔐 敏感信息输入规范 🔐
+    如果你判断当前是登录、密码输入等敏感输入框，**绝对不要尝试自己生成或捏造账号密码**。请在 `input_value` 中严格输出变量占位符！
+    例如输入账号时输出 `{{account}}`，输入密码时输出 `{{password}}`。系统底层会自动拦截并替换为真实的安全凭证。
+    
+    【当前可见元素 (ID与截图对应)】:
+    {{DOM}}
+    
+    【可选动作空间】 (请自由组合):
+    - hover / click / input: 默认的底层 JS 注入操作 (速度极快)
+    - native_hover / native_click / native_input: 原生物理外设操作 (仅当普通操作失效，或遇到防爬检测时使用)
+    - scroll_down / scroll_up: 页面滚动
+    - finish / fail: 任务成功完成(包含满足【成功视觉断言】)或失败请求接管
+    
+    严格输出如下 JSON 格式 (切勿输出其他废话):
+    {
+      "thought": "分析图文与历史记录，规划接下来的连续动作步骤的思考过程",
+      "steps": [
+        {
+          "action_type": "hover/click/input/native_click/scroll_down/finish/fail",
+          "target_id": "红框上的数字ID(无元素留空)",
+          "input_value": "如果是input，填写内容(否则留空)"
+        }
+      ]
+    }
+    """
 }
 
 // MARK: - [✨新增] AI 模型配置与全局管理器
@@ -297,54 +336,25 @@ public struct WebAgentParams: Codable, Equatable {
     var requireConfirm: Bool
     var manualText: String
     var captureMode: String
-    var successAssertion: String // [✨合并保留] 成功视觉断言
+    var successAssertion: String
+    var assertionType: String // [✨新增] 断言类型：支持 "ai" (智能裁判) 或 "ocr" (精准识字)
     
-    // 默认的系统 Prompt 模板 (包含动态变量占位符与多步操作)
-    static let defaultPrompt = """
-    你是一个顶级 Web RPA 智能体。结合给定的【屏幕截图】和【DOM列表】，你需要规划接下来的一个或多个连续动作。
-    注意：截图中可交互元素已被打上红色数字方框，请通过图片找到正确元素，并参考DOM列表提取目标ID。
-    
-    【任务目标】: {{TaskDesc}}
-    【成功视觉断言】: {{SuccessAssertion}}
-    【操作手册】: {{Manual}}
-    【历史操作记录】:
-    {{History}}
-    
-    ⚠️ 关键指令 ⚠️
-    1. 如果任务需要多步连贯操作（例如：先 hover，再 click，再 input），请在 steps 数组中一次性输出多个动作。
-    2. 如果历史记录中你刚执行过动作，但当前截图里没有任何变化，说明该ID可能无效。请重新寻找其他ID，或者换物理操作，如click换成native_click。
-    3. 如果屏幕上找不到需要的元素，请尝试输出 scroll_down。
-    
-    【当前可见元素 (ID与截图对应)】:
-    {{DOM}}
-    
-    【可选动作空间】 (请自由组合):
-    - hover / click / input: 默认的底层 JS 注入操作 (速度极快)
-    - native_hover / native_click / native_input: 原生物理外设操作 (仅当普通操作失效，或遇到防爬检测时使用)
-    - scroll_down / scroll_up: 页面滚动
-    - finish / fail: 任务成功完成(包含满足【成功视觉断言】)或失败请求接管
-    
-    严格输出如下 JSON 格式 (切勿输出其他废话):
-    {
-      "thought": "分析图文与历史记录，规划接下来的连续动作步骤的思考过程",
-      "steps": [
-        {
-          "action_type": "hover/click/input/native_click/scroll_down/finish/fail",
-          "target_id": "红框上的数字ID(无元素留空)",
-          "input_value": "如果是input，填写内容(否则留空)"
-        }
-      ]
-    }
-    """
-    
-    // 智能解析：兼容新的 JSON 格式与旧的 "|" 拼接格式
+    // 智能解析：兼容新的 JSON 格式、缺省字段以及旧的 "|" 拼接格式
     static func parse(from string: String) -> WebAgentParams {
         if let data = string.data(using: .utf8),
-           let params = try? JSONDecoder().decode(WebAgentParams.self, from: data) {
-            return params
+           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            return WebAgentParams(
+                taskDesc: dict["taskDesc"] as? String ?? "",
+                browser: dict["browser"] as? String ?? "InternalBrowser",
+                requireConfirm: dict["requireConfirm"] as? Bool ?? true,
+                manualText: dict["manualText"] as? String ?? "",
+                captureMode: dict["captureMode"] as? String ?? "app",
+                successAssertion: dict["successAssertion"] as? String ?? "",
+                assertionType: dict["assertionType"] as? String ?? "ocr" // 默认为 OCR
+            )
         }
         
-        // 兼容旧版参数解析
+        // 兼容极早期版本的旧版参数解析
         let parts = string.split(separator: "|", maxSplits: 6, omittingEmptySubsequences: false).map(String.init)
         return WebAgentParams(
             taskDesc: parts.count > 0 ? parts[0] : "",
@@ -353,12 +363,15 @@ public struct WebAgentParams: Codable, Equatable {
             manualText: parts.count > 3 ? parts[3] : "",
             captureMode: parts.count > 4 ? parts[4] : "app",
             successAssertion: parts.count > 5 ? parts[5] : "",
+            assertionType: "ocr"
         )
     }
     
     // 序列化为 JSON 字符串保存
     func encode() -> String {
-        if let data = try? JSONEncoder().encode(self),
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys // 保证每次生成的 JSON 字段顺序绝对一致
+        if let data = try? encoder.encode(self),
            let str = String(data: data, encoding: .utf8) {
             return str
         }

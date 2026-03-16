@@ -219,11 +219,12 @@ struct ActionSettingsPopoverView: View {
 // MARK: - [✨精简版] Web 智能体节点编辑器
 struct WebAgentEditor: View {
     @Binding var action: RPAAction
-    @State private var localParams: WebAgentParams
     
-    init(action: Binding<RPAAction>) {
-        self._action = action
-        self._localParams = State(initialValue: WebAgentParams.parse(from: action.wrappedValue.parameter))
+    private var paramsBinding: Binding<WebAgentParams> {
+        Binding(
+            get: { WebAgentParams.parse(from: action.parameter) },
+            set: { action.parameter = $0.encode() }
+        )
     }
     
     var body: some View {
@@ -232,25 +233,43 @@ struct WebAgentEditor: View {
             // 1. 任务目标
             VStack(alignment: .leading, spacing: 4) {
                 Label("🎯 智能体任务目标", systemImage: "flag.checkered").font(.subheadline).bold()
-                TextEditor(text: $localParams.taskDesc)
+                TextEditor(text: paramsBinding.taskDesc)
                     .font(.system(size: 12))
                     .frame(height: 45)
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
             }
             
-            // 2. 成功视觉断言
-            VStack(alignment: .leading, spacing: 4) {
-                Label("✅ 成功视觉断言 (决定走向成功分支)", systemImage: "checkmark.seal").font(.subheadline).bold()
-                TextEditor(text: $localParams.successAssertion)
-                    .font(.system(size: 11))
-                    .frame(height: 35)
-                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
+            // 2. [✨重构] 成功视觉断言 (支持 AI 与 OCR 双引擎)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Label("✅ 成功视觉断言", systemImage: "checkmark.seal").font(.subheadline).bold()
+                    Spacer()
+                    Picker("", selection: paramsBinding.assertionType) {
+                        Text("🤖 AI 裁判").tag("ai")
+                        Text("🔍 OCR 识字").tag("ocr")
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 160)
+                }
+                
+                if paramsBinding.assertionType.wrappedValue == "ocr" {
+                    TextField("请输入需出现在屏幕上的目标文字...", text: paramsBinding.successAssertion)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12))
+                    Text("极速本地验证，将在指定的【视觉范围】内寻找该文字。").font(.caption2).foregroundColor(.green)
+                } else {
+                    TextEditor(text: paramsBinding.successAssertion)
+                        .font(.system(size: 11))
+                        .frame(height: 35)
+                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
+                    Text("输入自然语言让大模型判断，如：'屏幕上出现了提交成功字样'。").font(.caption2).foregroundColor(.secondary)
+                }
             }
             
             // 3. 操作手册
             VStack(alignment: .leading, spacing: 4) {
                 Label("📚 注入操作手册 (可选 RAG)", systemImage: "book.pages").font(.subheadline).bold()
-                TextEditor(text: $localParams.manualText)
+                TextEditor(text: paramsBinding.manualText)
                     .font(.system(size: 11, design: .monospaced))
                     .frame(height: 50)
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
@@ -263,26 +282,21 @@ struct WebAgentEditor: View {
                 Label("⚙️ 底层交互控制", systemImage: "cpu").font(.subheadline).bold()
                 
                 HStack {
-                    Picker("目标浏览器:", selection: $localParams.browser) {
+                    Picker("目标浏览器:", selection: paramsBinding.browser) {
                         Text("内置开发者浏览器").tag("InternalBrowser")
                         Text("Safari (AppleScript)").tag("Safari")
                     }.frame(width: 200)
 
-                    Picker("视觉范围:", selection: $localParams.captureMode) {
+                    Picker("视觉范围:", selection: paramsBinding.captureMode) {
                         Text("仅目标程序").tag("app")
                         Text("全屏截取").tag("fullscreen")
                     }.frame(width: 170)
                 }
 
-                Toggle("🛡️ 开启 Human-in-the-loop (人工确认关键动作)", isOn: $localParams.requireConfirm)
+                Toggle("🛡️ 开启 Human-in-the-loop (人工确认关键动作)", isOn: paramsBinding.requireConfirm)
                     .toggleStyle(.switch)
                     .controlSize(.small)
                     .tint(.purple)
-            }
-        }
-        .onChange(of: localParams.encode()) { encodedString in
-            if action.parameter != encodedString {
-                action.parameter = encodedString
             }
         }
     }
@@ -322,9 +336,57 @@ struct OCRActionEditor: View {
     @Binding var action: RPAAction
     @State private var isPickingRegion = false
     var body: some View {
-        let parts = action.parameter.components(separatedBy: "|"); let targetText = parts.count > 0 ? parts[0] : action.parameter; let shouldClick = parts.count > 1 ? (parts[1] == "true") : true; let regionStr = parts.count > 2 ? parts[2] : ""
-        let updateParam = { (t: String, c: Bool, r: String) in action.parameter = "\(t)|\(c ? "true" : "false")|\(r)" }
-        VStack(alignment: .leading, spacing: 12) { TextField("要识别的文字内容", text: Binding(get: { targetText }, set: { updateParam($0, shouldClick, regionStr) })).textFieldStyle(.roundedBorder); Toggle("识别成功后伴随鼠标点击", isOn: Binding(get: { shouldClick }, set: { updateParam(targetText, $0, regionStr) })); Divider(); HStack { TextField("区域限制 (X,Y,宽,高)", text: Binding(get: { regionStr }, set: { updateParam(targetText, shouldClick, $0) })).textFieldStyle(.roundedBorder); Button(action: { isPickingRegion = true; ScreenRegionPicker.shared.pickRegion { rect in if let r = rect { updateParam(targetText, shouldClick, "\(Int(r.minX)), \(Int(r.minY)), \(Int(r.width)), \(Int(r.height))") }; isPickingRegion = false } }) { Image(systemName: "viewfinder") }.buttonStyle(.bordered) }; OCRMiniDesktop(regionStr: Binding(get: { regionStr }, set: { updateParam(targetText, shouldClick, $0) }), offsetX: $action.offsetX, offsetY: $action.offsetY) }
+        let parts = action.parameter.components(separatedBy: "|")
+        let targetText = parts.count > 0 ? parts[0] : action.parameter
+        let shouldClick = parts.count > 1 ? (parts[1] == "true") : true
+        let regionStr = parts.count > 2 ? parts[2] : ""
+        // [✨新增] 提取第4个参数：目标 App
+        let targetApp = parts.count > 3 ? parts[3] : ""
+        
+        let updateParam = { (t: String, c: Bool, r: String, app: String) in
+            action.parameter = "\(t)|\(c ? "true" : "false")|\(r)|\(app)"
+        }
+        
+        VStack(alignment: .leading, spacing: 12) {
+            TextField("要识别的文字内容", text: Binding(get: { targetText }, set: { updateParam($0, shouldClick, regionStr, targetApp) }))
+                .textFieldStyle(.roundedBorder)
+            
+            // [✨新增] 限定目标 App 的快捷选择框
+            HStack {
+                Text("限定 App:").font(.caption).frame(width: 60, alignment: .leading)
+                TextField("App名称 (留空为全屏识别)", text: Binding(get: { targetApp }, set: { updateParam(targetText, shouldClick, regionStr, $0) }))
+                    .textFieldStyle(.roundedBorder)
+                
+                Menu {
+                    let runningApps = NSWorkspace.shared.runningApplications
+                        .filter { $0.activationPolicy == .regular }
+                        .compactMap { $0.localizedName }.sorted()
+                    ForEach(runningApps, id: \.self) { appName in
+                        Button(appName) { updateParam(targetText, shouldClick, regionStr, appName) }
+                    }
+                } label: { Image(systemName: "list.bullet.rectangle.portrait") }
+                .fixedSize()
+                .help("从当前运行的程序中选择，选择后只识别该程序的窗口画面。")
+            }
+            
+            Toggle("识别成功后伴随鼠标点击", isOn: Binding(get: { shouldClick }, set: { updateParam(targetText, $0, regionStr, targetApp) }))
+            
+            Divider()
+            
+            HStack {
+                TextField("区域限制 (X,Y,宽,高)", text: Binding(get: { regionStr }, set: { updateParam(targetText, shouldClick, $0, targetApp) }))
+                    .textFieldStyle(.roundedBorder)
+                Button(action: {
+                    isPickingRegion = true
+                    ScreenRegionPicker.shared.pickRegion { rect in
+                        if let r = rect { updateParam(targetText, shouldClick, "\(Int(r.minX)), \(Int(r.minY)), \(Int(r.width)), \(Int(r.height))", targetApp) }
+                        isPickingRegion = false
+                    }
+                }) { Image(systemName: "viewfinder") }.buttonStyle(.bordered)
+            }
+            
+            OCRMiniDesktop(regionStr: Binding(get: { regionStr }, set: { updateParam(targetText, shouldClick, $0, targetApp) }), offsetX: $action.offsetX, offsetY: $action.offsetY)
+        }
     }
 }
 

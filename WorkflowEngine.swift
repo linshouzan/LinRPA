@@ -337,19 +337,30 @@ class WorkflowEngine {
         isRunning = true; logs.removeAll(); variables.removeAll()
         if !AXIsProcessTrusted() { log("❌ 致命错误：未获得辅助功能权限！"); isRunning = false; return }
         
-        // [✨修改] 仅在设置允许的情况下自动最小化主窗口
+        // [✨修改] 如果设置允许，自动最小化主窗口，并呼出右上角悬浮工具栏
         if AppSettings.shared.minimizeOnRun {
-            await MainActor.run { if let mainWindow = NSApp.windows.first(where: { $0.className.contains("AppKitWindow") }) { mainWindow.miniaturize(nil) } }
+            await MainActor.run {
+                if let mainWindow = NSApp.windows.first(where: { $0.className.contains("AppKitWindow") }) {
+                    mainWindow.miniaturize(nil)
+                }
+                // 呼出正在执行的悬浮监控面板
+                ExecutionToolbarManager.shared.show(engine: self)
+            }
         }
         
         log("⏱️ 准备执行，倒计时 3 秒...")
         await showCountdownHUD()
-        guard isRunning else { return }
+
+        guard isRunning else {
+            // 倒计时期间如果被紧急中止，也要收回工具栏
+            await MainActor.run { ExecutionToolbarManager.shared.hide() }
+            return
+        }
         
         log("🚀 开始执行工作流: \(workflow.name)")
         let allTargetIDs = Set(workflow.connections.map { $0.endNodeID })
         var startNodes = workflow.actions.filter { !allTargetIDs.contains($0.id) }
-        if startNodes.isEmpty { if let firstAction = workflow.actions.first { startNodes = [firstAction]; log("⚠️ 未检测到明确起点，强制从第一节点发起。") } else { isRunning = false; return } }
+        if startNodes.isEmpty { if let firstAction = workflow.actions.first { startNodes = [firstAction]; log("⚠️ 未检测到明确起点，强制从第一节点发起。") } else { isRunning = false; await MainActor.run { ExecutionToolbarManager.shared.hide() }; return; } }
         
         var executionQueue: [UUID] = startNodes.map { $0.id }
         while !executionQueue.isEmpty && isRunning {
@@ -377,6 +388,11 @@ class WorkflowEngine {
         }
         if isRunning { log("✅ 所有流程执行完成！") }
         currentActionId = nil; isRunning = false
+        
+        // [✨修改] 执行结束或中途被中止时，回收悬浮面板
+        await MainActor.run {
+            ExecutionToolbarManager.shared.hide()
+        }
     }
     
     /// 独立工作流执行方法 (供主流程和子流程调度器调用)
@@ -434,26 +450,55 @@ class WorkflowEngine {
     
     // MARK: - 基础底层能力（已向外部开放）
     
-    func findTextOnScreen(text: String, sampleBase64: String, region: CGRect?) async -> CGPoint? {
-        guard let fullCGImage = try? await ScreenCaptureUtility.captureScreen() else { return nil }
+    func findTextOnScreen(text: String, sampleBase64: String, region: CGRect?, appName: String? = nil) async -> CGPoint? {
+        
+        // [✨修改] 将 appName 传给底层的 ScreenCaptureUtility，它会自动构建 SCContentFilter 将非目标 App 过滤为纯黑
+        guard let fullCGImage = try? await ScreenCaptureUtility.captureScreen(forAppName: appName) else { return nil }
+        
         let bounds = CGDisplayBounds(CGMainDisplayID())
         var targetCGImage = fullCGImage; var cropOffset = CGPoint.zero; var cropSize = bounds.size
+        
         if let r = region {
             let safeRect = r.intersection(bounds)
-            if !safeRect.isNull, let cropped = fullCGImage.cropping(to: safeRect) { targetCGImage = cropped; cropOffset = safeRect.origin; cropSize = safeRect.size }
+            if !safeRect.isNull, let cropped = fullCGImage.cropping(to: safeRect) {
+                targetCGImage = cropped; cropOffset = safeRect.origin; cropSize = safeRect.size
+            }
         }
+        
         return await withCheckedContinuation { continuation in
             let request = VNRecognizeTextRequest { (req, err) in
                 guard let obs = req.results as? [VNRecognizedTextObservation] else { continuation.resume(returning: nil); return }
+                
                 let matches = obs.filter { $0.topCandidates(1).first?.string.localizedCaseInsensitiveContains(text) == true }
                 if matches.isEmpty { continuation.resume(returning: nil); return }
-                let getScreenPoint = { (match: VNRecognizedTextObservation) -> CGPoint in let localX = match.boundingBox.midX * cropSize.width; let localY = (1.0 - match.boundingBox.midY) * cropSize.height; return CGPoint(x: cropOffset.x + localX, y: cropOffset.y + localY) }
-                if matches.count == 1 || sampleBase64.isEmpty { continuation.resume(returning: getScreenPoint(matches.first!)); return }
-                if let sampleData = Data(base64Encoded: sampleBase64), let sampleNSImage = NSImage(data: sampleData), let sampleCG = sampleNSImage.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                
+                let getScreenPoint = { (match: VNRecognizedTextObservation) -> CGPoint in
+                    let localX = match.boundingBox.midX * cropSize.width
+                    let localY = (1.0 - match.boundingBox.midY) * cropSize.height
+                    return CGPoint(x: cropOffset.x + localX, y: cropOffset.y + localY)
+                }
+                
+                if matches.count == 1 || sampleBase64.isEmpty {
+                    continuation.resume(returning: getScreenPoint(matches.first!))
+                    return
+                }
+                
+                // 距离优先算法 (多匹配项时比对特征图)
+                if let sampleData = Data(base64Encoded: sampleBase64),
+                   let sampleNSImage = NSImage(data: sampleData),
+                   let sampleCG = sampleNSImage.cgImage(forProposedRect: nil, context: nil, hints: nil) {
                     var minDistance: Float = .infinity; var bestMatch = matches.first!
-                    for match in matches { let rect = VNImageRectForNormalizedRect(match.boundingBox, Int(targetCGImage.width), Int(targetCGImage.height)); if let cropped = targetCGImage.cropping(to: rect), let dist = try? self.computeImageDistance(img1: sampleCG, img2: cropped), dist < minDistance { minDistance = dist; bestMatch = match } }
+                    for match in matches {
+                        let rect = VNImageRectForNormalizedRect(match.boundingBox, Int(targetCGImage.width), Int(targetCGImage.height))
+                        if let cropped = targetCGImage.cropping(to: rect),
+                           let dist = try? self.computeImageDistance(img1: sampleCG, img2: cropped), dist < minDistance {
+                            minDistance = dist; bestMatch = match
+                        }
+                    }
                     continuation.resume(returning: getScreenPoint(bestMatch))
-                } else { continuation.resume(returning: getScreenPoint(matches.first!)) }
+                } else {
+                    continuation.resume(returning: getScreenPoint(matches.first!))
+                }
             }
             request.recognitionLanguages = ["zh-Hans", "en-US"]
             try? VNImageRequestHandler(cgImage: targetCGImage, options: [:]).perform([request])

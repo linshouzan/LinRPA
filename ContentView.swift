@@ -333,12 +333,13 @@ struct CanvasNodeCardView: View {
                 
                 TextField(action.displayTitle, text: $action.customName)
                     .font(.system(size: 12, weight: .bold))
-                    // 禁用时文字呈现删除线视觉
                     .strikethrough(action.isDisabled, color: .gray)
                     .foregroundColor(isCurrent ? .white : (action.isDisabled ? .gray : .primary))
                     .textFieldStyle(.plain)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(1)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    // 可选：如果节点名称过长被挤压，可以提高它的布局优先级
+                    .layoutPriority(1)
                     .disabled(isCurrent)
                 
                 Button(action: { showSettings.toggle() }) {
@@ -511,12 +512,12 @@ struct GlobalSettingsPopoverView: View {
                     Label("🧠 WebAgent 智能体核心 Prompt", systemImage: "brain").font(.subheadline).bold()
                     Spacer()
                     Button("恢复系统默认") {
-                        settings.webAgentPrompt = WebAgentParams.defaultPrompt
+                        settings.webAgentPrompt = AppSettings.shared.webAgentPrompt
                     }.font(.caption)
                 }
                 
                 TextEditor(text: Binding(
-                    get: { settings.webAgentPrompt.isEmpty ? WebAgentParams.defaultPrompt : settings.webAgentPrompt },
+                    get: { settings.webAgentPrompt.isEmpty ? AppSettings.shared.webAgentPrompt : settings.webAgentPrompt },
                     set: { settings.webAgentPrompt = $0 }
                 ))
                 .font(.system(size: 11, design: .monospaced))

@@ -7,6 +7,7 @@
 
 import Foundation
 import AppKit
+import Vision
 
 // MARK: - 执行器协议
 protocol RPAActionExecutor {
@@ -197,14 +198,29 @@ struct OCRTextExecutor: RPAActionExecutor {
         let targetText = parts.count > 0 ? parts[0] : parsedParam
         let shouldClick = parts.count > 1 ? (parts[1] == "true") : true
         let regionStr = parts.count > 2 ? parts[2] : ""
+        // [✨新增] 解析第四个参数：目标 App
+        let targetApp = parts.count > 3 ? parts[3] : ""
+        
         var regionRect: CGRect? = nil
         
         if !regionStr.isEmpty {
             let coords = regionStr.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
             if coords.count == 4 { regionRect = CGRect(x: coords[0], y: coords[1], width: coords[2], height: coords[3]) }
         }
-        context.log("📸 OCR 寻找: '\(targetText)'")
-        if let point = await context.findTextOnScreen(text: targetText, sampleBase64: action.sampleImageBase64, region: regionRect) {
+        
+        if targetApp.isEmpty {
+            context.log("📸 OCR 寻找 (全屏范围): '\(targetText)'")
+        } else {
+            context.log("📸 OCR 寻找 (仅限定 \(targetApp)): '\(targetText)'")
+            // 如果限定了目标应用，虽然底层可以透视拦截，但若需要伴随物理点击，建议将其强制激活到最前端，防止点击落空
+            if shouldClick, let app = NSWorkspace.shared.runningApplications.first(where: { $0.localizedName == targetApp }) {
+                app.activate(options: .activateIgnoringOtherApps)
+                try? await Task.sleep(for: .milliseconds(300))
+            }
+        }
+        
+        // [✨修改] 将 appName 注入底层的 findTextOnScreen 函数
+        if let point = await context.findTextOnScreen(text: targetText, sampleBase64: action.sampleImageBase64, region: regionRect, appName: targetApp.isEmpty ? nil : targetApp) {
             let finalPoint = CGPoint(x: point.x + action.offsetX, y: point.y + action.offsetY)
             context.log("🎯 找到落点: (\(Int(finalPoint.x)), \(Int(finalPoint.y)))")
             if shouldClick { await context.simulateMouseOperation(type: "leftClick", at: finalPoint) }
@@ -487,6 +503,9 @@ struct WebAgentExecutor: RPAActionExecutor {
         var isTaskCompleted = false
         var actionHistory: [String] = []
         
+        // ==========================================
+        // 第一阶段：感知与决策执行循环
+        // ==========================================
         while currentRound < maxRounds && !isTaskCompleted && context.isRunning {
             currentRound += 1
             context.log("🔄 [WebAgent] 第 \(currentRound) 轮感知与决策...")
@@ -502,8 +521,6 @@ struct WebAgentExecutor: RPAActionExecutor {
             try? await Task.sleep(for: .milliseconds(300))
             
             let targetCaptureApp: String? = (params.captureMode == "fullscreen") ? nil : (params.browser == "InternalBrowser" ? ProcessInfo.processInfo.processName : params.browser)
-            
-            // [✨新增] 如果是内置浏览器，精确锁定窗口标题为"开发者浏览器"，排除主程序和监控面板
             let targetWindowTitle: String? = (params.captureMode == "fullscreen") ? nil : (params.browser == "InternalBrowser" ? "开发者浏览器" : nil)
             
             guard let screenCGImage = try? await ScreenCaptureUtility.captureScreen(forAppName: targetCaptureApp, targetWindowTitle: targetWindowTitle) else {
@@ -516,9 +533,8 @@ struct WebAgentExecutor: RPAActionExecutor {
             await context.cleanupSoM(browser: params.browser)
             
             let historyStr = actionHistory.isEmpty ? "无" : actionHistory.enumerated().map{ "\($0.offset+1). \($0.element)" }.joined(separator: "\n")
-            let rawPromptTemplate = AppSettings.shared.webAgentPrompt.isEmpty ? WebAgentParams.defaultPrompt : AppSettings.shared.webAgentPrompt
-            
-            let prompt = rawPromptTemplate
+
+            let prompt = AppSettings.shared.webAgentPrompt
                 .replacingOccurrences(of: "{{TaskDesc}}", with: params.taskDesc)
                 .replacingOccurrences(of: "{{SuccessAssertion}}", with: params.successAssertion.isEmpty ? "无 (自主判断)" : params.successAssertion)
                 .replacingOccurrences(of: "{{Manual}}", with: params.manualText.isEmpty ? "无" : params.manualText)
@@ -612,10 +628,14 @@ struct WebAgentExecutor: RPAActionExecutor {
                 for (index, step) in steps.enumerated() {
                     let actionType = step["action_type"] as? String ?? "fail"
                     let targetId = step["target_id"] as? String ?? ""
-                    let inputValue = step["input_value"] as? String ?? ""
+                    let rawInputValue = step["input_value"] as? String ?? ""
+                    
+                    let inputValue = context.parseVariables(rawInputValue)
+                    let isSensitive = rawInputValue.contains("{{") && rawInputValue.contains("}}") && rawInputValue != inputValue
+                    let displayValue = isSensitive ? "****** (已安全隔离注入)" : inputValue
                     
                     if actionType == "finish" {
-                        context.log("✅ [WebAgent] 判断任务完成！")
+                        context.log("🏁 [WebAgent] AI 判断任务已执行完毕。")
                         isTaskCompleted = true
                         break
                     } else if actionType == "fail" {
@@ -625,22 +645,19 @@ struct WebAgentExecutor: RPAActionExecutor {
                     }
                     
                     context.log("⚙️ 执行步骤 \(index + 1): \(actionType) -> [\(targetId)]")
-                    actionHistory.append("[\(actionType)] 目标ID:\(targetId) 输入:\(inputValue)")
+                    actionHistory.append("[\(actionType)] 目标ID:\(targetId) 输入:\(rawInputValue)")
                     
-                    // [✨核心集成] 获取注入后的脚本以及返回值
                     let (injectedScript, scriptResult) = await context.injectActionJS(browser: params.browser, action: actionType, targetId: targetId, value: inputValue)
                     
-                    // [✨核心集成] 拼接要展示到监控窗口的详细日志信息
-                    let nodeName = action.displayTitle // 当前工作流节点名称
+                    let nodeName = action.displayTitle
                     let logMessage = """
                     ➤ 节点名称: \(nodeName)
                     ➤ 动作意图: \(actionType) (目标ID: \(targetId.isEmpty ? "无" : targetId))
-                    ➤ 注入脚本:
-                    \(injectedScript)
+                    ➤ 注入操作:
+                    \(isSensitive ? "// 🔒 安全脱敏，已隐藏底层注入脚本与真实凭据内容" : injectedScript)
                     ➤ 返回结果: \(scriptResult.isEmpty ? "undefined / 无返回值" : scriptResult)
                     """
                     
-                    // 推送到左下角监控窗口
                     await MainActor.run {
                         AgentMonitorManager.shared.actionExecutionLogs.append(logMessage)
                     }
@@ -658,8 +675,107 @@ struct WebAgentExecutor: RPAActionExecutor {
             }
         }
         
-        if currentRound >= maxRounds && !isTaskCompleted {
-             context.log("🛑 [WebAgent] 已达到系统设置的最大允许轮数 (\(maxRounds) 轮)，为了安全强制中断任务。")
+        // ==========================================
+        // 第二阶段：[✨升级] 支持双引擎的最终视觉断言阶段
+        // ==========================================
+        // 如果用户配置了断言，不管循环是因为 finish 结束还是达到 maxRounds 结束，都强制进行一次最终裁判校验
+        if !params.successAssertion.isEmpty {
+            let modeStr = params.assertionType == "ocr" ? "极速 OCR 识字" : "AI 多模态裁判"
+            context.log("🔍 [WebAgent] 开始最终独立视觉断言检查 (模式: \(modeStr))...")
+            await MainActor.run { AgentMonitorManager.shared.llmThought = "正在执行最终视觉断言 (\(modeStr))..." }
+            
+            // 1. 给页面的跳转、加载或动画留出充足的缓冲时间
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            
+            // 2. 跟屏幕感知一样，严格按【视觉范围】配置截取屏幕区域 (此时已经是过滤好边界的纯净图像了)
+            let targetCaptureApp: String? = (params.captureMode == "fullscreen") ? nil : (params.browser == "InternalBrowser" ? ProcessInfo.processInfo.processName : params.browser)
+            let targetWindowTitle: String? = (params.captureMode == "fullscreen") ? nil : (params.browser == "InternalBrowser" ? "开发者浏览器" : nil)
+            
+            if let assertionImage = try? await ScreenCaptureUtility.captureScreen(forAppName: targetCaptureApp, targetWindowTitle: targetWindowTitle) {
+                
+                // 刷新监控面板，让用户直观看到用于断言的最终精准截图
+                await MainActor.run { AgentMonitorManager.shared.currentVision = NSImage(cgImage: assertionImage, size: .zero) }
+                
+                if params.assertionType == "ocr" {
+                    // ------------------------------------------
+                    // [✨新增] 分支 A：本地 Vision OCR 极速断言
+                    // ------------------------------------------
+                    context.log("📸 [WebAgent] 正在限定视觉区域内扫描文本: '\(params.successAssertion)'")
+                    
+                    let request = VNRecognizeTextRequest()
+                    request.recognitionLanguages = ["zh-Hans", "en-US"]
+                    request.usesLanguageCorrection = true
+                    
+                    do {
+                        let handler = VNImageRequestHandler(cgImage: assertionImage, options: [:])
+                        try handler.perform([request])
+                        
+                        if let observations = request.results as? [VNRecognizedTextObservation] {
+                            let isFound = observations.contains { obs in
+                                // 取最高置信度的候选文本进行容错比对
+                                let text = obs.topCandidates(1).first?.string ?? ""
+                                return text.localizedCaseInsensitiveContains(params.successAssertion)
+                            }
+                            
+                            if isFound {
+                                context.log("✅ [OCR 断言通过]: 在视觉区域内成功匹配到目标文字 '\(params.successAssertion)'")
+                                isTaskCompleted = true
+                            } else {
+                                context.log("❌ [OCR 断言失败]: 视觉区域内未找到指定文字 '\(params.successAssertion)'")
+                                isTaskCompleted = false
+                            }
+                        } else {
+                            context.log("❌ [OCR 断言失败]: 屏幕内容无法被识别。")
+                            isTaskCompleted = false
+                        }
+                    } catch {
+                        context.log("❌ [OCR 断言失败]: Vision 引擎执行异常: \(error.localizedDescription)")
+                        isTaskCompleted = false
+                    }
+                    
+                } else {
+                    // ------------------------------------------
+                    // 分支 B：原生 AI 大模型推理断言
+                    // ------------------------------------------
+                    let assertionPrompt = """
+                    你是一个客观、严格的 RPA 视觉断言裁判。请观察截图，判断当前页面是否已经满足以下成功条件：
+                    【断言条件】: \(params.successAssertion)
+                    
+                    请严格输出 JSON 格式：
+                    {
+                        "is_success": true或者false,
+                        "reason": "简短的判断理由"
+                    }
+                    """
+                    
+                    let nsImage = NSImage(cgImage: assertionImage, size: .zero)
+                    let message = LLMMessage(role: .user, text: assertionPrompt, images: [nsImage])
+                    
+                    context.log("🧠 裁判介入，校验最终任务结果...")
+                    if let resultStr = try? await LLMService.shared.generate(messages: [message]),
+                       let jsonStr = self.extractJSON(from: resultStr),
+                       let jsonData = jsonStr.data(using: .utf8),
+                       let resultDict = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                       let isSuccess = resultDict["is_success"] as? Bool {
+                        
+                        let reason = resultDict["reason"] as? String ?? "无"
+                        if isSuccess {
+                            context.log("✅ [AI 断言通过]: \(reason)")
+                            isTaskCompleted = true
+                        } else {
+                            context.log("❌ [AI 断言失败]: \(reason)")
+                            isTaskCompleted = false // 强行扭转结果为失败
+                        }
+                    } else {
+                        context.log("⚠️ 最终断言解析失败，降级依赖运行状态。")
+                    }
+                }
+            } else {
+                context.log("⚠️ 断言截屏失败，降级依赖运行状态。")
+            }
+        } else if currentRound >= maxRounds && !isTaskCompleted {
+            // 如果没有配置断言且达到了最大轮数
+            context.log("🛑 [WebAgent] 已达到系统设置的最大允许轮数 (\(maxRounds) 轮)，强制中断。")
         }
         
         await MainActor.run { AgentMonitorManager.shared.isProcessing = false }
@@ -667,12 +783,19 @@ struct WebAgentExecutor: RPAActionExecutor {
     }
     
     private func extractJSON(from text: String) -> String? {
-        let pattern = "\\{(?:[^{}]|(?:\\{[^{}]*\\}))*\\}"
-        if let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) {
+        // Markdown 代码块的正则表达式（支持``` 或者 ~~~ 作为分隔符）
+        let markdownPattern = "(?<=^|\\n)(```|~~~)\\s*(\\{(?:[^{}]|(?:\\{[^{}]*\\}))*\\})\\s*(?=\\1$)"
+        
+        if let regex = try? NSRegularExpression(pattern: markdownPattern, options: [.dotMatchesLineSeparators]) {
             let nsString = text as NSString
             let results = regex.matches(in: text, options: [], range: NSRange(location: 0, length: nsString.length))
-            if let firstMatch = results.first { return nsString.substring(with: firstMatch.range) }
+            if let firstMatch = results.first {
+                // 提取匹配到的 JSON 内容
+                return nsString.substring(with: firstMatch.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
         }
+        
+        // 如果没有找到 Markdown 格式的代码块，返回整个文本并去除首尾空白字符
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
