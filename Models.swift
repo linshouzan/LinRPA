@@ -112,6 +112,8 @@ struct RPAAction: Identifiable, Codable, Equatable, Hashable {
     var offsetX: Double = 0.0
     var offsetY: Double = 0.0
     var sampleImageBase64: String = ""
+    // [✨新增] 节点是否被禁用（运行时跳过）
+    var isDisabled: Bool = false
     
     var displayTitle: String {
         if !customName.isEmpty { return customName }
@@ -126,7 +128,7 @@ struct RPAAction: Identifiable, Codable, Equatable, Hashable {
         case .ocrText: let text = parameter.components(separatedBy: "|").first ?? ""; return text.isEmpty ? type.rawValue : "识别: \(text)"
         case .condition: let parts = parameter.components(separatedBy: "|"); return parts.count >= 3 ? "判断: \(parts[0]) \(parts[1] == "==" ? "等于" : "包含")" : type.rawValue
         case .showNotification: let parts = parameter.components(separatedBy: "|"); return parts.count > 1 && !parts[1].isEmpty ? "提醒: \(parts[1])" : type.rawValue
-        case .webAgent: // [✨新增] Web Agent 标题
+        case .webAgent:
             let parts = parameter.split(separator: "|", maxSplits: 3, omittingEmptySubsequences: false).map(String.init)
             let task = parts.count > 0 ? parts[0] : ""
             return task.isEmpty ? type.rawValue : "Agent: \(task.count > 10 ? "\(task.prefix(10))..." : task)"
@@ -214,6 +216,9 @@ class AppSettings: ObservableObject {
     
     // 运行偏好 (默认运行时不最小化窗口)
     @AppStorage("minimize_on_run") var minimizeOnRun: Bool = false
+    
+    // WebAgent的AI提示词
+    @AppStorage("webAgentPrompt") var webAgentPrompt: String = ""
 }
 
 // MARK: - [✨新增] AI 模型配置与全局管理器
@@ -288,27 +293,28 @@ class AIConfigManager: ObservableObject {
 }
 
 // MARK: - WebAgent 4.0 参数与 Prompt 配置模型
-struct WebAgentParams: Codable, Equatable {
+public struct WebAgentParams: Codable, Equatable {
     var taskDesc: String
     var browser: String
     var requireConfirm: Bool
     var manualText: String
     var captureMode: String
-    var promptTemplate: String
+    var successAssertion: String // [✨合并保留] 成功视觉断言
     
-    // 默认的系统 Prompt 模板 (包含动态变量占位符)
+    // 默认的系统 Prompt 模板 (包含动态变量占位符与多步操作)
     static let defaultPrompt = """
-    你是一个顶级 Web RPA 智能体 (WebAgent 4.0)。结合给定的【屏幕截图】和【DOM列表】，你需要规划接下来的一个或多个连续动作。
+    你是一个顶级 Web RPA 智能体。结合给定的【屏幕截图】和【DOM列表】，你需要规划接下来的一个或多个连续动作。
     注意：截图中可交互元素已被打上红色数字方框，请通过图片找到正确元素，并参考DOM列表提取目标ID。
     
     【任务目标】: {{TaskDesc}}
+    【成功视觉断言】: {{SuccessAssertion}}
     【操作手册】: {{Manual}}
     【历史操作记录】:
     {{History}}
     
     ⚠️ 关键指令 ⚠️
     1. 如果任务需要多步连贯操作（例如：先 hover，再 click，再 input），请在 steps 数组中一次性输出多个动作。
-    2. 如果历史记录中你刚执行过动作，但当前截图里没有任何变化，说明该ID可能无效。请重新寻找其他ID。
+    2. 如果历史记录中你刚执行过动作，但当前截图里没有任何变化，说明该ID可能无效。请重新寻找其他ID，或者换物理操作，如click换成native_click。
     3. 如果屏幕上找不到需要的元素，请尝试输出 scroll_down。
     
     【当前可见元素 (ID与截图对应)】:
@@ -318,7 +324,7 @@ struct WebAgentParams: Codable, Equatable {
     - hover / click / input: 默认的底层 JS 注入操作 (速度极快)
     - native_hover / native_click / native_input: 原生物理外设操作 (仅当普通操作失效，或遇到防爬检测时使用)
     - scroll_down / scroll_up: 页面滚动
-    - finish / fail: 任务成功完成或失败请求接管
+    - finish / fail: 任务成功完成(包含满足【成功视觉断言】)或失败请求接管
     
     严格输出如下 JSON 格式 (切勿输出其他废话):
     {
@@ -341,14 +347,14 @@ struct WebAgentParams: Codable, Equatable {
         }
         
         // 兼容旧版参数解析
-        let parts = string.split(separator: "|", maxSplits: 4, omittingEmptySubsequences: false).map(String.init)
+        let parts = string.split(separator: "|", maxSplits: 6, omittingEmptySubsequences: false).map(String.init)
         return WebAgentParams(
             taskDesc: parts.count > 0 ? parts[0] : "",
             browser: parts.count > 1 ? parts[1] : "InternalBrowser",
             requireConfirm: parts.count > 2 ? (parts[2] == "true") : true,
             manualText: parts.count > 3 ? parts[3] : "",
             captureMode: parts.count > 4 ? parts[4] : "app",
-            promptTemplate: defaultPrompt
+            successAssertion: parts.count > 5 ? parts[5] : "",
         )
     }
     

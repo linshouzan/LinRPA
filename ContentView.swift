@@ -255,15 +255,29 @@ struct ContentView: View {
         }.frame(minWidth: 1000, idealWidth: 1200, minHeight: 700, idealHeight: 800).onAppear { engine.checkPermissions() }
         .toolbar {
             ToolbarItem(placement: .automatic) {
-                Button(action: {
-                    // 通过刚才注册的 ID 呼出独立窗口
-                    openWindow(id: "agentMonitor")
-                }) {
-                    // 使用一个代表"视觉与AI"的图标，比如带方框的眼睛或CPU
-                    Label("AI 监控", systemImage: "eye.square")
-                        .foregroundColor(.cyan) // 给点特殊颜色以示区分
+                HStack(spacing: 12) {
+                    // [✨新增] 全局设置入口按钮
+                    Button(action: {
+                        showGlobalSettings.toggle()
+                    }) {
+                        Label("全局设置", systemImage: "gearshape.fill")
+                            .foregroundColor(.secondary)
+                    }
+                    .help("打开系统全局设置与 AI Prompt 调优")
+                    .popover(isPresented: $showGlobalSettings, arrowEdge: .bottom) {
+                        GlobalSettingsPopoverView()
+                    }
+                    
+                    // 原有的 AI 监控按钮
+                    Button(action: {
+                        // 通过刚才注册的 ID 呼出独立窗口
+                        openWindow(id: "agentMonitor")
+                    }) {
+                        Label("AI 监控", systemImage: "eye.square")
+                            .foregroundColor(.cyan)
+                    }
+                    .help("打开 WebAgent 运行时感知与思考监控面板")
                 }
-                .help("打开 WebAgent 运行时感知与思考监控面板") // 鼠标悬停提示
             }
         }
     }
@@ -299,7 +313,17 @@ struct ContentView: View {
     private func defaultPosition(in size: CGSize, offset: CGSize) -> CGPoint { return CGPoint(x: size.width / 2 - offset.width + CGFloat.random(in: -30...30), y: size.height / 3 - offset.height + CGFloat.random(in: -30...30)) }
     private func getPortAbsolutePosition(nodeID: UUID, port: PortPosition, in workflow: Workflow) -> CGPoint { let center = getPosition(for: nodeID, in: workflow); switch port { case .top: return CGPoint(x: center.x, y: center.y - nodeHeight / 2); case .bottom: return CGPoint(x: center.x, y: center.y + nodeHeight / 2); case .left: return CGPoint(x: center.x - nodeWidth / 2, y: center.y); case .right: return CGPoint(x: center.x + nodeWidth / 2, y: center.y) } }
     private func guessEndPortDirection(start: CGPoint, current: CGPoint) -> PortPosition { let dx = current.x - start.x; let dy = current.y - start.y; if abs(dx) > abs(dy) { return dx > 0 ? .left : .right } else { return dy > 0 ? .top : .bottom } }
-    private func guessConditionForNewConnection(startID: UUID, startPort: PortPosition, in workflow: Workflow) -> ConnectionCondition { guard let sourceAction = workflow.actions.first(where: { $0.id == startID }) else { return .always }; if sourceAction.type == .ocrText || sourceAction.type == .condition { if startPort == .right { return .success }; if startPort == .bottom { return .failure } }; return .always }
+    
+    // [✨修改] 让 WebAgent 也支持条件分支
+    private func guessConditionForNewConnection(startID: UUID, startPort: PortPosition, in workflow: Workflow) -> ConnectionCondition {
+        guard let sourceAction = workflow.actions.first(where: { $0.id == startID }) else { return .always }
+        if sourceAction.type == .ocrText || sourceAction.type == .condition || sourceAction.type == .webAgent {
+            if startPort == .right { return .success }
+            if startPort == .bottom { return .failure }
+        }
+        return .always
+    }
+    
     private func handleConnectionDrop(dropLocation: CGPoint?, startID: UUID?, startPort: PortPosition?, workflow: Workflow) { guard let dropPoint = dropLocation, let sourceID = startID, let sPort = startPort else { return }; var closest: (nodeID: UUID, port: PortPosition, distance: CGFloat)? = nil; for targetNode in workflow.actions { if targetNode.id == sourceID { continue }; for port in PortPosition.allCases { let targetPortPos = getPortAbsolutePosition(nodeID: targetNode.id, port: port, in: workflow); let distance = hypot(targetPortPos.x - dropPoint.x, targetPortPos.y - dropPoint.y); if distance <= snapDistance { if closest == nil || distance < closest!.distance { closest = (targetNode.id, port, distance) } } } }; if let bestMatch = closest { let condition = guessConditionForNewConnection(startID: sourceID, startPort: sPort, in: workflow); engine.addConnection(source: sourceID, sourcePort: sPort, target: bestMatch.nodeID, targetPort: bestMatch.port, condition: condition) } }
 }
 
@@ -339,11 +363,40 @@ struct CanvasNodeCardView: View {
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(isCurrent ? themeColor.opacity(0.6 + breathePhase * 0.4) : (isStart ? Color.green.opacity(0.8) : (isEnd ? Color.orange.opacity(0.8) : Color.gray.opacity(0.3))), lineWidth: isCurrent ? (2 + breathePhase * 1.5) : 1))
             .shadow(color: isCurrent ? themeColor.opacity(0.5 - breathePhase * 0.2) : .black.opacity(0.05), radius: isCurrent ? (6 + breathePhase * 8) : 2, y: 2)
             .scaleEffect(isCurrent ? (1.02 + breathePhase * 0.02) : 1.0)
+            
+            // [✨新增] 节点禁用状态蒙层
+            .overlay(
+                Group {
+                    if action.isDisabled {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 8).fill(Color.gray.opacity(0.6))
+                            Text("已禁用").font(.system(size: 14, weight: .bold)).foregroundColor(.white).rotationEffect(.degrees(-15))
+                        }
+                    }
+                }
+            )
             .animation(.easeOut(duration: 0.2), value: isCurrent)
-            .contextMenu { Button(role: .destructive, action: onDelete) { Label("删除节点", systemImage: "trash") } }
+            .animation(.easeOut(duration: 0.2), value: action.isDisabled) // 添加禁用动画
+            .contextMenu {
+                // [✨新增] 右键控制启用或禁用
+                Button(action: { action.isDisabled.toggle() }) {
+                    Label(action.isDisabled ? "启用节点" : "暂时禁用", systemImage: action.isDisabled ? "play.circle" : "pause.circle")
+                }
+                Button(role: .destructive, action: onDelete) { Label("删除节点", systemImage: "trash") }
+            }
             
             if isStart || isEnd { Text(isStart ? "▶ 起点" : "🏁 终点").font(.system(size: 8, weight: .bold)).foregroundColor(.white).padding(.horizontal, 4).padding(.vertical, 2).background(isStart ? Color.green : Color.orange).clipShape(Capsule()).offset(x: cardWidth / 2 - 10, y: -cardHeight / 2 - 6) }
-            ForEach(PortPosition.allCases, id: \.self) { port in let portOffset = getPortLocalOffset(port: port); Circle().fill(Color(NSColor.controlBackgroundColor)).frame(width: 10, height: 10).overlay(Circle().stroke(themeColor.opacity(0.6), lineWidth: 2)).scaleEffect(isConnecting ? 1.3 : 1.0).animation(.spring(), value: isConnecting).offset(x: portOffset.width, y: portOffset.height).overlay(Color.white.opacity(0.001).frame(width: 25, height: 25).offset(x: portOffset.width, y: portOffset.height).gesture(DragGesture(minimumDistance: 0).onChanged { value in if value.translation.width == 0 && value.translation.height == 0 { onStartConnection(port) } else { onDragConnection(port, value.translation) } }.onEnded { value in onEndConnection(port, value.translation) })); if action.type == .ocrText || action.type == .condition { if port == .right { Text("✅").font(.system(size: 8)).foregroundColor(.green).offset(x: portOffset.width + 12, y: portOffset.height) } else if port == .bottom { Text("❌").font(.system(size: 8)).foregroundColor(.red).offset(x: portOffset.width, y: portOffset.height + 12) } } }
+            
+            // [✨修改] 支持给 WebAgent 显示勾叉
+            ForEach(PortPosition.allCases, id: \.self) { port in
+                let portOffset = getPortLocalOffset(port: port)
+                Circle().fill(Color(NSColor.controlBackgroundColor)).frame(width: 10, height: 10).overlay(Circle().stroke(themeColor.opacity(0.6), lineWidth: 2)).scaleEffect(isConnecting ? 1.3 : 1.0).animation(.spring(), value: isConnecting).offset(x: portOffset.width, y: portOffset.height).overlay(Color.white.opacity(0.001).frame(width: 25, height: 25).offset(x: portOffset.width, y: portOffset.height).gesture(DragGesture(minimumDistance: 0).onChanged { value in if value.translation.width == 0 && value.translation.height == 0 { onStartConnection(port) } else { onDragConnection(port, value.translation) } }.onEnded { value in onEndConnection(port, value.translation) }))
+                
+                if action.type == .ocrText || action.type == .condition || action.type == .webAgent {
+                    if port == .right { Text("✅").font(.system(size: 8)).foregroundColor(.green).offset(x: portOffset.width + 12, y: portOffset.height) }
+                    else if port == .bottom { Text("❌").font(.system(size: 8)).foregroundColor(.red).offset(x: portOffset.width, y: portOffset.height + 12) }
+                }
+            }
         }
         .onChange(of: isCurrent) { _, current in
             if current { breathePhase = 0; withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) { breathePhase = 1 } }
@@ -483,6 +536,33 @@ struct GlobalSettingsPopoverView: View {
                     SecureField("sk-...", text: $settings.aiApiKey).textFieldStyle(.roundedBorder)
                 }
                 Text("默认兼容 OpenAI 格式 API (如 Ollama, DeepSeek, 阿里百炼等)").font(.caption2).foregroundColor(.secondary).padding(.leading, 78)
+            }
+            .padding(10)
+            .background(Color(NSColor.controlBackgroundColor))
+            .cornerRadius(8)
+            
+            // [✨新增] 全局 WebAgent Prompt 调优区
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Label("🧠 WebAgent 智能体核心 Prompt", systemImage: "brain").font(.subheadline).bold()
+                    Spacer()
+                    Button("恢复系统默认") {
+                        settings.webAgentPrompt = WebAgentParams.defaultPrompt
+                    }.font(.caption)
+                }
+                
+                TextEditor(text: Binding(
+                    get: { settings.webAgentPrompt.isEmpty ? WebAgentParams.defaultPrompt : settings.webAgentPrompt },
+                    set: { settings.webAgentPrompt = $0 }
+                ))
+                .font(.system(size: 11, design: .monospaced))
+                .frame(height: 160)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
+                
+                HStack {
+                    Text("全局可用变量:").font(.caption2).foregroundColor(.secondary)
+                    Text("{{TaskDesc}} {{SuccessAssertion}} {{Manual}} {{History}} {{DOM}}").font(.caption2).foregroundColor(.blue)
+                }
             }
             .padding(10)
             .background(Color(NSColor.controlBackgroundColor))

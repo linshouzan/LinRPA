@@ -216,101 +216,73 @@ struct ActionSettingsPopoverView: View {
     }
 }
 
-// MARK: - [✨优化] Web 智能体 3.0 编辑器
+// MARK: - [✨精简版] Web 智能体节点编辑器
 struct WebAgentEditor: View {
     @Binding var action: RPAAction
+    @State private var localParams: WebAgentParams
+    
+    init(action: Binding<RPAAction>) {
+        self._action = action
+        self._localParams = State(initialValue: WebAgentParams.parse(from: action.wrappedValue.parameter))
+    }
     
     var body: some View {
-        // maxSplits 改为 6，以支持 7 个参数 (加入静默模式)
-        let parts = action.parameter.split(separator: "|", maxSplits: 6, omittingEmptySubsequences: false).map(String.init)
-        
-        // 1. 任务目标
-        let taskDesc = parts.count > 0 ? parts[0] : ""
-        // 2. 目标浏览器 (默认内置极速浏览器)
-        let browser = parts.count > 1 ? (parts[1].isEmpty ? "InternalBrowser" : parts[1]) : "InternalBrowser"
-        // 3. 人工确认
-        let requireConfirm = parts.count > 2 ? (parts[2] == "true") : true
-        // 4. 操作手册 RAG
-        let manualText = parts.count > 3 ? parts[3] : ""
-        // 5. 视觉范围
-        let captureMode = parts.count > 4 ? parts[4] : "app"
-        // 6. 断言关键字
-        let successKeywords = parts.count > 5 ? parts[5] : ""
-        
-        // 7. [✨核心逻辑] 静默模式：默认开启。如果选择了全屏截取，强制为 false。
-        let rawSilent = parts.count > 6 ? (parts[6] == "true") : true
-        let silentMode = (captureMode == "fullscreen") ? false : rawSilent
-        
-        // 更新参数的闭包
-        let updateParam = { (task: String, brs: String, conf: Bool, man: String, mode: String, kw: String, silent: Bool) in
-            action.parameter = "\(task)|\(brs)|\(conf ? "true" : "false")|\(man)|\(mode)|\(kw)|\(silent ? "true" : "false")"
-        }
-        
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 14) {
             
-            // --- 任务目标 ---
-            VStack(alignment: .leading, spacing: 6) {
+            // 1. 任务目标
+            VStack(alignment: .leading, spacing: 4) {
                 Label("🎯 智能体任务目标", systemImage: "flag.checkered").font(.subheadline).bold()
-                TextEditor(text: Binding(get: { taskDesc }, set: { updateParam($0, browser, requireConfirm, manualText, captureMode, successKeywords, silentMode) }))
+                TextEditor(text: $localParams.taskDesc)
                     .font(.system(size: 12))
-                    .frame(height: 60)
+                    .frame(height: 45)
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
-                Text("例如: 帮我填写表单并提交，姓名为张三，请假天数3天。").font(.caption2).foregroundColor(.secondary)
             }
             
-            Divider()
+            // 2. 成功视觉断言
+            VStack(alignment: .leading, spacing: 4) {
+                Label("✅ 成功视觉断言 (决定走向成功分支)", systemImage: "checkmark.seal").font(.subheadline).bold()
+                TextEditor(text: $localParams.successAssertion)
+                    .font(.system(size: 11))
+                    .frame(height: 35)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
+            }
             
-            // --- 操作手册 ---
-            VStack(alignment: .leading, spacing: 6) {
+            // 3. 操作手册
+            VStack(alignment: .leading, spacing: 4) {
                 Label("📚 注入操作手册 (可选 RAG)", systemImage: "book.pages").font(.subheadline).bold()
-                TextEditor(text: Binding(get: { manualText }, set: { updateParam(taskDesc, browser, requireConfirm, $0, captureMode, successKeywords, silentMode) }))
+                TextEditor(text: $localParams.manualText)
                     .font(.system(size: 11, design: .monospaced))
-                    .frame(height: 60)
+                    .frame(height: 50)
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
-                Text("粘贴此系统的操作要求，Agent 遇到卡点时会自动查阅。").font(.caption2).foregroundColor(.secondary)
             }
             
             Divider()
             
-            // --- 成功断言 ---
-            VStack(alignment: .leading, spacing: 6) {
-                Label("✅ 执行成功断言 (本地极速校验)", systemImage: "checkmark.seal.fill").font(.subheadline).bold()
-                TextField("标志性文字 (如: 提交成功) 多词用逗号隔开", text: Binding(get: { successKeywords }, set: { updateParam(taskDesc, browser, requireConfirm, manualText, captureMode, $0, silentMode) }))
-                    .textFieldStyle(.roundedBorder)
-                Text("AI 每次交互后会暂停并提取页面文字，若命中此关键词则立即判定成功结束任务，杜绝死循环。").font(.caption2).foregroundColor(.secondary)
-            }
-            
-            Divider()
-            
-            // --- 底层交互控制 ---
-            VStack(alignment: .leading, spacing: 10) {
+            // 4. 底层控制
+            VStack(alignment: .leading, spacing: 8) {
                 Label("⚙️ 底层交互控制", systemImage: "cpu").font(.subheadline).bold()
                 
-                Picker("目标浏览器:", selection: Binding(get: { browser }, set: { updateParam(taskDesc, $0, requireConfirm, manualText, captureMode, successKeywords, silentMode) })) {
-                    Text("🚀 内置开发者浏览器 (极速原生)").tag("InternalBrowser")
-                    Text("Safari (AppleScript Bridge)").tag("Safari")
-                }.frame(width: 250)
+                HStack {
+                    Picker("目标浏览器:", selection: $localParams.browser) {
+                        Text("内置开发者浏览器").tag("InternalBrowser")
+                        Text("Safari (AppleScript)").tag("Safari")
+                    }.frame(width: 200)
 
-                // 当视觉范围改变时，同步处理静默模式的强制状态
-                Picker("视觉范围:", selection: Binding(get: { captureMode }, set: { newMode in
-                    let finalSilent = (newMode == "fullscreen") ? false : silentMode
-                    updateParam(taskDesc, browser, requireConfirm, manualText, newMode, successKeywords, finalSilent)
-                })) {
-                    Text("仅截取目标程序 (专注无干扰)").tag("app")
-                    Text("全屏截取 (视野大，但容易误判)").tag("fullscreen")
-                }.frame(width: 280)
+                    Picker("视觉范围:", selection: $localParams.captureMode) {
+                        Text("仅目标程序").tag("app")
+                        Text("全屏截取").tag("fullscreen")
+                    }.frame(width: 170)
+                }
 
-                // [✨联动核心] 禁用与强制取消
-                Toggle("🥷 开启后台静默运行 (不抢夺前台焦点)", isOn: Binding(get: { silentMode }, set: { updateParam(taskDesc, browser, requireConfirm, manualText, captureMode, successKeywords, $0) }))
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .tint(.blue)
-                    .disabled(captureMode == "fullscreen") // 全屏时不可选
-
-                Toggle("🛡️ 开启 Human-in-the-loop (执行动作前人工确认)", isOn: Binding(get: { requireConfirm }, set: { updateParam(taskDesc, browser, $0, manualText, captureMode, successKeywords, silentMode) }))
+                Toggle("🛡️ 开启 Human-in-the-loop (人工确认关键动作)", isOn: $localParams.requireConfirm)
                     .toggleStyle(.switch)
                     .controlSize(.small)
                     .tint(.purple)
+            }
+        }
+        .onChange(of: localParams.encode()) { encodedString in
+            if action.parameter != encodedString {
+                action.parameter = encodedString
             }
         }
     }

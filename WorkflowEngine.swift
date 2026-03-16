@@ -328,46 +328,50 @@ class WorkflowEngine {
         
     /// 主流程执行入口 (由用户点击 UI 触发)
     func runCurrentWorkflow() async {
-        guard let id = selectedWorkflowId, !isRunning else { return }
+        guard let idx = currentWorkflowIndex, !isRunning else { return }
+        let workflow = workflows[idx]
+        guard !workflow.actions.isEmpty else { return }
         
-        // 1. 状态重置与前置校验
-        isRunning = true
-        logs.removeAll()
-        variables.removeAll() // 清空全局变量池
+        isRunning = true; logs.removeAll(); variables.removeAll()
+        if !AXIsProcessTrusted() { log("❌ 致命错误：未获得辅助功能权限！"); isRunning = false; return }
+        await MainActor.run { if let mainWindow = NSApp.windows.first(where: { $0.className.contains("AppKitWindow") }) { mainWindow.miniaturize(nil) } }
         
-        if !AXIsProcessTrusted() {
-            log("❌ 致命错误：未获得辅助功能权限！")
-            isRunning = false
-            return
-        }
-        
-        // 2. 根据设置决定是否隐藏主窗口防遮挡
-        let autoMinimize = UserDefaults.standard.bool(forKey: "autoMinimizeOnRun")
-        if autoMinimize {
-            // [✨修改] 根据全局设置判断是否需要自动隐藏主窗口
-            await MainActor.run {
-                if AppSettings.shared.minimizeOnRun {
-                    if let mainWindow = NSApp.windows.first(where: { $0.className.contains("AppKitWindow") }) {
-                        mainWindow.miniaturize(nil)
-                    }
-                }
-            }
-        }
-        
-        // 3. 倒计时（给予用户准备与中止时间）
         log("⏱️ 准备执行，倒计时 3 秒...")
         await showCountdownHUD()
-        
-        // 如果倒计时期间用户按下了停止快捷键
         guard isRunning else { return }
         
-        // 4. 调用独立的核心引擎方法执行该流程
-        _ = await runWorkflow(by: id)
+        log("🚀 开始执行工作流: \(workflow.name)")
+        let allTargetIDs = Set(workflow.connections.map { $0.endNodeID })
+        var startNodes = workflow.actions.filter { !allTargetIDs.contains($0.id) }
+        if startNodes.isEmpty { if let firstAction = workflow.actions.first { startNodes = [firstAction]; log("⚠️ 未检测到明确起点，强制从第一节点发起。") } else { isRunning = false; return } }
         
-        // 5. 流程结束收尾
+        var executionQueue: [UUID] = startNodes.map { $0.id }
+        while !executionQueue.isEmpty && isRunning {
+            let actionID = executionQueue.removeFirst()
+            guard let action = workflow.actions.first(where: { $0.id == actionID }) else { continue }
+            
+            // [✨支持节点禁用] 跳过执行，直接传导连线
+            if action.isDisabled {
+                log("⏭️ 节点被禁用，直接跳过: [\(action.displayTitle)]")
+                let nextConnections = workflow.connections.filter { $0.startNodeID == actionID }
+                for conn in nextConnections { executionQueue.append(conn.endNodeID) }
+                continue
+            }
+            
+            currentActionId = action.id
+            log("▶️ 执行: [\(action.displayTitle)]")
+            
+            // [✨核心修改] 委托给解耦的 Executor 执行
+            let executor = ActionExecutorFactory.getExecutor(for: action.type)
+            let executeResult = await executor.execute(action: action, context: self)
+            
+            try? await Task.sleep(for: .milliseconds(50))
+            
+            let nextConnections = workflow.connections.filter { $0.startNodeID == actionID && ($0.condition == .always || $0.condition == executeResult) }
+            for conn in nextConnections { executionQueue.append(conn.endNodeID) }
+        }
         if isRunning { log("✅ 所有流程执行完成！") }
-        currentActionId = nil
-        isRunning = false
+        currentActionId = nil; isRunning = false
     }
     
     /// 独立工作流执行方法 (供主流程和子流程调度器调用)
