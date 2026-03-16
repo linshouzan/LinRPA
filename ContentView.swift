@@ -10,12 +10,11 @@ import AppKit
 import UniformTypeIdentifiers
 
 struct ContentView: View {
-    // [✨ 新增 2] 引入 macOS 原生的打开多窗口环境变量
     @Environment(\.openWindow) private var openWindow
     
     @State private var engine = WorkflowEngine()
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
-    @State private var isRecordingUI = false // 控制录制按钮状态
+    @State private var isRecordingUI = false
     
     @State private var draggingStartNodeID: UUID? = nil
     @State private var draggingStartPort: PortPosition? = nil
@@ -44,9 +43,7 @@ struct ContentView: View {
     
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
-            // 替换 ContentView 中的 List 区域
             VStack(spacing: 0) {
-                // 头部工具栏
                 HStack {
                     Text("RPA 流程库").font(.headline)
                     Spacer()
@@ -61,9 +58,7 @@ struct ContentView: View {
                 
                 Divider()
                 
-                // 列表区域
                 List(selection: $engine.selectedWorkflowId) {
-                    // 按照 engine 维护的 folders 顺序渲染
                     ForEach(engine.folders, id: \.self) { folderName in
                         Section {
                             let folderWorkflows = engine.workflows.filter { $0.folderName == folderName }
@@ -83,7 +78,6 @@ struct ContentView: View {
                                         Spacer()
                                     }
                                     .padding(.vertical, 4)
-                                    // 【右键菜单】允许修改工作流的归属文件夹
                                     .contextMenu {
                                         Menu("移动到文件夹...") {
                                             ForEach(engine.folders.filter { $0 != folderName }, id: \.self) { targetFolder in
@@ -100,7 +94,6 @@ struct ContentView: View {
                                 }
                             }
                         } header: {
-                            // 文件夹 Header 与操作菜单
                             HStack {
                                 Text(folderName).font(.subheadline).bold()
                                 Spacer()
@@ -125,20 +118,18 @@ struct ContentView: View {
                 }
                 .listStyle(.sidebar)
             }
-            // 新建文件夹弹窗
             .alert("新建文件夹", isPresented: $showNewFolderAlert) {
                 TextField("文件夹名称", text: $tempFolderName)
                 Button("取消", role: .cancel) { }
                 Button("确定") { engine.addFolder(name: tempFolderName) }
             }
-            // 重命名文件夹弹窗
             .alert("重命名文件夹", isPresented: $showRenameFolderAlert) {
                 TextField("新文件夹名称", text: $tempFolderName)
                 Button("取消", role: .cancel) { }
                 Button("确定") { engine.renameFolder(oldName: targetFolderToRename, newName: tempFolderName) }
             }
+            // [✨修改] 移除了原有的 .toolbar 添加工作流+号，使其更加干净
             .navigationTitle("我的流程").navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 300)
-            .toolbar { ToolbarItem(placement: .primaryAction) { Button(action: engine.createNewWorkflow) { Image(systemName: "plus") } } }
         } content: {
             VStack(spacing: 0) {
                 if !engine.hasAccessibilityPermission || !engine.hasScreenRecordingPermission {
@@ -152,23 +143,16 @@ struct ContentView: View {
                     }.padding(8).background(Color.red.opacity(0.1))
                 }
                 
-                // [✨新增] 顶部带录制状态的控制栏
                 HStack {
                     Text("画布视图").font(.headline)
                     Spacer()
                     
-                    // [✨新增] 内置浏览器独立入口，随时手动调出，防止丢失焦点
                     Button(action: {
-                        DispatchQueue.main.async {
-                            BrowserWindowController.showSharedWindow()
-                        }
+                        DispatchQueue.main.async { BrowserWindowController.showSharedWindow() }
                     }) {
-                        Label("内置浏览器", systemImage: "safari.fill")
-                            .foregroundColor(.blue)
+                        Label("内置浏览器", systemImage: "safari.fill").foregroundColor(.blue)
                     }
-                    .buttonStyle(.plain)
-                    .padding(.horizontal, 6)
-                    .help("手动打开或唤起内置开发者浏览器")
+                    .buttonStyle(.plain).padding(.horizontal, 6).help("手动打开或唤起内置开发者浏览器")
                     
                     Divider().frame(height: 16).padding(.horizontal, 4)
                     
@@ -181,7 +165,6 @@ struct ContentView: View {
                     Button(action: { Task { await engine.runCurrentWorkflow() } }) { Label("执行", systemImage: "play.fill") }.buttonStyle(.borderedProminent).disabled(engine.isRunning || engine.selectedWorkflowId == nil || isRecordingUI)
                 }.padding(8).background(Material.bar)
                 
-                // 画板区 (保留了完整的连线、拖拽、吸附逻辑)
                 if let idx = engine.currentWorkflowIndex {
                     GeometryReader { geo in
                         ZStack {
@@ -256,25 +239,16 @@ struct ContentView: View {
         .toolbar {
             ToolbarItem(placement: .automatic) {
                 HStack(spacing: 12) {
-                    // [✨新增] 全局设置入口按钮
-                    Button(action: {
-                        showGlobalSettings.toggle()
-                    }) {
-                        Label("全局设置", systemImage: "gearshape.fill")
-                            .foregroundColor(.secondary)
+                    Button(action: { showGlobalSettings.toggle() }) {
+                        Label("全局设置", systemImage: "gearshape.fill").foregroundColor(.secondary)
                     }
                     .help("打开系统全局设置与 AI Prompt 调优")
                     .popover(isPresented: $showGlobalSettings, arrowEdge: .bottom) {
                         GlobalSettingsPopoverView()
                     }
                     
-                    // 原有的 AI 监控按钮
-                    Button(action: {
-                        // 通过刚才注册的 ID 呼出独立窗口
-                        openWindow(id: "agentMonitor")
-                    }) {
-                        Label("AI 监控", systemImage: "eye.square")
-                            .foregroundColor(.cyan)
+                    Button(action: { openWindow(id: "agentMonitor") }) {
+                        Label("AI 监控", systemImage: "eye.square").foregroundColor(.cyan)
                     }
                     .help("打开 WebAgent 运行时感知与思考监控面板")
                 }
@@ -282,15 +256,17 @@ struct ContentView: View {
         }
     }
     
-    // [✨修改] 支持异步触发倒计时与窗口自动隐藏/恢复
     private func toggleRecording() {
         if isRecordingUI {
             MacroRecorder.shared.stopRecording()
             isRecordingUI = false
             engine.log("⏹️ 录制结束，已在画板生成操作节点。")
-            // 录制结束后，自动把主窗口弹回来
-            if let mainWindow = NSApp.windows.first(where: { $0.className.contains("AppKitWindow") }) {
-                mainWindow.deminiaturize(nil)
+            
+            // [✨修改] 仅当设置开启时，录制结束才干预恢复窗口
+            if appSettings.minimizeOnRun {
+                if let mainWindow = NSApp.windows.first(where: { $0.className.contains("AppKitWindow") }) {
+                    mainWindow.deminiaturize(nil)
+                }
             }
         } else {
             Task {
@@ -301,9 +277,11 @@ struct ContentView: View {
                 isRecordingUI = true
                 engine.log("🔴 开始录制，请在系统内操作，完成后点击通知栏或回到应用停止录制...")
                 
-                // 开始录制后自动最小化主窗口，腾出操作视野
-                await MainActor.run {
-                    NSApp.windows.first(where: { $0.className.contains("AppKitWindow") })?.miniaturize(nil)
+                // [✨修改] 根据用户设置决定是否自动最小化
+                if appSettings.minimizeOnRun {
+                    await MainActor.run {
+                        NSApp.windows.first(where: { $0.className.contains("AppKitWindow") })?.miniaturize(nil)
+                    }
                 }
             }
         }
@@ -313,8 +291,6 @@ struct ContentView: View {
     private func defaultPosition(in size: CGSize, offset: CGSize) -> CGPoint { return CGPoint(x: size.width / 2 - offset.width + CGFloat.random(in: -30...30), y: size.height / 3 - offset.height + CGFloat.random(in: -30...30)) }
     private func getPortAbsolutePosition(nodeID: UUID, port: PortPosition, in workflow: Workflow) -> CGPoint { let center = getPosition(for: nodeID, in: workflow); switch port { case .top: return CGPoint(x: center.x, y: center.y - nodeHeight / 2); case .bottom: return CGPoint(x: center.x, y: center.y + nodeHeight / 2); case .left: return CGPoint(x: center.x - nodeWidth / 2, y: center.y); case .right: return CGPoint(x: center.x + nodeWidth / 2, y: center.y) } }
     private func guessEndPortDirection(start: CGPoint, current: CGPoint) -> PortPosition { let dx = current.x - start.x; let dy = current.y - start.y; if abs(dx) > abs(dy) { return dx > 0 ? .left : .right } else { return dy > 0 ? .top : .bottom } }
-    
-    // [✨修改] 让 WebAgent 也支持条件分支
     private func guessConditionForNewConnection(startID: UUID, startPort: PortPosition, in workflow: Workflow) -> ConnectionCondition {
         guard let sourceAction = workflow.actions.first(where: { $0.id == startID }) else { return .always }
         if sourceAction.type == .ocrText || sourceAction.type == .condition || sourceAction.type == .webAgent {
@@ -323,21 +299,21 @@ struct ContentView: View {
         }
         return .always
     }
-    
     private func handleConnectionDrop(dropLocation: CGPoint?, startID: UUID?, startPort: PortPosition?, workflow: Workflow) { guard let dropPoint = dropLocation, let sourceID = startID, let sPort = startPort else { return }; var closest: (nodeID: UUID, port: PortPosition, distance: CGFloat)? = nil; for targetNode in workflow.actions { if targetNode.id == sourceID { continue }; for port in PortPosition.allCases { let targetPortPos = getPortAbsolutePosition(nodeID: targetNode.id, port: port, in: workflow); let distance = hypot(targetPortPos.x - dropPoint.x, targetPortPos.y - dropPoint.y); if distance <= snapDistance { if closest == nil || distance < closest!.distance { closest = (targetNode.id, port, distance) } } } }; if let bestMatch = closest { let condition = guessConditionForNewConnection(startID: sourceID, startPort: sPort, in: workflow); engine.addConnection(source: sourceID, sourcePort: sPort, target: bestMatch.nodeID, targetPort: bestMatch.port, condition: condition) } }
 }
 
+// 替换原有的 CanvasNodeCardView
 struct CanvasNodeCardView: View {
     @Binding var action: RPAAction
     var isCurrent: Bool; var isStart: Bool; var isEnd: Bool; var isConnecting: Bool
     let cardWidth: CGFloat; let cardHeight: CGFloat
     var onStartConnection: (PortPosition) -> Void; var onDragConnection: (PortPosition, CGSize) -> Void; var onEndConnection: (PortPosition, CGSize) -> Void; var onDelete: () -> Void
     @State private var showSettings = false
-    
     @State private var breathePhase: CGFloat = 0
 
-    // [✨UI架构优化] 统一提取节点的主题色，让呼吸、阴影和图标完美契合，消除色彩割裂感
     var themeColor: Color {
+        // 禁用状态统一降级为灰色系
+        if action.isDisabled { return .gray }
         switch action.type {
         case .aiVision, .ocrText: return .purple
         case .webAgent: return .indigo
@@ -355,14 +331,14 @@ struct CanvasNodeCardView: View {
                     .font(.system(size: 16))
                     .foregroundColor(isCurrent ? .white : themeColor)
                 
-                // [✨修复核心] 解决运行时 TextField 高频缩放引发的 min/max 浮点约束冲突
                 TextField(action.displayTitle, text: $action.customName)
                     .font(.system(size: 12, weight: .bold))
-                    .foregroundColor(isCurrent ? .white : .primary)
+                    // 禁用时文字呈现删除线视觉
+                    .strikethrough(action.isDisabled, color: .gray)
+                    .foregroundColor(isCurrent ? .white : (action.isDisabled ? .gray : .primary))
                     .textFieldStyle(.plain)
-                    .fixedSize(horizontal: false, vertical: true) // 明确锁定垂直尺寸，防止底层 NSTextField 内部约束打架
-                    .frame(maxWidth: .infinity, alignment: .leading) // 让水平方向充分伸展并靠左对齐，替代单纯的 Spacer 挤压
-                    // [体验优化] 当工作流运行时，禁用直接修改名称，防止焦点冲突
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .disabled(isCurrent)
                 
                 Button(action: { showSettings.toggle() }) {
@@ -373,13 +349,19 @@ struct CanvasNodeCardView: View {
             }
             .padding(.horizontal, 10).frame(width: cardWidth, height: cardHeight)
             .background(RoundedRectangle(cornerRadius: 8).fill(isCurrent ? themeColor.opacity(0.9) : Color(NSColor.controlBackgroundColor)))
-            
-            // [✨特效优化] 边框和发光阴影采用 themeColor 同色系过渡，呼吸感更高级自然
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(isCurrent ? themeColor.opacity(0.6 + breathePhase * 0.4) : (isStart ? Color.green.opacity(0.8) : (isEnd ? Color.orange.opacity(0.8) : Color.gray.opacity(0.3))), lineWidth: isCurrent ? (2 + breathePhase * 1.5) : 1))
             .shadow(color: isCurrent ? themeColor.opacity(0.5 - breathePhase * 0.2) : .black.opacity(0.05), radius: isCurrent ? (6 + breathePhase * 8) : 2, y: 2)
             .scaleEffect(isCurrent ? (1.02 + breathePhase * 0.02) : 1.0)
             .animation(.easeOut(duration: 0.2), value: isCurrent)
-            .contextMenu { Button(role: .destructive, action: onDelete) { Label("删除节点", systemImage: "trash") } }
+            // [✨修改] 增加禁用选项以及视觉穿透力衰减
+            .opacity(action.isDisabled ? 0.6 : 1.0)
+            .contextMenu {
+                Button(action: { action.isDisabled.toggle() }) {
+                    Label(action.isDisabled ? "启用此节点" : "禁用此节点 (运行时跳过)", systemImage: action.isDisabled ? "play.circle" : "pause.circle")
+                }
+                Divider()
+                Button(role: .destructive, action: onDelete) { Label("删除节点", systemImage: "trash") }
+            }
             
             if isStart || isEnd { Text(isStart ? "▶ 起点" : "🏁 终点").font(.system(size: 8, weight: .bold)).foregroundColor(.white).padding(.horizontal, 4).padding(.vertical, 2).background(isStart ? Color.green : Color.orange).clipShape(Capsule()).offset(x: cardWidth / 2 - 10, y: -cardHeight / 2 - 6) }
             ForEach(PortPosition.allCases, id: \.self) { port in let portOffset = getPortLocalOffset(port: port); Circle().fill(Color(NSColor.controlBackgroundColor)).frame(width: 10, height: 10).overlay(Circle().stroke(themeColor.opacity(0.6), lineWidth: 2)).scaleEffect(isConnecting ? 1.3 : 1.0).animation(.spring(), value: isConnecting).offset(x: portOffset.width, y: portOffset.height).overlay(Color.white.opacity(0.001).frame(width: 25, height: 25).offset(x: portOffset.width, y: portOffset.height).gesture(DragGesture(minimumDistance: 0).onChanged { value in if value.translation.width == 0 && value.translation.height == 0 { onStartConnection(port) } else { onDragConnection(port, value.translation) } }.onEnded { value in onEndConnection(port, value.translation) })); if action.type == .ocrText || action.type == .condition { if port == .right { Text("✅").font(.system(size: 8)).foregroundColor(.green).offset(x: portOffset.width + 12, y: portOffset.height) } else if port == .bottom { Text("❌").font(.system(size: 8)).foregroundColor(.red).offset(x: portOffset.width, y: portOffset.height + 12) } } }
@@ -507,28 +489,23 @@ struct GlobalSettingsPopoverView: View {
             }
             Divider()
             
+            // [✨修改] 完全移除了与 AIConfigManager 功能重复的基础配置界面
+            
+            // [✨新增] WebAgent 运行控制
             VStack(alignment: .leading, spacing: 12) {
-                Label("AI 模型底座配置", systemImage: "brain.head.profile").font(.subheadline).bold()
-                
+                Label("WebAgent 运行控制", systemImage: "globe").font(.subheadline).bold()
                 HStack {
-                    Text("API 地址:").font(.caption).frame(width: 70, alignment: .trailing)
-                    TextField("如 http://127.0.0.1...", text: $settings.aiHost).textFieldStyle(.roundedBorder)
+                    Text("最大思考与动作轮数:").font(.caption)
+                    Stepper(value: $settings.webAgentMaxRounds, in: 1...50) {
+                        Text("\(settings.webAgentMaxRounds) 轮")
+                    }
                 }
-                HStack {
-                    Text("模型名称:").font(.caption).frame(width: 70, alignment: .trailing)
-                    TextField("如 qwen3-vl:4b", text: $settings.aiModel).textFieldStyle(.roundedBorder)
-                }
-                HStack {
-                    Text("API Key:").font(.caption).frame(width: 70, alignment: .trailing)
-                    SecureField("sk-...", text: $settings.aiApiKey).textFieldStyle(.roundedBorder)
-                }
-                Text("默认兼容 OpenAI 格式 API (如 Ollama, DeepSeek, 阿里百炼等)").font(.caption2).foregroundColor(.secondary).padding(.leading, 78)
+                Text("防止 WebAgent 在特殊页面陷入死循环，超过此轮数将强制终止。").font(.caption2).foregroundColor(.secondary)
             }
             .padding(10)
             .background(Color(NSColor.controlBackgroundColor))
             .cornerRadius(8)
             
-            // [✨新增] 全局 WebAgent Prompt 调优区
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
                     Label("🧠 WebAgent 智能体核心 Prompt", systemImage: "brain").font(.subheadline).bold()

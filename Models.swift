@@ -209,10 +209,8 @@ class StorageManager {
 class AppSettings: ObservableObject {
     static let shared = AppSettings()
     
-    // AI 模型配置
-    @AppStorage("ai_host") var aiHost: String = "http://127.0.0.1:11434/v1/chat/completions"
-    @AppStorage("ai_model") var aiModel: String = "qwen3-vl:4b"
-    @AppStorage("ai_api_key") var aiApiKey: String = "sk-local-token"
+    // [✨新增] WebAgent 最大思考与动作执行轮数限制
+    @AppStorage("webAgent_max_rounds") var webAgentMaxRounds: Int = 10
     
     // 运行偏好 (默认运行时不最小化窗口)
     @AppStorage("minimize_on_run") var minimizeOnRun: Bool = false

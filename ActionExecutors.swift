@@ -472,19 +472,17 @@ struct AIVisionExecutor: RPAActionExecutor {
 // MARK: - 重构的 Web 智能体 4.0 执行器 (支持多步规划、Hover 及 感知监控面板)
 struct WebAgentExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
-        // [✨全新 JSON 参数解析]
         let params = WebAgentParams.parse(from: action.parameter)
         
         context.log("🌟 [WebAgent 4.0] 准备接管 [\(params.browser == "InternalBrowser" ? "内置浏览器" : "Safari")]...")
         await context.activateBrowser(params.browser)
         
-        // [✨接入监控 1] 呼出监控窗口，并初始化新任务的状态
         await MainActor.run {
             AgentMonitorManager.shared.showWindow()
             AgentMonitorManager.shared.resetForNewTask()
         }
         
-        let maxRounds = 10
+        let maxRounds = AppSettings.shared.webAgentMaxRounds
         var currentRound = 0
         var isTaskCompleted = false
         var actionHistory: [String] = []
@@ -493,7 +491,6 @@ struct WebAgentExecutor: RPAActionExecutor {
             currentRound += 1
             context.log("🔄 [WebAgent] 第 \(currentRound) 轮感知与决策...")
             
-            // 1. 获取 DOM
             let domContext = await context.injectSoMAndGetDOM(browser: params.browser)
             if domContext.contains("Error") {
                 context.log("❌ [WebAgent] 获取网页结构失败: \(domContext)")
@@ -501,33 +498,26 @@ struct WebAgentExecutor: RPAActionExecutor {
                 return .failure
             }
             
-            // [✨接入监控 2] 投递 DOM 结构到左下角雷达区
             await MainActor.run { AgentMonitorManager.shared.domSummary = domContext }
-            
             try? await Task.sleep(for: .milliseconds(300))
             
             let targetCaptureApp: String? = (params.captureMode == "fullscreen") ? nil : (params.browser == "InternalBrowser" ? ProcessInfo.processInfo.processName : params.browser)
             
-            // 2. 获取视野截屏
-            guard let screenCGImage = try? await ScreenCaptureUtility.captureScreen(forAppName: targetCaptureApp) else {
+            // [✨新增] 如果是内置浏览器，精确锁定窗口标题为"开发者浏览器"，排除主程序和监控面板
+            let targetWindowTitle: String? = (params.captureMode == "fullscreen") ? nil : (params.browser == "InternalBrowser" ? "开发者浏览器" : nil)
+            
+            guard let screenCGImage = try? await ScreenCaptureUtility.captureScreen(forAppName: targetCaptureApp, targetWindowTitle: targetWindowTitle) else {
                 context.log("❌ [WebAgent] 截屏失败，请检查屏幕录制权限。")
                 await MainActor.run { AgentMonitorManager.shared.isProcessing = false }
                 return .failure
             }
             
-            // [✨接入监控 3] 投递包含红框和蓝色准星的截图到顶部视觉区
             await MainActor.run { AgentMonitorManager.shared.currentVision = NSImage(cgImage: screenCGImage, size: .zero) }
-            
             await context.cleanupSoM(browser: params.browser)
             
             let historyStr = actionHistory.isEmpty ? "无" : actionHistory.enumerated().map{ "\($0.offset+1). \($0.element)" }.joined(separator: "\n")
-
-            // [✨从全局设置读取 Prompt 模板]
-            let rawPromptTemplate = AppSettings.shared.webAgentPrompt.isEmpty
-                                    ? WebAgentParams.defaultPrompt
-                                    : AppSettings.shared.webAgentPrompt
+            let rawPromptTemplate = AppSettings.shared.webAgentPrompt.isEmpty ? WebAgentParams.defaultPrompt : AppSettings.shared.webAgentPrompt
             
-            // 动态变量插值
             let prompt = rawPromptTemplate
                 .replacingOccurrences(of: "{{TaskDesc}}", with: params.taskDesc)
                 .replacingOccurrences(of: "{{SuccessAssertion}}", with: params.successAssertion.isEmpty ? "无 (自主判断)" : params.successAssertion)
@@ -538,7 +528,6 @@ struct WebAgentExecutor: RPAActionExecutor {
             context.log("🧠 [WebAgent] 大脑运转中 (图文多模态推理)...")
             context.log("🌊 正在思考: ")
             
-            // [✨接入监控 4] 清理上一轮的思考内容与动作计划
             await MainActor.run {
                 AgentMonitorManager.shared.llmThought = ""
                 AgentMonitorManager.shared.plannedSteps.removeAll()
@@ -568,7 +557,6 @@ struct WebAgentExecutor: RPAActionExecutor {
                         chunkBuffer = ""
                         await MainActor.run {
                             context.appendLogChunk(textToAppend)
-                            // [✨接入监控 5] 将流式输出投射到面板的右下角“思维链”中
                             AgentMonitorManager.shared.llmThought = currentFullResponse
                         }
                         lastReportTime = now
@@ -595,14 +583,12 @@ struct WebAgentExecutor: RPAActionExecutor {
                 let thought = plan["thought"] as? String ?? ""
                 context.log("\n💡 思考结果: \(thought)")
                 
-                // [✨核心升级：解析多步动作]
                 guard let steps = plan["steps"] as? [[String: Any]], !steps.isEmpty else {
                     context.log("⚠️ Agent 返回的动作列表为空，强制重新思考。")
                     actionHistory.append("上一步未返回任何有效动作(steps为空)，请重新规划。")
                     continue
                 }
                 
-                // [✨接入监控 6] 将多步规划推送至面板 UI
                 await MainActor.run {
                     AgentMonitorManager.shared.plannedSteps = steps.enumerated().map { index, step in
                         let aType = step["action_type"] as? String ?? "未知"
@@ -613,7 +599,6 @@ struct WebAgentExecutor: RPAActionExecutor {
                     }
                 }
                 
-                // Human-in-the-loop: 一次性确认所有连贯动作
                 if params.requireConfirm {
                     let stepsDesc = steps.map { "[\($0["action_type"] ?? "")] ID:\($0["target_id"] ?? "") \($0["input_value"] ?? "")" }.joined(separator: "\n")
                     let confirmMsg = "思考: \(thought)\n\n计划连续执行以下动作:\n\(stepsDesc)"
@@ -624,7 +609,6 @@ struct WebAgentExecutor: RPAActionExecutor {
                     }
                 }
                 
-                // [✨循环执行 Steps]
                 for (index, step) in steps.enumerated() {
                     let actionType = step["action_type"] as? String ?? "fail"
                     let targetId = step["target_id"] as? String ?? ""
@@ -643,9 +627,24 @@ struct WebAgentExecutor: RPAActionExecutor {
                     context.log("⚙️ 执行步骤 \(index + 1): \(actionType) -> [\(targetId)]")
                     actionHistory.append("[\(actionType)] 目标ID:\(targetId) 输入:\(inputValue)")
                     
-                    await context.injectActionJS(browser: params.browser, action: actionType, targetId: targetId, value: inputValue)
+                    // [✨核心集成] 获取注入后的脚本以及返回值
+                    let (injectedScript, scriptResult) = await context.injectActionJS(browser: params.browser, action: actionType, targetId: targetId, value: inputValue)
                     
-                    // 如果不是最后一步，给极短的延时；最后一步给予长延时等待页面稳定
+                    // [✨核心集成] 拼接要展示到监控窗口的详细日志信息
+                    let nodeName = action.displayTitle // 当前工作流节点名称
+                    let logMessage = """
+                    ➤ 节点名称: \(nodeName)
+                    ➤ 动作意图: \(actionType) (目标ID: \(targetId.isEmpty ? "无" : targetId))
+                    ➤ 注入脚本:
+                    \(injectedScript)
+                    ➤ 返回结果: \(scriptResult.isEmpty ? "undefined / 无返回值" : scriptResult)
+                    """
+                    
+                    // 推送到左下角监控窗口
+                    await MainActor.run {
+                        AgentMonitorManager.shared.actionExecutionLogs.append(logMessage)
+                    }
+                    
                     let sleepTime: UInt64 = (index == steps.count - 1) ? 1_500_000_000 : 300_000_000
                     try? await Task.sleep(nanoseconds: sleepTime)
                     
@@ -657,6 +656,10 @@ struct WebAgentExecutor: RPAActionExecutor {
                 await MainActor.run { AgentMonitorManager.shared.isProcessing = false }
                 return .failure
             }
+        }
+        
+        if currentRound >= maxRounds && !isTaskCompleted {
+             context.log("🛑 [WebAgent] 已达到系统设置的最大允许轮数 (\(maxRounds) 轮)，为了安全强制中断任务。")
         }
         
         await MainActor.run { AgentMonitorManager.shared.isProcessing = false }

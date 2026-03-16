@@ -16,8 +16,8 @@ import CoreGraphics
 import ScreenCaptureKit
 
 struct ScreenCaptureUtility {
-    /// 截取屏幕（彻底解决 CGColorCreateCopy 野指针崩溃与 Retina 尺寸异常）
-    static func captureScreen(forAppName targetAppName: String? = nil) async throws -> CGImage {
+    /// 截取屏幕（支持精准窗口标题过滤，解决多窗口自身干扰问题）
+    static func captureScreen(forAppName targetAppName: String? = nil, targetWindowTitle: String? = nil) async throws -> CGImage {
         
         let content = try await SCShareableContent.current
         guard let primaryDisplay = content.displays.first else {
@@ -32,10 +32,18 @@ struct ScreenCaptureUtility {
                 $0.applicationName.localizedCaseInsensitiveContains(appName) ||
                 $0.bundleIdentifier.localizedCaseInsensitiveContains(appName)
             }) {
-                let realWindows = content.windows.filter { win in
+                var realWindows = content.windows.filter { win in
                     win.owningApplication?.processID == targetApp.processID &&
                     win.frame.width > 50 &&
                     win.frame.height > 50
+                }
+                
+                // [✨核心修复] 精确匹配窗口标题，将其他窗口（如主控制台、监控面板）剔除出白名单
+                if let exactTitle = targetWindowTitle, !exactTitle.isEmpty {
+                    let matchedWindows = realWindows.filter { $0.title?.contains(exactTitle) == true }
+                    if !matchedWindows.isEmpty {
+                        realWindows = matchedWindows
+                    }
                 }
                 
                 if !realWindows.isEmpty {
@@ -43,6 +51,7 @@ struct ScreenCaptureUtility {
                        let targetDisp = content.displays.first(where: { $0.frame.intersects(firstWin.frame) }) {
                         captureDisplay = targetDisp
                     }
+                    // SCContentFilter 的 including 模式会完美地只渲染白名单窗口，其余透明/纯黑
                     filter = SCContentFilter(display: captureDisplay, including: realWindows)
                 } else {
                     print("⚠️ 未检测到 [\(appName)] 的合法可视窗口，降级为全屏截图")
@@ -54,7 +63,6 @@ struct ScreenCaptureUtility {
             filter = SCContentFilter(display: captureDisplay, excludingWindows: [])
         }
         
-        // [✨修复 1] 补全 Retina 缩放倍率，防止传递逻辑坐标导致 macOS 底层分配显存溢出
         let scaleFactor: CGFloat = await MainActor.run {
             var factor: CGFloat = 1.0
             for screen in NSScreen.screens {
@@ -79,15 +87,9 @@ struct ScreenCaptureUtility {
         config.width = pixelWidth
         config.height = pixelHeight
         config.showsCursor = false
-        
-        // [✨修复 2 核心崩溃点] 解决 Crash 日志中的 CGColorCreateCopy EXC_BREAKPOINT！
-        // 绝不能用 NSColor.black.cgColor！使用不可变的 CGColor.black 单例常量，它的内存永不释放
         config.backgroundColor = CGColor.black
-        
-        // [✨防御 3] 必须显式指定色彩空间，防止外接 HDR 或 P3 广色域屏幕导致底层转换崩溃
         config.colorSpaceName = CGColorSpace.sRGB
         
-        // 执行截取
         return try await SCScreenshotManager.captureImage(contentFilter: filter!, configuration: config)
     }
 }
@@ -325,7 +327,7 @@ class WorkflowEngine {
     }
     
     // MARK: - 工作流执行引擎 (支持子流程递归调用)
-        
+    
     /// 主流程执行入口 (由用户点击 UI 触发)
     func runCurrentWorkflow() async {
         guard let idx = currentWorkflowIndex, !isRunning else { return }
@@ -334,7 +336,11 @@ class WorkflowEngine {
         
         isRunning = true; logs.removeAll(); variables.removeAll()
         if !AXIsProcessTrusted() { log("❌ 致命错误：未获得辅助功能权限！"); isRunning = false; return }
-        await MainActor.run { if let mainWindow = NSApp.windows.first(where: { $0.className.contains("AppKitWindow") }) { mainWindow.miniaturize(nil) } }
+        
+        // [✨修改] 仅在设置允许的情况下自动最小化主窗口
+        if AppSettings.shared.minimizeOnRun {
+            await MainActor.run { if let mainWindow = NSApp.windows.first(where: { $0.className.contains("AppKitWindow") }) { mainWindow.miniaturize(nil) } }
+        }
         
         log("⏱️ 准备执行，倒计时 3 秒...")
         await showCountdownHUD()
@@ -350,7 +356,7 @@ class WorkflowEngine {
             let actionID = executionQueue.removeFirst()
             guard let action = workflow.actions.first(where: { $0.id == actionID }) else { continue }
             
-            // [✨支持节点禁用] 跳过执行，直接传导连线
+            // 跳过执行，直接传导连线
             if action.isDisabled {
                 log("⏭️ 节点被禁用，直接跳过: [\(action.displayTitle)]")
                 let nextConnections = workflow.connections.filter { $0.startNodeID == actionID }
@@ -361,7 +367,6 @@ class WorkflowEngine {
             currentActionId = action.id
             log("▶️ 执行: [\(action.displayTitle)]")
             
-            // [✨核心修改] 委托给解耦的 Executor 执行
             let executor = ActionExecutorFactory.getExecutor(for: action.type)
             let executeResult = await executor.execute(action: action, context: self)
             
@@ -375,8 +380,6 @@ class WorkflowEngine {
     }
     
     /// 独立工作流执行方法 (供主流程和子流程调度器调用)
-    /// - Parameter id: 要执行的 Workflow 的 UUID
-    /// - Returns: 是否顺利执行完成
     func runWorkflow(by id: UUID) async -> Bool {
         guard let workflow = workflows.first(where: { $0.id == id }) else {
             log("❌ 找不到 ID 为 \(id) 的工作流")
@@ -389,8 +392,6 @@ class WorkflowEngine {
         }
         
         log("🚀 开始执行工作流: [\(workflow.name)]")
-        
-        // 1. 寻找启动节点 (没有被其他节点当作终点连线的节点即为起点)
         let allTargetIDs = Set(workflow.connections.map { $0.endNodeID })
         var startNodes = workflow.actions.filter { !allTargetIDs.contains($0.id) }
         
@@ -398,42 +399,36 @@ class WorkflowEngine {
             if let firstAction = workflow.actions.first {
                 startNodes = [firstAction]
                 log("⚠️ 未检测到明确起点，强制从第一节点发起。")
-            } else {
-                return false
-            }
+            } else { return false }
         }
         
-        // 2. 构建执行队列
         var executionQueue: [UUID] = startNodes.map { $0.id }
         
-        // 3. 核心流转循环
         while !executionQueue.isEmpty && isRunning {
             let actionID = executionQueue.removeFirst()
             guard let action = workflow.actions.first(where: { $0.id == actionID }) else { continue }
             
-            // UI 高亮当前节点
+            // [✨修改] 子流程同样需要支持节点禁用跳过
+            if action.isDisabled {
+                log("⏭️ 节点被禁用，直接跳过: [\(action.displayTitle)]")
+                let nextConnections = workflow.connections.filter { $0.startNodeID == actionID }
+                for conn in nextConnections { executionQueue.append(conn.endNodeID) }
+                continue
+            }
+            
             currentActionId = action.id
             log("▶️ 执行: [\(action.displayTitle)]")
             
-            // 委托给解耦的 Executor 执行具体物理动作
             let executor = ActionExecutorFactory.getExecutor(for: action.type)
             let executeResult = await executor.execute(action: action, context: self)
             
-            // 节点间的缓冲等待
             try? await Task.sleep(for: .milliseconds(50))
             
-            // 根据执行结果（success / failure / always）寻找下一条符合条件的连线
             let nextConnections = workflow.connections.filter {
                 $0.startNodeID == actionID && ($0.condition == .always || $0.condition == executeResult)
             }
-            
-            // 将下一个节点压入执行队列
-            for conn in nextConnections {
-                executionQueue.append(conn.endNodeID)
-            }
+            for conn in nextConnections { executionQueue.append(conn.endNodeID) }
         }
-        
-        // 如果 isRunning 依然为 true，说明是自然流转完成，否则是被用户强行中断
         return isRunning
     }
     
@@ -770,39 +765,46 @@ class WorkflowEngine {
         }
     }
     
+    // [✨修改] 返回生成的脚本和执行的真实结果，而不是内部消化掉
     @MainActor
-    func injectActionJS(browser: String, action: String, targetId: String, value: String) async {
+    func injectActionJS(browser: String, action: String, targetId: String, value: String) async -> (script: String, result: String) {
         var jsCommand = ""
         if action == "scroll_down" {
-            jsCommand = "window.scrollBy({top: window.innerHeight * 0.8, behavior: 'smooth'});"
+            jsCommand = "(function() {window.scrollBy({top: window.innerHeight * 0.8, behavior: 'smooth'}); return 'Scrolled Down';})();"
         }
         else if action == "scroll_up" {
-            jsCommand = "window.scrollBy({top: -window.innerHeight * 0.8, behavior: 'smooth'});"
+            jsCommand = "(function() {window.scrollBy({top: -window.innerHeight * 0.8, behavior: 'smooth'}); return 'Scrolled Up';})();"
         }
         else if action == "hover" {
-            // [✨ WebAgent 4.0 新增] 模拟鼠标悬停，触发下拉菜单或 tooltip
             jsCommand = """
             (function() {
                 let el = document.querySelector('[data-rpa-id="\(targetId)"]');
-                if (!el) return;
+                if (!el) return 'Element Not Found';
                 let eventParams = { bubbles: true, cancelable: true, view: window };
                 el.dispatchEvent(new MouseEvent('mouseover', eventParams));
                 el.dispatchEvent(new MouseEvent('mouseenter', eventParams));
                 el.dispatchEvent(new MouseEvent('mousemove', eventParams));
+                return 'Hover Triggered';
             })();
             """
         }
         else if action == "click" {
-            // 增加 focus() 唤醒元素状态
-            jsCommand = "let el = document.querySelector('[data-rpa-id=\"\(targetId)\"]'); if(el){ el.focus(); el.click(); }"
+            jsCommand = """
+            (function() {
+                let el = document.querySelector('[data-rpa-id="\(targetId)"]'); 
+                if(!el) return 'Element Not Found';
+                el.focus(); 
+                el.click();
+                return 'Clicked';
+            })();
+            """
         }
         else if action == "input" {
             let safeValue = value.replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(of: "\n", with: "")
-            // [✨ WebAgent 4.0 核心修复] 原型链穿透 + 完整键盘事件流模拟
             jsCommand = """
             (function() {
                 let el = document.querySelector('[data-rpa-id="\(targetId)"]');
-                if (!el) return;
+                if (!el) return 'Element Not Found';
                 
                 el.focus();
                 
@@ -822,11 +824,17 @@ class WorkflowEngine {
                 el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Enter', code: 'Enter' }));
                 el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Enter', code: 'Enter' }));
                 el.blur();
+                return 'Input Injected: \(safeValue)';
             })();
             """
         }
         
-        _ = try? await executeJS(browser: browser, script: jsCommand)
+        do {
+            let res = try await executeJS(browser: browser, script: jsCommand)
+            return (jsCommand, res)
+        } catch {
+            return (jsCommand, "执行抛出异常: \(error.localizedDescription)")
+        }
     }
     
     @MainActor

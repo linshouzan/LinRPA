@@ -12,3 +12,9 @@
 匹配规则: 包含(Contains)
 
 序号(Index): -1
+
+// AI 模型配置
+var aiHost: String = "http://127.0.0.1:11434/v1/chat/completions"
+var aiModel: String = "qwen3-vl:4b"
+var aiApiKey: String = "sk-local-token"
+
