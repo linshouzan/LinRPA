@@ -591,6 +591,7 @@ class WorkflowEngine {
         }
     }
     
+    // MARK: - [✨3.0 终极版] 穿透 Iframe/ShadowDOM + Set-of-Mark 坐标锚点绘制
     @MainActor
     func injectSoMAndGetDOM(browser: String) async -> String {
         let script = """
@@ -626,7 +627,7 @@ class WorkflowEngine {
                                 elements = elements.concat(getAllElements(iframeDoc.body, offsetX + rect.left, offsetY + rect.top));
                             }
                         } catch(e) {
-                            // 跨域 iframe 会触发 DOMException，此处静默忽略或在扩展中通过 CDP 解决
+                            // 跨域 iframe 会触发 DOMException，此处静默忽略
                         }
                     }
                 }
@@ -666,9 +667,15 @@ class WorkflowEngine {
                     let finalLeft = rect.left + window.scrollX + (el._rpaOffsetX || 0);
                     let finalTop = rect.top + window.scrollY + (el._rpaOffsetY || 0);
                     
+                    // [✨ 新增] 计算绝对中心坐标
+                    let centerX = Math.round(finalLeft + rect.width / 2);
+                    let centerY = Math.round(finalTop + rect.height / 2);
+                    
                     el.setAttribute('data-rpa-id', index.toString());
                     
-                    // 绘制 SoM 标记
+                    // ==========================================
+                    // 1. 绘制主体高亮边框
+                    // ==========================================
                     let marker = document.createElement('div');
                     marker.className = 'rpa-som';
                     marker.style.position = 'absolute';
@@ -681,6 +688,7 @@ class WorkflowEngine {
                     marker.style.zIndex = '2147483647';
                     marker.style.pointerEvents = 'none'; 
                     
+                    // 左上角数字 ID 标签
                     let label = document.createElement('div');
                     label.innerText = index;
                     label.style.position = 'absolute';
@@ -689,16 +697,50 @@ class WorkflowEngine {
                     label.style.padding = '1px 5px'; label.style.fontSize = '12px'; label.style.fontWeight = 'bold';
                     label.style.borderRadius = '3px';
                     label.style.boxShadow = '0 1px 3px rgba(0,0,0,0.3)';
+                    marker.appendChild(label);
                     
-                    marker.appendChild(label); document.body.appendChild(marker);
+                    // ==========================================
+                    // 2. [✨ 融合] 绘制中心坐标圆点 (瞄准点)
+                    // ==========================================
+                    let centerDot = document.createElement('div');
+                    centerDot.style.position = 'absolute';
+                    centerDot.style.left = 'calc(50% - 3px)';
+                    centerDot.style.top = 'calc(50% - 3px)';
+                    centerDot.style.width = '6px';
+                    centerDot.style.height = '6px';
+                    centerDot.style.background = 'blue';
+                    centerDot.style.borderRadius = '50%';
+                    centerDot.style.boxShadow = '0 0 2px white';
+                    marker.appendChild(centerDot);
                     
-                    // [✨ 深度语义] 提取更多状态供大模型判断
+                    // ==========================================
+                    // 3. [✨ 融合] 绘制右下角坐标文本 (供大模型读取)
+                    // ==========================================
+                    let coordLabel = document.createElement('div');
+                    coordLabel.innerText = '(' + centerX + ', ' + centerY + ')';
+                    coordLabel.style.position = 'absolute';
+                    coordLabel.style.bottom = '-12px'; 
+                    coordLabel.style.right = '-2px';
+                    coordLabel.style.background = 'rgba(0, 0, 255, 0.8)'; 
+                    coordLabel.style.color = 'white';
+                    coordLabel.style.padding = '1px 3px'; 
+                    coordLabel.style.fontSize = '9px';
+                    coordLabel.style.fontFamily = 'monospace';
+                    coordLabel.style.borderRadius = '2px';
+                    marker.appendChild(coordLabel);
+
+                    document.body.appendChild(marker);
+                    
+                    // ==========================================
+                    // 4. [✨ 融合] 提取携带状态和坐标的 DOM 上下文
+                    // ==========================================
                     let text = el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '';
                     let state = el.disabled ? " [Disabled]" : "";
                     let isChecked = el.checked ? " [Checked]" : "";
                     let typeInfo = el.type ? `(${el.type})` : "";
+                    let cleanText = text.trim().replace(/\\n/g, ' ').substring(0, 40);
                     
-                    summary.push(`[${index}] ${el.tagName.toLowerCase()}${typeInfo} | Text: ${text.trim().replace(/\\n/g, ' ').substring(0, 40)}${state}${isChecked}`);
+                    summary.push(`[${index}] ${el.tagName.toLowerCase()}${typeInfo} | Coord: (${centerX}, ${centerY}) | Text: ${cleanText}${state}${isChecked}`);
                     index++;
                 }
             }

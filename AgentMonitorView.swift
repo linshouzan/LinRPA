@@ -1,14 +1,7 @@
-//////////////////////////////////////////////////////////////////
-// 文件名：MacroRecorder.swift
-// 文件说明：这是适用于 macos 14+ 的RPA WebAgent感知监控
-// 功能说明：
-// 代码要求：没有要求修改不用输出代码，请保证代码的逻辑和完整性，保留代码中的所有注释内容
-//////////////////////////////////////////////////////////////////
-
 import SwiftUI
 import Combine
 
-// MARK: - 1. 感知状态管理器
+// MARK: - 1. 感知状态管理器 (增强了独立窗口管理能力)
 class AgentMonitorManager: ObservableObject {
     static let shared = AgentMonitorManager()
     
@@ -17,6 +10,39 @@ class AgentMonitorManager: ObservableObject {
     @Published var llmThought: String = ""     // 模型正在思考的推理过程
     @Published var plannedSteps: [String] = [] // 计划执行的动作序列
     @Published var isProcessing: Bool = false  // 运行状态指示器
+    
+    private var window: NSWindow?
+    
+    // [✨新增] 呼出独立的悬浮监控窗口
+    @MainActor
+    func showWindow() {
+        if window == nil {
+            let view = AgentMonitorView()
+            let newWin = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+                styleMask: [.titled, .closable, .resizable, .miniaturizable, .nonactivatingPanel],
+                backing: .buffered,
+                defer: false
+            )
+            newWin.title = "🤖 WebAgent 感知与决策监控"
+            newWin.level = .floating // 悬浮在屏幕最上层
+            newWin.isReleasedWhenClosed = false
+            newWin.contentView = NSHostingView(rootView: view)
+            newWin.center()
+            window = newWin
+        }
+        window?.makeKeyAndOrderFront(nil)
+    }
+    
+    // [✨新增] 每次新任务开始前重置状态
+    @MainActor
+    func resetForNewTask() {
+        currentVision = nil
+        domSummary = "正在扫描页面结构..."
+        llmThought = "等待视觉接入..."
+        plannedSteps.removeAll()
+        isProcessing = true
+    }
 }
 
 // MARK: - 2. 运行时监控控制台 UI

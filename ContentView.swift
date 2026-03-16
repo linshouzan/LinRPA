@@ -351,10 +351,25 @@ struct CanvasNodeCardView: View {
     var body: some View {
         ZStack {
             HStack(spacing: 8) {
-                Image(systemName: action.type.icon).font(.system(size: 16)).foregroundColor(isCurrent ? .white : themeColor)
-                TextField(action.displayTitle, text: $action.customName).font(.system(size: 12, weight: .bold)).foregroundColor(isCurrent ? .white : .primary).textFieldStyle(.plain)
-                Spacer(minLength: 0)
-                Button(action: { showSettings.toggle() }) { Image(systemName: "gearshape.fill").foregroundColor(isCurrent ? .white.opacity(0.8) : .gray) }.buttonStyle(.plain)
+                Image(systemName: action.type.icon)
+                    .font(.system(size: 16))
+                    .foregroundColor(isCurrent ? .white : themeColor)
+                
+                // [✨修复核心] 解决运行时 TextField 高频缩放引发的 min/max 浮点约束冲突
+                TextField(action.displayTitle, text: $action.customName)
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(isCurrent ? .white : .primary)
+                    .textFieldStyle(.plain)
+                    .fixedSize(horizontal: false, vertical: true) // 明确锁定垂直尺寸，防止底层 NSTextField 内部约束打架
+                    .frame(maxWidth: .infinity, alignment: .leading) // 让水平方向充分伸展并靠左对齐，替代单纯的 Spacer 挤压
+                    // [体验优化] 当工作流运行时，禁用直接修改名称，防止焦点冲突
+                    .disabled(isCurrent)
+                
+                Button(action: { showSettings.toggle() }) {
+                    Image(systemName: "gearshape.fill")
+                        .foregroundColor(isCurrent ? .white.opacity(0.8) : .gray)
+                }
+                .buttonStyle(.plain)
             }
             .padding(.horizontal, 10).frame(width: cardWidth, height: cardHeight)
             .background(RoundedRectangle(cornerRadius: 8).fill(isCurrent ? themeColor.opacity(0.9) : Color(NSColor.controlBackgroundColor)))
@@ -363,40 +378,11 @@ struct CanvasNodeCardView: View {
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(isCurrent ? themeColor.opacity(0.6 + breathePhase * 0.4) : (isStart ? Color.green.opacity(0.8) : (isEnd ? Color.orange.opacity(0.8) : Color.gray.opacity(0.3))), lineWidth: isCurrent ? (2 + breathePhase * 1.5) : 1))
             .shadow(color: isCurrent ? themeColor.opacity(0.5 - breathePhase * 0.2) : .black.opacity(0.05), radius: isCurrent ? (6 + breathePhase * 8) : 2, y: 2)
             .scaleEffect(isCurrent ? (1.02 + breathePhase * 0.02) : 1.0)
-            
-            // [✨新增] 节点禁用状态蒙层
-            .overlay(
-                Group {
-                    if action.isDisabled {
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 8).fill(Color.gray.opacity(0.6))
-                            Text("已禁用").font(.system(size: 14, weight: .bold)).foregroundColor(.white).rotationEffect(.degrees(-15))
-                        }
-                    }
-                }
-            )
             .animation(.easeOut(duration: 0.2), value: isCurrent)
-            .animation(.easeOut(duration: 0.2), value: action.isDisabled) // 添加禁用动画
-            .contextMenu {
-                // [✨新增] 右键控制启用或禁用
-                Button(action: { action.isDisabled.toggle() }) {
-                    Label(action.isDisabled ? "启用节点" : "暂时禁用", systemImage: action.isDisabled ? "play.circle" : "pause.circle")
-                }
-                Button(role: .destructive, action: onDelete) { Label("删除节点", systemImage: "trash") }
-            }
+            .contextMenu { Button(role: .destructive, action: onDelete) { Label("删除节点", systemImage: "trash") } }
             
             if isStart || isEnd { Text(isStart ? "▶ 起点" : "🏁 终点").font(.system(size: 8, weight: .bold)).foregroundColor(.white).padding(.horizontal, 4).padding(.vertical, 2).background(isStart ? Color.green : Color.orange).clipShape(Capsule()).offset(x: cardWidth / 2 - 10, y: -cardHeight / 2 - 6) }
-            
-            // [✨修改] 支持给 WebAgent 显示勾叉
-            ForEach(PortPosition.allCases, id: \.self) { port in
-                let portOffset = getPortLocalOffset(port: port)
-                Circle().fill(Color(NSColor.controlBackgroundColor)).frame(width: 10, height: 10).overlay(Circle().stroke(themeColor.opacity(0.6), lineWidth: 2)).scaleEffect(isConnecting ? 1.3 : 1.0).animation(.spring(), value: isConnecting).offset(x: portOffset.width, y: portOffset.height).overlay(Color.white.opacity(0.001).frame(width: 25, height: 25).offset(x: portOffset.width, y: portOffset.height).gesture(DragGesture(minimumDistance: 0).onChanged { value in if value.translation.width == 0 && value.translation.height == 0 { onStartConnection(port) } else { onDragConnection(port, value.translation) } }.onEnded { value in onEndConnection(port, value.translation) }))
-                
-                if action.type == .ocrText || action.type == .condition || action.type == .webAgent {
-                    if port == .right { Text("✅").font(.system(size: 8)).foregroundColor(.green).offset(x: portOffset.width + 12, y: portOffset.height) }
-                    else if port == .bottom { Text("❌").font(.system(size: 8)).foregroundColor(.red).offset(x: portOffset.width, y: portOffset.height + 12) }
-                }
-            }
+            ForEach(PortPosition.allCases, id: \.self) { port in let portOffset = getPortLocalOffset(port: port); Circle().fill(Color(NSColor.controlBackgroundColor)).frame(width: 10, height: 10).overlay(Circle().stroke(themeColor.opacity(0.6), lineWidth: 2)).scaleEffect(isConnecting ? 1.3 : 1.0).animation(.spring(), value: isConnecting).offset(x: portOffset.width, y: portOffset.height).overlay(Color.white.opacity(0.001).frame(width: 25, height: 25).offset(x: portOffset.width, y: portOffset.height).gesture(DragGesture(minimumDistance: 0).onChanged { value in if value.translation.width == 0 && value.translation.height == 0 { onStartConnection(port) } else { onDragConnection(port, value.translation) } }.onEnded { value in onEndConnection(port, value.translation) })); if action.type == .ocrText || action.type == .condition { if port == .right { Text("✅").font(.system(size: 8)).foregroundColor(.green).offset(x: portOffset.width + 12, y: portOffset.height) } else if port == .bottom { Text("❌").font(.system(size: 8)).foregroundColor(.red).offset(x: portOffset.width, y: portOffset.height + 12) } } }
         }
         .onChange(of: isCurrent) { _, current in
             if current { breathePhase = 0; withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) { breathePhase = 1 } }
@@ -405,6 +391,7 @@ struct CanvasNodeCardView: View {
         .onAppear { if isCurrent { withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) { breathePhase = 1 } } }
         .popover(isPresented: $showSettings, arrowEdge: .trailing) { ActionSettingsPopoverView(action: $action, showSettings: $showSettings) }
     }
+    
     private func getPortLocalOffset(port: PortPosition) -> CGSize { switch port { case .top: return CGSize(width: 0, height: -cardHeight / 2); case .bottom: return CGSize(width: 0, height: cardHeight / 2); case .left: return CGSize(width: -cardWidth / 2, height: 0); case .right: return CGSize(width: cardWidth / 2, height: 0) } }
 }
 
