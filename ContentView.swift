@@ -10,6 +10,9 @@ import AppKit
 import UniformTypeIdentifiers
 
 struct ContentView: View {
+    // [✨ 新增 2] 引入 macOS 原生的打开多窗口环境变量
+    @Environment(\.openWindow) private var openWindow
+    
     @State private var engine = WorkflowEngine()
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var isRecordingUI = false // 控制录制按钮状态
@@ -53,19 +56,6 @@ struct ContentView: View {
                     } label: {
                         Image(systemName: "plus.circle.fill").imageScale(.large).foregroundColor(.blue)
                     }.menuStyle(.borderlessButton)
-                    Spacer()
-                    Button(action: {
-                        // 唤起 macOS 原生设置窗口
-                        if #available(macOS 13.0, *) {
-                            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-                        } else {
-                            NSApp.sendAction(#selector(NSWindowController.showWindow(_:)), to: nil, from: nil)
-                        }
-                    }) {
-                        Image(systemName: "gearshape.fill")
-                            .foregroundColor(.secondary)
-                    }
-                    .help("全局设置")
                 }
                 .padding()
                 
@@ -180,17 +170,6 @@ struct ContentView: View {
                     .padding(.horizontal, 6)
                     .help("手动打开或唤起内置开发者浏览器")
                     
-                    // [✨新增] 全局设置入口
-                    Button(action: { showGlobalSettings.toggle() }) {
-                        Label("设置", systemImage: "gearshape.fill")
-                            .foregroundColor(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.horizontal, 6)
-                    .popover(isPresented: $showGlobalSettings, arrowEdge: .bottom) {
-                        GlobalSettingsPopoverView()
-                    }
-                    
                     Divider().frame(height: 16).padding(.horizontal, 4)
                     
                     if engine.hasUnsavedChanges { Button(action: { engine.saveChanges() }) { Label("保存", systemImage: "checkmark.circle.fill") }.buttonStyle(.borderedProminent).tint(.green); Divider().frame(height: 16).padding(.horizontal, 4) }
@@ -274,6 +253,19 @@ struct ContentView: View {
             }
             .navigationTitle("组件库").listStyle(.sidebar).navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 300)
         }.frame(minWidth: 1000, idealWidth: 1200, minHeight: 700, idealHeight: 800).onAppear { engine.checkPermissions() }
+        .toolbar {
+            ToolbarItem(placement: .automatic) {
+                Button(action: {
+                    // 通过刚才注册的 ID 呼出独立窗口
+                    openWindow(id: "agentMonitor")
+                }) {
+                    // 使用一个代表"视觉与AI"的图标，比如带方框的眼睛或CPU
+                    Label("AI 监控", systemImage: "eye.square")
+                        .foregroundColor(.cyan) // 给点特殊颜色以示区分
+                }
+                .help("打开 WebAgent 运行时感知与思考监控面板") // 鼠标悬停提示
+            }
+        }
     }
     
     // [✨修改] 支持异步触发倒计时与窗口自动隐藏/恢复

@@ -368,18 +368,19 @@ class BrowserViewModel: NSObject, ObservableObject, WKHTTPCookieStoreObserver {
         }
     }
     
-    // MARK: - [✨API核心升级] OpenAI 兼容的流式请求解析
+    // MARK: - [✨API核心升级] 动态读取全局模型配置的流式请求解析
     func callAi(htmlString: String, isStreaming: Bool = true, onProgress: ((String, String) -> Void)? = nil) async -> String {
-        // 防止前端传来的 DOM 文本太大撑爆上下文
         let prompt = String(htmlString.prefix(30000))
         
-        guard let url = URL(string: "http://127.0.0.1:11434/v1/chat/completions") else {
-            return "❌ URL 无效"
+        // 获取当前激活的模型配置
+        let provider = AIConfigManager.shared.activeProvider
+        
+        guard let url = URL(string: provider.host) else {
+            return "❌ URL 无效，请检查设置中的模型地址"
         }
         
-        // 构建标准的 OpenAI Chat 格式 Payload
         let payload: [String: Any] = [
-            "model": "qwen3-vl:4b", // 根据你实际使用的模型修改
+            "model": provider.modelName,
             "messages": [
                 ["role": "user", "content": prompt]
             ],
@@ -389,6 +390,8 @@ class BrowserViewModel: NSObject, ObservableObject, WKHTTPCookieStoreObserver {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // [✨核心修复] 必须加上 Authorization 才能兼容云端大厂 API
+        request.setValue("Bearer \(provider.apiKey)", forHTTPHeaderField: "Authorization")
         request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
         
         if isStreaming {
@@ -399,10 +402,10 @@ class BrowserViewModel: NSObject, ObservableObject, WKHTTPCookieStoreObserver {
             do {
                 let (result, response) = try await URLSession.shared.bytes(for: request)
                 guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-                    return "❌ AI 接口请求失败或拒绝连接"
+                    let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                    return "❌ AI 接口请求失败 (HTTP \(code))，请检查模型配置及 API Key"
                 }
                 
-                // 解析 Server-Sent Events (SSE) 数据流
                 for try await line in result.lines {
                     guard line.hasPrefix("data: ") else { continue }
                     let dataString = line.dropFirst(6)
@@ -411,29 +414,33 @@ class BrowserViewModel: NSObject, ObservableObject, WKHTTPCookieStoreObserver {
                     if let data = dataString.data(using: .utf8),
                        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                        let choices = json["choices"] as? [[String: Any]],
-                       let delta = choices.first?["delta"] as? [String: Any],
-                       let contentStr = delta["content"] as? String {
+                       let delta = choices.first?["delta"] as? [String: Any] {
                         
-                        // 预留兼容具有深度思考标签的模型 (如 DeepSeek-R1)
-                        if contentStr.contains("<think>") { isThinking = true; continue }
-                        if contentStr.contains("</think>") { isThinking = false; continue }
-                        
-                        if isThinking {
-                            thinkContent += contentStr
-                        } else {
-                            fullContent += contentStr
+                        // 兼容推理模型的思考字段
+                        let dynamicReasoning = (delta["reasoning_content"] as? String) ?? (delta["reasoning"] as? String)
+                        if let r = dynamicReasoning {
+                            thinkContent += r
+                            onProgress?(fullContent, thinkContent)
+                            continue
                         }
                         
-                        onProgress?(fullContent, thinkContent)
+                        if let contentStr = delta["content"] as? String {
+                            if contentStr.contains("<think>") { isThinking = true; continue }
+                            if contentStr.contains("</think>") { isThinking = false; continue }
+                            
+                            if isThinking { thinkContent += contentStr }
+                            else { fullContent += contentStr }
+                            
+                            onProgress?(fullContent, thinkContent)
+                        }
                     }
                 }
                 return fullContent
-                
             } catch {
                 return "❌ 流式请求发生错误: \(error.localizedDescription)"
             }
         } else {
-            // 非流式兜底处理
+            // 非流式兜底处理 (省略...)
             do {
                 let (data, _) = try await URLSession.shared.data(for: request)
                 if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],

@@ -21,11 +21,10 @@ struct LLMMessage {
 class LLMService: NSObject {
     static let shared = LLMService()
     
-    // 全局默认配置 (可在此处统一修改)
-    // [✨修改] 动态桥接全局配置中心
-    var defaultHost: String { AppSettings.shared.aiHost }
-    var defaultModel: String { AppSettings.shared.aiModel }
-    var defaultApiKey: String { AppSettings.shared.aiApiKey }
+    // [✨重构] 彻底废弃硬编码，改为动态读取全局激活的模型配置
+    var defaultHost: String { AIConfigManager.shared.activeProvider.host }
+    var defaultModel: String { AIConfigManager.shared.activeProvider.modelName }
+    var defaultApiKey: String { AIConfigManager.shared.activeProvider.apiKey }
     
     private lazy var session: URLSession = {
         let config = URLSessionConfiguration.default

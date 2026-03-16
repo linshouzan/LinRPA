@@ -592,35 +592,109 @@ class WorkflowEngine {
         let script = """
         (function() {
             document.querySelectorAll('.rpa-som').forEach(e => e.remove());
-            let elements = document.querySelectorAll('button, input, a, select, [role="button"], [tabindex="0"]');
             let summary = [];
             let index = 0;
+            
+            // [✨ 深度获取] 递归遍历 DOM, ShadowDOM, 以及 Iframe，并携带坐标偏移量
+            function getAllElements(root, offsetX = 0, offsetY = 0) {
+                let elements = [];
+                let walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null, false);
+                let node;
+                
+                while (node = walker.nextNode()) {
+                    // 记录元素的绝对坐标偏移
+                    node._rpaOffsetX = offsetX;
+                    node._rpaOffsetY = offsetY;
+                    elements.push(node);
+                    
+                    // 1. 穿透 Shadow DOM
+                    if (node.shadowRoot) {
+                        elements = elements.concat(getAllElements(node.shadowRoot, offsetX, offsetY));
+                    }
+                    
+                    // 2. 穿透 同源 Iframe
+                    if (node.tagName.toLowerCase() === 'iframe') {
+                        try {
+                            let iframeDoc = node.contentDocument || node.contentWindow.document;
+                            if (iframeDoc) {
+                                let rect = node.getBoundingClientRect();
+                                // 累加 iframe 在父级窗口中的坐标
+                                elements = elements.concat(getAllElements(iframeDoc.body, offsetX + rect.left, offsetY + rect.top));
+                            }
+                        } catch(e) {
+                            // 跨域 iframe 会触发 DOMException，此处静默忽略或在扩展中通过 CDP 解决
+                        }
+                    }
+                }
+                return elements;
+            }
+            
+            let allNodes = getAllElements(document.body);
+            let interactiveTags = ['button', 'input', 'a', 'select', 'textarea'];
+            
+            let elements = allNodes.filter(el => {
+                let tag = el.tagName.toLowerCase();
+                let role = el.getAttribute('role');
+                let style = window.getComputedStyle(el);
+                let className = (el.className && typeof el.className === 'string') ? el.className.toLowerCase() : '';
+                
+                // [✨ 增强的感知雷达] 增加指针样式、事件、类名、多角色识别
+                return interactiveTags.includes(tag) || 
+                       ['button', 'link', 'tab', 'menuitem', 'switch', 'checkbox'].includes(role) || 
+                       el.hasAttribute('tabindex') || 
+                       el.hasAttribute('onclick') || 
+                       style.cursor === 'pointer' || 
+                       className.includes('btn') || 
+                       className.includes('button');
+            });
+            
             for(let i=0; i<elements.length; i++) {
                 let el = elements[i];
                 let rect = el.getBoundingClientRect();
-                if(rect.width > 0 && rect.height > 0 && rect.top >= 0 && rect.top <= window.innerHeight) {
+                let style = window.getComputedStyle(el);
+                
+                // 排除不可见、被隐藏(aria-hidden)的元素
+                if(rect.width > 5 && rect.height > 5 && 
+                   style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' &&
+                   el.getAttribute('aria-hidden') !== 'true') {
+                    
+                    // 叠加由 iframe 传导下来的坐标偏移
+                    let finalLeft = rect.left + window.scrollX + (el._rpaOffsetX || 0);
+                    let finalTop = rect.top + window.scrollY + (el._rpaOffsetY || 0);
+                    
                     el.setAttribute('data-rpa-id', index.toString());
+                    
+                    // 绘制 SoM 标记
                     let marker = document.createElement('div');
                     marker.className = 'rpa-som';
                     marker.style.position = 'absolute';
-                    marker.style.left = (rect.left + window.scrollX) + 'px';
-                    marker.style.top = (rect.top + window.scrollY) + 'px';
+                    marker.style.left = finalLeft + 'px';
+                    marker.style.top = finalTop + 'px';
                     marker.style.width = rect.width + 'px';
                     marker.style.height = rect.height + 'px';
-                    marker.style.border = '2px solid red';
+                    marker.style.border = '2px solid rgba(255, 0, 0, 0.6)';
+                    marker.style.boxSizing = 'border-box';
                     marker.style.zIndex = '2147483647';
-                    marker.style.pointerEvents = 'none';
+                    marker.style.pointerEvents = 'none'; 
                     
                     let label = document.createElement('div');
                     label.innerText = index;
                     label.style.position = 'absolute';
-                    label.style.top = '-12px'; label.style.left = '-2px';
-                    label.style.background = 'red'; label.style.color = 'white';
-                    label.style.padding = '1px 4px'; label.style.fontSize = '12px'; label.style.fontWeight = 'bold';
+                    label.style.top = '-16px'; label.style.left = '-2px';
+                    label.style.background = 'rgba(255,0,0,0.9)'; label.style.color = 'white';
+                    label.style.padding = '1px 5px'; label.style.fontSize = '12px'; label.style.fontWeight = 'bold';
+                    label.style.borderRadius = '3px';
+                    label.style.boxShadow = '0 1px 3px rgba(0,0,0,0.3)';
                     
                     marker.appendChild(label); document.body.appendChild(marker);
+                    
+                    // [✨ 深度语义] 提取更多状态供大模型判断
                     let text = el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '';
-                    summary.push('[' + index + '] ' + el.tagName.toLowerCase() + ' | Text: ' + text.trim().replace(/\\n/g, ' '));
+                    let state = el.disabled ? " [Disabled]" : "";
+                    let isChecked = el.checked ? " [Checked]" : "";
+                    let typeInfo = el.type ? `(${el.type})` : "";
+                    
+                    summary.push(`[${index}] ${el.tagName.toLowerCase()}${typeInfo} | Text: ${text.trim().replace(/\\n/g, ' ').substring(0, 40)}${state}${isChecked}`);
                     index++;
                 }
             }
@@ -653,12 +727,57 @@ class WorkflowEngine {
     @MainActor
     func injectActionJS(browser: String, action: String, targetId: String, value: String) async {
         var jsCommand = ""
-        if action == "scroll_down" { jsCommand = "window.scrollBy(0, window.innerHeight * 0.8);" }
-        else if action == "scroll_up" { jsCommand = "window.scrollBy(0, -window.innerHeight * 0.8);" }
-        else if action == "click" { jsCommand = "document.querySelector('[data-rpa-id=\"\(targetId)\"]').click();" }
+        if action == "scroll_down" {
+            jsCommand = "window.scrollBy({top: window.innerHeight * 0.8, behavior: 'smooth'});"
+        }
+        else if action == "scroll_up" {
+            jsCommand = "window.scrollBy({top: -window.innerHeight * 0.8, behavior: 'smooth'});"
+        }
+        else if action == "hover" {
+            // [✨ WebAgent 4.0 新增] 模拟鼠标悬停，触发下拉菜单或 tooltip
+            jsCommand = """
+            (function() {
+                let el = document.querySelector('[data-rpa-id="\(targetId)"]');
+                if (!el) return;
+                let eventParams = { bubbles: true, cancelable: true, view: window };
+                el.dispatchEvent(new MouseEvent('mouseover', eventParams));
+                el.dispatchEvent(new MouseEvent('mouseenter', eventParams));
+                el.dispatchEvent(new MouseEvent('mousemove', eventParams));
+            })();
+            """
+        }
+        else if action == "click" {
+            // 增加 focus() 唤醒元素状态
+            jsCommand = "let el = document.querySelector('[data-rpa-id=\"\(targetId)\"]'); if(el){ el.focus(); el.click(); }"
+        }
         else if action == "input" {
             let safeValue = value.replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(of: "\n", with: "")
-            jsCommand = "let el = document.querySelector('[data-rpa-id=\"\(targetId)\"]'); el.value = \"\(safeValue)\"; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true }));"
+            // [✨ WebAgent 4.0 核心修复] 原型链穿透 + 完整键盘事件流模拟
+            jsCommand = """
+            (function() {
+                let el = document.querySelector('[data-rpa-id="\(targetId)"]');
+                if (!el) return;
+                
+                el.focus();
+                
+                let nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                if (el.tagName.toLowerCase() === 'textarea') {
+                    nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+                }
+                
+                if (nativeSetter) {
+                    nativeSetter.call(el, "\(safeValue)");
+                } else {
+                    el.value = "\(safeValue)";
+                }
+                
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Enter', code: 'Enter' }));
+                el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Enter', code: 'Enter' }));
+                el.blur();
+            })();
+            """
         }
         
         _ = try? await executeJS(browser: browser, script: jsCommand)
@@ -706,5 +825,109 @@ class WorkflowEngine {
         // 使用 innerText 可以过滤掉隐藏元素，完美模拟用户的“视觉可见文本”
         let script = "document.body.innerText"
         return (try? await executeJS(browser: browser, script: script)) ?? ""
+    }
+    
+    // MARK: - [✨ 原生引擎桥梁] 获取元素在屏幕上的物理绝对坐标
+    @MainActor
+    func getElementScreenCoordinates(browser: String, targetId: String) async -> CGPoint? {
+        let script = """
+        (function() {
+            let el = document.querySelector('[data-rpa-id="\(targetId)"]');
+            if (!el) return null;
+            let rect = el.getBoundingClientRect();
+            
+            // 计算浏览器 UI 栏(如顶部的地址栏、书签栏)的高度补偿
+            let toolbarHeight = window.outerHeight - window.innerHeight;
+            let sidebarWidth = window.outerWidth - window.innerWidth;
+            
+            // 换算为操作系统的全局绝对坐标 (获取元素的中心点)
+            let screenX = window.screenX + (sidebarWidth > 0 ? sidebarWidth / 2 : 0) + rect.left + (rect.width / 2);
+            let screenY = window.screenY + toolbarHeight + rect.top + (rect.height / 2);
+            
+            return screenX + "," + screenY;
+        })();
+        """
+        
+        if let result = try? await executeJS(browser: browser, script: script),
+           let coords = result as? String, coords.contains(",") {
+            let parts = coords.split(separator: ",")
+            if parts.count == 2, let x = Double(parts[0]), let y = Double(parts[1]) {
+                return CGPoint(x: x, y: y)
+            }
+        }
+        return nil
+    }
+    
+    // MARK: - [✨ 原生引擎桥梁] 执行物理动作
+    @MainActor
+    func executeNativeAction(browser: String, action: String, targetId: String, value: String) async -> Bool {
+        // 1. 获取物理坐标
+        guard let point = await getElementScreenCoordinates(browser: browser, targetId: targetId) else {
+            return false
+        }
+        
+        // 2. 根据动作指令调用物理外设
+        if action == "native_hover" {
+            NativeInputManager.shared.hover(at: point)
+        } else if action == "native_click" {
+            NativeInputManager.shared.click(at: point)
+        } else if action == "native_input" {
+            // 输入动作：物理鼠标先点过去激活光标，然后再进行物理键盘敲击
+            NativeInputManager.shared.click(at: point)
+            try? await Task.sleep(nanoseconds: 300_000_000) // 等待0.3秒聚焦和动画完成
+            NativeInputManager.shared.typeText(value)
+        }
+        return true
+    }
+}
+
+// MARK: - 鼠标和键盘控制
+class NativeInputManager {
+    static let shared = NativeInputManager()
+    
+    /// 物理鼠标悬停：控制光标瞬间移动到屏幕指定绝对坐标
+    func hover(at point: CGPoint) {
+        let source = CGEventSource(stateID: .hidSystemState)
+        let moveEvent = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)
+        moveEvent?.post(tap: .cghidEventTap)
+    }
+    
+    /// 物理鼠标点击：包含完整的 移动 -> 停留激活Hover -> 按下 -> 抬起 闭环
+    func click(at point: CGPoint) {
+        let source = CGEventSource(stateID: .hidSystemState)
+        
+        // 1. 移动光标
+        let moveEvent = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)
+        moveEvent?.post(tap: .cghidEventTap)
+        
+        // 2. 停顿 50ms (非常重要！给系统或前端框架一个响应 Hover 态的时间)
+        usleep(50_000)
+        
+        // 3. 按下左键
+        let mouseDown = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left)
+        mouseDown?.post(tap: .cghidEventTap)
+        
+        usleep(20_000) // 模拟人类按压停留 20ms
+        
+        // 4. 抬起左键
+        let mouseUp = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)
+        mouseUp?.post(tap: .cghidEventTap)
+    }
+    
+    /// 物理键盘输入：调用系统事件进行真实按键模拟
+    func typeText(_ text: String) {
+        // 对双引号和斜杠进行转义，防止 AppleScript 解析失败
+        let safeText = text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        let script = """
+        tell application "System Events"
+            keystroke "\(safeText)"
+            delay 0.1
+            key code 36 -- 模拟敲击回车键 (Enter)
+        end tell
+        """
+        var error: NSDictionary?
+        if let appleScript = NSAppleScript(source: script) {
+            appleScript.executeAndReturnError(&error)
+        }
     }
 }
