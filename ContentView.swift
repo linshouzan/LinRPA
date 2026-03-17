@@ -82,9 +82,9 @@ struct ContentView: View {
                                         Menu("移动到文件夹...") {
                                             ForEach(engine.folders.filter { $0 != folderName }, id: \.self) { targetFolder in
                                                 Button(targetFolder) {
-                                                    if let idx = engine.workflows.firstIndex(where: { $0.id == workflow.id }) {
-                                                        engine.workflows[idx].folderName = targetFolder
-                                                        engine.saveChanges()
+                                                    // 菜单点击时没有拖拽冲突，可以使用动画
+                                                    withAnimation(.easeInOut(duration: 0.2)) {
+                                                        engine.moveWorkflow(id: workflow.id, toFolder: targetFolder)
                                                     }
                                                 }
                                             }
@@ -92,7 +92,27 @@ struct ContentView: View {
                                         Button("删除此流程", role: .destructive) { engine.deleteWorkflow(id: workflow.id) }
                                     }
                                 }
+                                // [✨重构1] 注入底层原生拖拽源 (NSItemProvider)
+                                .itemProvider {
+                                    NSItemProvider(object: workflow.id.uuidString as NSString)
+                                }
                             }
+                            // [✨重构2] 原生支持：同文件夹内上下拖动，UI 自动避让挤开
+                            .onMove { source, destination in
+                                engine.moveWorkflowWithinFolder(folder: folderName, source: source, destination: destination)
+                            }
+                            // [✨重构3] 原生支持：跨文件夹拖拽时，展示原生蓝色插入提示线
+                            .onInsert(of: [UTType.plainText]) { index, providers in
+                                guard let provider = providers.first else { return }
+                                _ = provider.loadObject(ofClass: String.self) { idString, _ in
+                                    if let idStr = idString, let id = UUID(uuidString: idStr) {
+                                        DispatchQueue.main.async {
+                                            engine.insertWorkflow(id: id, into: folderName, at: index)
+                                        }
+                                    }
+                                }
+                            }
+                            
                         } header: {
                             HStack {
                                 Text(folderName).font(.subheadline).bold()
@@ -105,7 +125,9 @@ struct ContentView: View {
                                             showRenameFolderAlert = true
                                         }
                                         Button("删除文件夹 (流程将移至默认)", role: .destructive) {
-                                            engine.deleteFolder(name: folderName)
+                                            withAnimation {
+                                                engine.deleteFolder(name: folderName)
+                                            }
                                         }
                                     } label: {
                                         Image(systemName: "ellipsis")
@@ -113,6 +135,15 @@ struct ContentView: View {
                                     }.menuStyle(.borderlessButton).frame(width: 20)
                                 }
                             }
+                        }
+                        // [✨重构4] 兜底策略：如果用户恰好把项目丢在了文件夹标题栏(Header)上，将其移入该文件夹末尾
+                        .dropDestination(for: String.self) { items, location in
+                            guard let firstItem = items.first, let id = UUID(uuidString: firstItem) else { return false }
+                            if let wf = engine.workflows.first(where: { $0.id == id }), wf.folderName != folderName {
+                                engine.moveWorkflow(id: id, toFolder: folderName)
+                                return true
+                            }
+                            return false
                         }
                     }
                 }

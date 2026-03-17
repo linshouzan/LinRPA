@@ -49,40 +49,40 @@ struct ActionExecutorFactory {
 
 struct UIInteractionExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
-        let parsedParam = context.parseVariables(action.parameter)
-        let parts = parsedParam.components(separatedBy: "|")
-        guard parts.count >= 4 else { return .failure }
-        
-        let targetApp = parts[0]
-        let targetRole = parts[1]
-        let targetTitle = parts[2]
-        let actType = parts[3]
-        let matchMode = parts.count > 4 ? parts[4] : "exact"
-        let targetIndexStr = parts.count > 5 ? parts[5] : "-1"
-        let targetIndex = Int(targetIndexStr) ?? -1
-        
-        context.log("🔍 寻找 [\(targetApp)] 元素 (Role:[\(targetRole.isEmpty ? "不限" : targetRole)], 模式:\(matchMode), 索引:\(targetIndex))...")
-        
-        guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.localizedName == targetApp }) else {
-            context.log("❌ 未找到运行中的应用: \(targetApp)")
+        let parts = action.parameter.components(separatedBy: "|")
+        guard parts.count >= 3 else {
+            context.log("❌ UI交互参数不完整。需要重新配置。")
             return .failure
         }
         
-        app.activate(options: .activateIgnoringOtherApps)
-        try? await Task.sleep(for: .milliseconds(300))
+        let appName = parts[0]
+        let role = parts[1]
+        let rawTitle = parts[2]
         
-        let appElement = AXUIElementCreateApplication(app.processIdentifier)
-        var startElement = appElement
-        var mainWindowRef: CFTypeRef?
-        if AXUIElementCopyAttributeValue(appElement, kAXMainWindowAttribute as CFString, &mainWindowRef) == .success,
-           let mainWindow = mainWindowRef {
-            startElement = mainWindow as! AXUIElement
-            context.log("🎯 已锁定主窗口，开始深层递归扫描...")
+        let actionType = parts.count > 3 ? (parts[3].isEmpty ? "click" : parts[3]) : "click"
+        let rawExtraValue = parts.count > 4 ? parts[4] : ""
+        let timeout = parts.count > 5 ? (Int(parts[5]) ?? 5) : 5
+        let matchMode = parts.count > 6 ? (parts[6].isEmpty ? "exact" : parts[6]) : "exact"
+        let targetIndex = Int(parts.count > 7 ? (parts[7].isEmpty ? "0" : parts[7]) : "0") ?? 0
+        let ignoreError = parts.count > 8 ? (parts[8] == "true") : false
+        
+        let title = context.parseVariables(rawTitle)
+        let extraValue = context.parseVariables(rawExtraValue)
+        
+        if appName.isEmpty {
+            context.log("❌ 缺失应用名称，无法定位。")
+            return ignoreError ? .always : .failure
         }
         
-        struct MatchedUIElement { let element: AXUIElement; let rect: CGRect; let role: String; let title: String }
-        var allMatches: [MatchedUIElement] = []
+        context.log("🔎 原生深度探测 [\(appName)] -> [\(title)] (模式:\(matchMode), 序号:\(targetIndex))...")
         
+        // 强制激活应用
+        let activateScript = "tell application \"\(appName)\" to activate"
+        _ = NSAppleScript(source: activateScript)?.executeAndReturnError(nil)
+        
+        // ---------------------------------------------------------
+        // 辅助方法：与拾取器保持 100% 一致的深层文本提取算法
+        // ---------------------------------------------------------
         func extractComprehensiveTitle(from element: AXUIElement, depth: Int = 0) -> String {
             if depth > 3 { return "" }
             var valRef: CFTypeRef?
@@ -91,7 +91,9 @@ struct UIInteractionExecutor: RPAActionExecutor {
                    let str = valRef as? String, !str.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return str }
             }
             var childrenRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success, let children = childrenRef as? [AXUIElement] {
+            // [✨修复 1] 替换为 as!
+            if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success {
+                let children = childrenRef as! [AXUIElement]
                 for child in children {
                     var childRoleRef: CFTypeRef?; AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &childRoleRef)
                     if let childRole = childRoleRef as? String, childRole == "AXStaticText" {
@@ -104,61 +106,148 @@ struct UIInteractionExecutor: RPAActionExecutor {
             return ""
         }
         
-        func collectElementsDFS(in element: AXUIElement, roleToFind: String, titleToFind: String, currentDepth: Int) {
-            if currentDepth > 20 { return }
-            var childrenRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success, let children = childrenRef as? [AXUIElement] {
-                for child in children {
-                    var roleVal: CFTypeRef?; AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &roleVal)
-                    let r = roleVal as? String ?? ""
-                    let t = extractComprehensiveTitle(from: child)
-                    let roleMatches = roleToFind.isEmpty || r == roleToFind
-                    var titleMatches = false
-                    
-                    if titleToFind.isEmpty { titleMatches = true }
-                    else if matchMode == "exact" { titleMatches = (t == titleToFind) }
-                    else if matchMode == "contains" { titleMatches = t.localizedCaseInsensitiveContains(titleToFind) }
-                    else if matchMode == "regex" { titleMatches = (t.range(of: titleToFind, options: [.regularExpression, .caseInsensitive]) != nil) }
-                    
-                    if roleMatches && titleMatches && !t.isEmpty {
-                        var posRef: CFTypeRef?; var sizeRef: CFTypeRef?; var position = CGPoint.zero; var size = CGSize.zero
-                        if AXUIElementCopyAttributeValue(child, kAXPositionAttribute as CFString, &posRef) == .success, let pVal = posRef, CFGetTypeID(pVal) == AXValueGetTypeID() { AXValueGetValue(pVal as! AXValue, .cgPoint, &position) }
-                        if AXUIElementCopyAttributeValue(child, kAXSizeAttribute as CFString, &sizeRef) == .success, let sVal = sizeRef, CFGetTypeID(sVal) == AXValueGetTypeID() { AXValueGetValue(sVal as! AXValue, .cgSize, &size) }
-                        if size.width > 0 && size.height > 0 {
-                            allMatches.append(MatchedUIElement(element: child, rect: CGRect(origin: position, size: size), role: r, title: t))
-                            context.log("   ↳ 命中: 尺寸=(\(Int(size.width))x\(Int(size.height))), Role=[\(r)], Title=[\(t)]")
+        struct MatchedUIElement { let element: AXUIElement; let role: String; let title: String }
+        
+        let startTime = Date()
+        var success = false
+        var extractedData = ""
+        
+        // ---------------------------------------------------------
+        // 智能轮询引擎 (摒弃死板的 AppleScript，直接遍历 AX 树)
+        // ---------------------------------------------------------
+        while Date().timeIntervalSince(startTime) < Double(timeout) && context.isRunning {
+            guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.localizedName == appName }) else {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                continue
+            }
+            
+            let appElement = AXUIElementCreateApplication(app.processIdentifier)
+            var allMatches: [MatchedUIElement] = []
+            
+            func collectElementsDFS(in element: AXUIElement, currentDepth: Int) {
+                if currentDepth > 20 { return } // 防止无限循环
+                var childrenRef: CFTypeRef?
+                // [✨修复 2] 替换为 as!
+                if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success {
+                    let children = childrenRef as! [AXUIElement]
+                    for child in children {
+                        var roleVal: CFTypeRef?; AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &roleVal)
+                        let r = roleVal as? String ?? ""
+                        let t = extractComprehensiveTitle(from: child)
+                        
+                        // 匹配逻辑校验
+                        var titleMatches = false
+                        if title.isEmpty {
+                            titleMatches = true
+                        } else {
+                            if matchMode == "contains" { titleMatches = t.localizedCaseInsensitiveContains(title) }
+                            else { titleMatches = (t == title) }
+                        }
+                        
+                        let roleMatches = role.isEmpty || r == role || r.contains(role)
+                        
+                        if titleMatches && roleMatches && (!title.isEmpty || !role.isEmpty) {
+                            allMatches.append(MatchedUIElement(element: child, role: r, title: t))
+                        } else {
+                            collectElementsDFS(in: child, currentDepth: currentDepth + 1)
                         }
                     }
-                    collectElementsDFS(in: child, roleToFind: roleToFind, titleToFind: titleToFind, currentDepth: currentDepth + 1)
                 }
             }
+            
+            // 从所有窗口中搜索
+            var windowsRef: CFTypeRef?
+            // [✨修复 3] 替换为 as!
+            if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success {
+                let windows = windowsRef as! [AXUIElement]
+                for window in windows { collectElementsDFS(in: window, currentDepth: 0) }
+            }
+            
+            // 从顶部系统菜单栏搜索
+            var menuBarRef: CFTypeRef?
+            // [✨修复 4] 替换为 as!
+            if AXUIElementCopyAttributeValue(appElement, kAXMenuBarAttribute as CFString, &menuBarRef) == .success {
+                let menuBar = menuBarRef as! AXUIElement
+                collectElementsDFS(in: menuBar, currentDepth: 0)
+            }
+            
+            // ---------------------------------------------------------
+            // 命中后的动作执行
+            // ---------------------------------------------------------
+            if allMatches.count > targetIndex {
+                let finalTarget = allMatches[targetIndex]
+                let targetEl = finalTarget.element
+                
+                if actionType == "read" {
+                    extractedData = finalTarget.title
+                } else if actionType == "write" {
+                    // 1. 尝试调用底层 API 写入
+                    AXUIElementSetAttributeValue(targetEl, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    let setResult = AXUIElementSetAttributeValue(targetEl, kAXValueAttribute as CFString, extraValue as CFTypeRef)
+                    
+                    // 2. 降级防线：如果有些自绘输入框不接受直接设值，我们用物理鼠标点击它，然后物理键盘键入！
+                    if setResult != .success {
+                        var posRef: CFTypeRef?; var sizeRef: CFTypeRef?
+                        var pos = CGPoint.zero; var size = CGSize.zero
+                        if AXUIElementCopyAttributeValue(targetEl, kAXPositionAttribute as CFString, &posRef) == .success { AXValueGetValue(posRef as! AXValue, .cgPoint, &pos) }
+                        if AXUIElementCopyAttributeValue(targetEl, kAXSizeAttribute as CFString, &sizeRef) == .success { AXValueGetValue(sizeRef as! AXValue, .cgSize, &size) }
+                        
+                        if size.width > 0 && size.height > 0 {
+                            let center = CGPoint(x: pos.x + size.width/2, y: pos.y + size.height/2)
+                            NativeInputManager.shared.click(at: center)
+                            try? await Task.sleep(nanoseconds: 200_000_000)
+                            NativeInputManager.shared.typeText(extraValue)
+                        }
+                    }
+                } else {
+                    // 点击动作 (Click)
+                    let performResult = AXUIElementPerformAction(targetEl, kAXPressAction as CFString)
+                    
+                    // 降级防线：很多标签或纯文本没有原生 Press 动作，使用基于物理坐标的强行点击
+                    if performResult != .success {
+                        var posRef: CFTypeRef?; var sizeRef: CFTypeRef?
+                        var pos = CGPoint.zero; var size = CGSize.zero
+                        if AXUIElementCopyAttributeValue(targetEl, kAXPositionAttribute as CFString, &posRef) == .success { AXValueGetValue(posRef as! AXValue, .cgPoint, &pos) }
+                        if AXUIElementCopyAttributeValue(targetEl, kAXSizeAttribute as CFString, &sizeRef) == .success { AXValueGetValue(sizeRef as! AXValue, .cgSize, &size) }
+                        
+                        if size.width > 0 && size.height > 0 {
+                            let center = CGPoint(x: pos.x + size.width/2, y: pos.y + size.height/2)
+                            NativeInputManager.shared.click(at: center)
+                        }
+                    }
+                }
+                
+                success = true
+                break
+            }
+            
+            // 轮询间隔 0.5 秒
+            try? await Task.sleep(nanoseconds: 500_000_000)
         }
         
-        collectElementsDFS(in: startElement, roleToFind: targetRole, titleToFind: targetTitle, currentDepth: 0)
-        if allMatches.isEmpty { context.log("❌ 未找到任何符合条件的元素。"); return .failure }
-        
-        var validMatches = allMatches.filter { $0.rect.height < 150 }
-        validMatches.sort { a, b in abs(a.rect.minY - b.rect.minY) > 10 ? a.rect.minY < b.rect.minY : a.rect.minX < b.rect.minX }
-        
-        if validMatches.isEmpty { return .failure }
-        let finalTarget: MatchedUIElement
-        if targetIndex == -1 { finalTarget = validMatches[0] }
-        else if targetIndex >= 0 && targetIndex < validMatches.count { finalTarget = validMatches[targetIndex] }
-        else { context.log("❌ 填写的序号(Index: \(targetIndex)) 越界！"); return .failure }
-        
-        context.log("🎯 锁定最终元素 [序号 \(targetIndex)] -> Role: \(finalTarget.role)")
-        
-        if actType == "click" {
-            AXUIElementPerformAction(finalTarget.element, kAXPressAction as CFString)
-            let clickX = finalTarget.rect.minX + 20; let clickY = finalTarget.rect.midY
-            context.log("🖱️ 执行物理点击，坐标: (\(Int(clickX)), \(Int(clickY)))")
-            await context.simulateMouseOperation(type: "leftClick", at: CGPoint(x: clickX, y: clickY))
-            CGWarpMouseCursorPosition(CGPoint(x: finalTarget.rect.maxX + 50, y: finalTarget.rect.maxY + 50))
-        } else if actType == "read" {
-            context.variables["ui_text"] = finalTarget.title
-            context.log("📖 读取文本: \(context.variables["ui_text"]!)")
+        // ---------------------------------------------------------
+        // 结果汇报与异常软控制
+        // ---------------------------------------------------------
+        if success {
+            if actionType == "read" && !extraValue.isEmpty {
+                context.variables[extraValue] = extractedData
+                context.log("✅ 读取文本并存入 [\(extraValue)]: \(extractedData)")
+            } else if actionType == "write" {
+                context.log("✅ 成功写入文本。")
+            } else {
+                context.log("✅ 成功定位并点击 UI 元素。")
+            }
+            return .always
+        } else {
+            if ignoreError {
+                context.log("⚠️ 探测超时，未发现目标。已开启【忽略错误并继续】，放行下个节点。")
+                return .always
+            } else {
+                context.log("❌ 探测超时 (\(timeout)s)，未能找到目标 UI 元素。")
+                return .failure
+            }
         }
-        return .success
     }
 }
 
@@ -348,28 +437,67 @@ struct MouseOperationExecutor: RPAActionExecutor {
 struct OpenAppExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         let parts = context.parseVariables(action.parameter).components(separatedBy: "|")
-        let appName = parts.count > 0 ? (parts[0].isEmpty ? "Safari" : parts[0]) : "Safari"
+        let appTarget = parts.count > 0 ? (parts[0].isEmpty ? "Safari" : parts[0]) : "Safari"
         let silent = parts.count > 1 ? (parts[1] == "true") : false
+        let newInstance = parts.count > 2 ? (parts[2] == "true") : false
         
+        var appURL: URL?
+        
+        // 1. 尝试作为绝对路径解析 (如 /Applications/WeChat.app)
+        if appTarget.hasPrefix("/") && appTarget.hasSuffix(".app") {
+            appURL = URL(fileURLWithPath: appTarget)
+        }
+        // 2. 尝试作为 Bundle Identifier 解析 (如 com.tencent.xinWeChat)
+        else if appTarget.contains(".") {
+            appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: appTarget)
+        }
+        
+        // 3. 优先执行：现代化 NSWorkspace API (macOS 10.15+)
+        // 此方案极其稳定，100% 免疫中英文国际化造成的干扰
+        if let url = appURL {
+            let config = NSWorkspace.OpenConfiguration()
+            config.activates = !silent                // 是否强制拉到前台激活
+            config.createsNewApplicationInstance = newInstance // 是否多开新实例
+            
+            do {
+                try await NSWorkspace.shared.openApplication(at: url, configuration: config)
+                let modeStr = silent ? "静默唤起" : "激活前置"
+                let instanceStr = newInstance ? " [新实例]" : ""
+                context.log("📂 现代化应用启动 (\(modeStr))\(instanceStr): \(url.lastPathComponent)")
+                
+                try? await Task.sleep(nanoseconds: silent ? 500_000_000 : 1_500_000_000)
+                return .always
+            } catch {
+                context.log("⚠️ 现代化启动异常，尝试降级命令启动: \(error.localizedDescription)")
+            }
+        }
+        
+        // 4. 降级防线：如果用户执意手敲了中文 "微信" 或 "Safari"
         let task = Process()
         task.launchPath = "/usr/bin/open"
-        // [✨核心优化] -g 参数控制静默唤起
-        if silent {
-            task.arguments = ["-g", "-a", appName]
-        } else {
-            task.arguments = ["-a", appName]
-        }
-        try? task.run()
+        var args = ["-a", appTarget]
+        if silent { args.insert("-g", at: 0) }      // -g 后台启动
+        if newInstance { args.insert("-n", at: 0) } // -n 多开实例
+        task.arguments = args
         
-        if !silent {
-            let script = "tell application \"\(appName)\" to activate"
-            var errorInfo: NSDictionary?
-            NSAppleScript(source: script)?.executeAndReturnError(&errorInfo)
-            context.log("📂 激活并前置应用: \(appName)")
-            try? await Task.sleep(for: .seconds(1.5))
-        } else {
-            context.log("🥷 静默唤起应用 (后台): \(appName)")
-            try? await Task.sleep(for: .seconds(0.5)) // 静默启动不需要那么长的强制缓冲
+        do {
+            try task.run()
+            let modeStr = silent ? "静默唤起" : "激活前置"
+            let instanceStr = newInstance ? " [新实例多开]" : ""
+            context.log("📂 降级命令启动 (\(modeStr))\(instanceStr): \(appTarget)")
+            
+            // 补充前置：open -a 无法 100% 保证前置，用 AppleScript 强拉一下
+            if !silent {
+                let script = "tell application \"\(appTarget)\" to activate"
+                var errorInfo: NSDictionary?
+                NSAppleScript(source: script)?.executeAndReturnError(&errorInfo)
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+            } else {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        } catch {
+            context.log("❌ 唤起应用失败: 未找到该应用或执行受阻。")
+            return .failure
         }
         
         return .always
@@ -380,22 +508,34 @@ struct OpenURLExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         let parsedParam = context.parseVariables(action.parameter)
         let parts = parsedParam.components(separatedBy: "|")
-        let urlStr = parts.count > 0 ? parts[0] : parsedParam
-        let browser = parts.count > 1 ? parts[1] : "InternalBrowser"
         
-        guard let encodedURLString = urlStr.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+        let rawUrl = parts.count > 0 ? parts[0] : parsedParam
+        let browser = parts.count > 1 ? parts[1] : "InternalBrowser"
+        let silent = parts.count > 2 ? (parts[2] == "true") : false
+        let incognito = parts.count > 3 ? (parts[3] == "true") : false
+        
+        // [✨核心优化 1] 智能补全 HTTP 协议，防止用户只填域名导致崩溃
+        var finalUrlStr = rawUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !finalUrlStr.lowercased().hasPrefix("http") && !finalUrlStr.isEmpty {
+            finalUrlStr = "https://" + finalUrlStr
+        }
+        
+        guard let encodedURLString = finalUrlStr.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
               let url = URL(string: encodedURLString) else {
-            context.log("❌ 无效的 URL 格式: \(urlStr)")
+            context.log("❌ 无效的 URL 格式: \(rawUrl)")
             return .failure
         }
         
         if browser == "InternalBrowser" {
             await MainActor.run {
-                BrowserWindowController.showSharedWindow()
+                // 如果非静默，主动把浏览器窗口拉到最前
+                if !silent {
+                    BrowserWindowController.showSharedWindow()
+                }
+                
                 let vm = BrowserViewModel.shared
-                // [✨修复] 如果没有页签则新建，否则默认激活使用当前或第一个页签
                 if vm.tabs.isEmpty {
-                    vm.addNewTab(request: URLRequest(url: url), makeActive: true)
+                    vm.addNewTab(request: URLRequest(url: url), makeActive: !silent)
                 } else {
                     if vm.activeTab == nil {
                         vm.activeTabId = vm.tabs.first?.id
@@ -403,25 +543,61 @@ struct OpenURLExecutor: RPAActionExecutor {
                     if let activeTab = vm.activeTab {
                         activeTab.loadURL(url.absoluteString)
                     } else {
-                        vm.addNewTab(request: URLRequest(url: url), makeActive: true)
+                        vm.addNewTab(request: URLRequest(url: url), makeActive: !silent)
                     }
                 }
             }
-            context.log("🌐 [内置浏览器] 打开网址: \(urlStr)")
-            try? await Task.sleep(for: .seconds(1.5))
+            let modeStr = silent ? " (后台静默加载)" : ""
+            context.log("🌐 [内置浏览器] 打开网址\(modeStr): \(finalUrlStr)")
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
             
         } else if browser == "System" {
-            NSWorkspace.shared.open(url)
-            context.log("🌐 [系统默认浏览器] 打开网址: \(urlStr)")
-            try? await Task.sleep(for: .seconds(1.0))
+            // [✨核心优化 2] 采用 macOS 现代化 NSWorkspace API 打开系统默认浏览器
+            if let targetAppUrl = NSWorkspace.shared.urlForApplication(toOpen: url) {
+                let config = NSWorkspace.OpenConfiguration()
+                config.activates = !silent // 彻底实现静默控制
+                
+                do {
+                    try await NSWorkspace.shared.open([url], withApplicationAt: targetAppUrl, configuration: config)
+                    let modeStr = silent ? " (后台静默)" : ""
+                    context.log("🌐 [系统默认] 打开网址\(modeStr): \(finalUrlStr)")
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                } catch {
+                    context.log("❌ 无法唤起系统默认浏览器: \(error.localizedDescription)")
+                    return .failure
+                }
+            } else {
+                // 兜底：如果找不到默认应用，退回旧版 API
+                NSWorkspace.shared.open(url)
+            }
+            
         } else {
+            // 指定外部浏览器 (Safari, Chrome, Edge)
             let task = Process()
             task.launchPath = "/usr/bin/open"
-            task.arguments = ["-a", browser, url.absoluteString]
+            var args: [String] = []
+            
+            // [✨核心优化 3] 修复旧版底层漏传 -g (静默启动) 的 Bug
+            if silent { args.append("-g") }
+            
+            args.append(contentsOf: ["-a", browser])
+            
+            // [✨核心优化 4] 无痕模式参数注入 (针对 Chromium 内核)
+            if incognito && (browser.contains("Chrome") || browser.contains("Edge")) {
+                args.append("--args")
+                args.append("--incognito")
+            }
+            
+            args.append(url.absoluteString)
+            task.arguments = args
+            
             do {
                 try task.run()
-                context.log("🌐 [\(browser)] 打开网址: \(urlStr)")
-                try? await Task.sleep(for: .seconds(1.5))
+                let modeStr = silent ? " (后台静默)" : ""
+                let incStr = incognito ? " [无痕模式]" : ""
+                context.log("🌐 [\(browser)] 打开网址\(modeStr)\(incStr): \(finalUrlStr)")
+                
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
             } catch {
                 context.log("❌ 无法唤起 \(browser) 浏览器: \(error.localizedDescription)")
                 return .failure
@@ -462,19 +638,59 @@ struct ConditionExecutor: RPAActionExecutor {
 
 struct ShowNotificationExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
-        let parts = context.parseVariables(action.parameter).components(separatedBy: "|")
-        let style = parts.count > 0 ? parts[0] : "banner"
-        let title = parts.count > 1 ? parts[1].replacingOccurrences(of: "\"", with: "\\\"") : "提醒"
-        let body = parts.count > 2 ? parts[2].replacingOccurrences(of: "\"", with: "\\\"") : ""
-        if style == "dialog" {
-            context.log("💬 阻断对话框: \(title)")
-            let script = "display dialog \"\(body)\" with title \"\(title)\" buttons {\"确认\"} default button \"确认\""
-            var err: NSDictionary?; NSAppleScript(source: script)?.executeAndReturnError(&err)
+        let parsedParam = context.parseVariables(action.parameter)
+        let parts = parsedParam.components(separatedBy: "|")
+        
+        let isOldFormat = parts.count == 1 && !action.parameter.contains("|")
+        
+        let title = isOldFormat ? "RPA 提醒" : (parts.count > 0 ? parts[0] : "RPA 提醒")
+        let body = isOldFormat ? parsedParam : (parts.count > 1 ? parts[1] : "")
+        let notifyType = parts.count > 2 ? parts[2] : "banner"
+        let playSound = parts.count > 3 ? (parts[3] == "true") : true
+        
+        // [✨核心优化] 防注入与多行换行符处理
+        let safeTitle = title.replacingOccurrences(of: "\"", with: "\\\"")
+        
+        // 对于 AppleScript，如果直接注入 \n 会导致脚本多行截断报错。
+        // 我们需要把真实文本中的 \n 替换为 AppleScript 认识的拼接常量 " & return & "
+        let safeBodyForAppleScript = body
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\" & return & \"")
+        
+        if notifyType == "alert" {
+            await MainActor.run {
+                NSApp.activate(ignoringOtherApps: true)
+                let alert = NSAlert()
+                alert.messageText = title
+                alert.informativeText = body // NSAlert 原生支持 \n 换行，无需特殊处理
+                alert.alertStyle = .informational
+                alert.addButton(withTitle: "确定")
+                
+                if playSound { NSSound.beep() }
+                alert.runModal()
+            }
+            context.log("💬 [弹窗确认] 用户已阅: \(title)")
         } else {
-            let script = "display notification \"\(body)\" with title \"\(title)\""
-            var err: NSDictionary?; NSAppleScript(source: script)?.executeAndReturnError(&err)
-            context.log("🔔 通知横幅: \(title)")
+            // 使用安全处理过多行字符的字符串注入 AppleScript
+            var scriptSource = "display notification \"\(safeBodyForAppleScript)\" with title \"\(safeTitle)\""
+            if playSound {
+                scriptSource += " sound name \"Glass\""
+            }
+            
+            if let script = NSAppleScript(source: scriptSource) {
+                var error: NSDictionary?
+                script.executeAndReturnError(&error)
+                
+                if let err = error {
+                    context.log("⚠️ 横幅通知发送受阻: \(err)")
+                } else {
+                    // 为了日志整洁，把换行符替换为空格输出到日志
+                    let logBody = body.replacingOccurrences(of: "\n", with: " ")
+                    context.log("💬 [横幅通知] \(title) - \(logBody)")
+                }
+            }
         }
+        
         return .always
     }
 }

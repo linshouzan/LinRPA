@@ -232,7 +232,60 @@ class WorkflowEngine {
     func deleteWorkflow(at offsets: IndexSet) { workflows.remove(atOffsets: offsets); if let selectedId = selectedWorkflowId, !workflows.contains(where: { $0.id == selectedId }) { selectedWorkflowId = workflows.first?.id } }
     func deleteWorkflow(id: UUID) { if let idx = workflows.firstIndex(where: { $0.id == id }) { workflows.remove(at: idx) }; if selectedWorkflowId == id { selectedWorkflowId = workflows.first?.id } }
     func moveWorkflow(from source: IndexSet, to destination: Int) { workflows.move(fromOffsets: source, toOffset: destination) }
+    // 1. 处理：同文件夹内的原生排序
+    func moveWorkflowWithinFolder(folder: String, source: IndexSet, destination: Int) {
+        var localList = workflows.filter { $0.folderName == folder }
+        localList.move(fromOffsets: source, toOffset: destination)
+        rebuildWorkflows(activeFolder: folder, newActiveFolderList: localList)
+    }
     
+    // 2. 处理：跨文件夹的精准插入 (带蓝色指示线)
+    func insertWorkflow(id: UUID, into folder: String, at localIndex: Int) {
+        guard let wIndex = workflows.firstIndex(where: { $0.id == id }) else { return }
+        var movedItem = workflows[wIndex]
+        movedItem.folderName = folder // 更新归属文件夹
+        
+        var localList = workflows.filter { $0.folderName == folder && $0.id != id }
+        let safeIndex = min(max(0, localIndex), localList.count)
+        localList.insert(movedItem, at: safeIndex)
+        
+        rebuildWorkflows(activeFolder: folder, newActiveFolderList: localList)
+    }
+    
+    // 3. 处理：通过菜单移动，或拖拽到空文件夹 Header 上
+    func moveWorkflow(id: UUID, toFolder targetFolder: String) {
+        guard let wIndex = workflows.firstIndex(where: { $0.id == id }) else { return }
+        guard workflows[wIndex].folderName != targetFolder else { return }
+        
+        var movedItem = workflows[wIndex]
+        movedItem.folderName = targetFolder
+        
+        var localList = workflows.filter { $0.folderName == targetFolder }
+        localList.append(movedItem) // 默认放到末尾
+        
+        rebuildWorkflows(activeFolder: targetFolder, newActiveFolderList: localList)
+    }
+    
+    // 🛡️ 核心防闪烁机制：静默重组数组，不触发大面积的 View 销毁
+    private func rebuildWorkflows(activeFolder: String, newActiveFolderList: [Workflow]) {
+        var finalList = [Workflow]()
+        let movedIds = Set(newActiveFolderList.map { $0.id })
+        
+        for f in folders {
+            if f == activeFolder {
+                finalList.append(contentsOf: newActiveFolderList)
+            } else {
+                // 将不属于当前操作文件夹，且没有被移动过的老数据按原样拼回
+                let items = workflows.filter { $0.folderName == f && !movedIds.contains($0.id) }
+                finalList.append(contentsOf: items)
+            }
+        }
+        
+        // 注意：这里绝对不能包裹 withAnimation，否则会与 List 原生的拖拽动画冲突导致严重闪烁
+        self.workflows = finalList
+        saveChanges()
+    }
+
     func addAction(_ type: ActionType) {
         guard let idx = currentWorkflowIndex else { return }
         var param = ""
