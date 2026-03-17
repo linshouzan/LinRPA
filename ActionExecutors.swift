@@ -1,7 +1,7 @@
 //////////////////////////////////////////////////////////////////
 // 文件名：ActionExecutors.swift
 // 文件说明：RPA动作执行器集合，采用策略模式解耦执行逻辑
-// 功能说明：
+// 功能说明：存放所有的 RPA 节点具体执行逻辑。
 // 代码要求：没有要求修改不用输出代码，请保证代码的逻辑和完整性，保留代码中的所有注释内容
 //////////////////////////////////////////////////////////////////
 
@@ -9,7 +9,8 @@ import Foundation
 import AppKit
 import Vision
 
-// MARK: - 执行器协议
+// MARK: - 执行器基础协议
+/// 定义了所有 RPA 组件执行器必须遵循的基础协议
 protocol RPAActionExecutor {
     /// 执行具体的 Action
     /// - Parameters:
@@ -20,33 +21,36 @@ protocol RPAActionExecutor {
 }
 
 // MARK: - 执行器工厂
+/// 负责根据节点的类型生成并返回对应的独立执行器对象
 struct ActionExecutorFactory {
     static func getExecutor(for type: ActionType) -> RPAActionExecutor {
         switch type {
-        case .webAgent: return WebAgentExecutor()
-        case .uiInteraction: return UIInteractionExecutor()
-        case .setVariable: return SetVariableExecutor()
-        case .httpRequest: return HTTPRequestExecutor()
-        case .aiVision: return AIVisionExecutor()
-        case .openApp: return OpenAppExecutor()
-        case .openURL: return OpenURLExecutor()
-        case .typeText: return TypeTextExecutor()
-        case .wait: return WaitExecutor()
-        case .condition: return ConditionExecutor()
+        case .webAgent:         return WebAgentExecutor()
+        case .uiInteraction:    return UIInteractionExecutor()
+        case .setVariable:      return SetVariableExecutor()
+        case .httpRequest:      return HTTPRequestExecutor()
+        case .aiVision:         return AIVisionExecutor()
+        case .openApp:          return OpenAppExecutor()
+        case .openURL:          return OpenURLExecutor()
+        case .typeText:         return TypeTextExecutor()
+        case .wait:             return WaitExecutor()
+        case .condition:        return ConditionExecutor()
         case .showNotification: return ShowNotificationExecutor()
-        case .ocrText: return OCRTextExecutor()
-        case .mouseOperation: return MouseOperationExecutor()
-        case .writeClipboard: return WriteClipboardExecutor()
-        case .readClipboard: return ReadClipboardExecutor()
-        case .runShell: return RunShellExecutor()
-        case .runAppleScript: return RunAppleScriptExecutor()
-        case .callWorkflow: return CallWorkflowExecutor()
+        case .ocrText:          return OCRTextExecutor()
+        case .mouseOperation:   return MouseOperationExecutor()
+        case .writeClipboard:   return WriteClipboardExecutor()
+        case .readClipboard:    return ReadClipboardExecutor()
+        case .runShell:         return RunShellExecutor()
+        case .runAppleScript:   return RunAppleScriptExecutor()
+        case .callWorkflow:     return CallWorkflowExecutor()
         }
     }
 }
 
 // MARK: - 具体组件执行器实现
 
+// MARK: - 原生 UI 交互执行器
+/// 负责与 macOS 系统的 Accessibility API (AX) 进行深度对接，探测并操作原生界面元素
 struct UIInteractionExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         let parts = action.parameter.components(separatedBy: "|")
@@ -251,11 +255,14 @@ struct UIInteractionExecutor: RPAActionExecutor {
     }
 }
 
+// MARK: - 变量设置执行器
+/// 负责对引擎的运行时环境变量池进行写操作
 struct SetVariableExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         let parts = context.parseVariables(action.parameter).components(separatedBy: "|")
         if parts.count >= 2 {
-            let key = parts[0].trimmingCharacters(in: .whitespaces); let val = parts[1]
+            let key = parts[0].trimmingCharacters(in: .whitespaces)
+            let val = parts[1]
             context.variables[key] = val
             context.log("🗂️ 设置变量: [\(key)] = \(val)")
         }
@@ -263,24 +270,35 @@ struct SetVariableExecutor: RPAActionExecutor {
     }
 }
 
+// MARK: - HTTP 请求执行器
+/// 轻量级 API 调用封装，支持将状态码和结果直接写回上下文环境变量中
 struct HTTPRequestExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         let parts = context.parseVariables(action.parameter).components(separatedBy: "|")
-        let urlStr = parts.count > 0 ? parts[0] : ""; let method = parts.count > 1 ? parts[1] : "GET"
+        let urlStr = parts.count > 0 ? parts[0] : ""
+        let method = parts.count > 1 ? parts[1] : "GET"
+        
         if let url = URL(string: urlStr) {
-            var req = URLRequest(url: url); req.httpMethod = method
+            var req = URLRequest(url: url)
+            req.httpMethod = method
+            
             if let (data, resp) = try? await URLSession.shared.data(for: req), let response = resp as? HTTPURLResponse {
-                if let str = String(data: data, encoding: .utf8) { context.variables["http_response"] = str }
+                if let str = String(data: data, encoding: .utf8) {
+                    context.variables["http_response"] = str
+                }
                 context.variables["http_status"] = "\(response.statusCode)"
                 context.log("🌐 HTTP \(method) 完成: 状态码 \(response.statusCode)")
                 return .success
             }
         }
-        context.log("❌ HTTP 请求失败或无效 URL"); return .failure
+        
+        context.log("❌ HTTP 请求失败或无效 URL")
+        return .failure
     }
 }
 
-// 替换 ActionExecutors.swift 中的 OCRTextExecutor
+// MARK: - OCR 文本识别执行器
+/// 负责屏幕区域截取、图像增强、基于 Vision 的文本识别及点击互动调度
 struct OCRTextExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         let parsedParam = context.parseVariables(action.parameter)
@@ -403,6 +421,8 @@ struct OCRTextExecutor: RPAActionExecutor {
     }
 }
 
+// MARK: - 鼠标操作执行器
+/// 处理点击、移动、双击、滚轮、拖拽等原生物理光标输入
 struct MouseOperationExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         let parsedParam = context.parseVariables(action.parameter)
@@ -414,18 +434,28 @@ struct MouseOperationExecutor: RPAActionExecutor {
         let currentLoc = CGEvent(source: nil)?.location ?? .zero
         
         if type == "drag" {
-            let startCoords = val1.split(separator: ","); let endCoords = val2.split(separator: ",")
-            if startCoords.count == 2, endCoords.count == 2, let sx = Double(startCoords[0].trimmingCharacters(in: .whitespaces)), let sy = Double(startCoords[1].trimmingCharacters(in: .whitespaces)), let ex = Double(endCoords[0].trimmingCharacters(in: .whitespaces)), let ey = Double(endCoords[1].trimmingCharacters(in: .whitespaces)) {
+            let startCoords = val1.split(separator: ",")
+            let endCoords = val2.split(separator: ",")
+            
+            if startCoords.count == 2, endCoords.count == 2,
+               let sx = Double(startCoords[0].trimmingCharacters(in: .whitespaces)),
+               let sy = Double(startCoords[1].trimmingCharacters(in: .whitespaces)),
+               let ex = Double(endCoords[0].trimmingCharacters(in: .whitespaces)),
+               let ey = Double(endCoords[1].trimmingCharacters(in: .whitespaces)) {
                 let startPoint = isRelative ? CGPoint(x: currentLoc.x + sx, y: currentLoc.y + sy) : CGPoint(x: sx, y: sy)
                 let endPoint = isRelative ? CGPoint(x: startPoint.x + ex, y: startPoint.y + ey) : CGPoint(x: ex, y: ey)
                 await context.simulateDrag(from: startPoint, to: endPoint)
-            } else { return .failure }
+            } else {
+                return .failure
+            }
         } else if ["leftClick", "rightClick", "doubleClick", "move"].contains(type) {
             let coords = val1.split(separator: ",")
             if coords.count == 2, let x = Double(coords[0].trimmingCharacters(in: .whitespaces)), let y = Double(coords[1].trimmingCharacters(in: .whitespaces)) {
                 let targetPoint = isRelative ? CGPoint(x: currentLoc.x + x, y: currentLoc.y + y) : CGPoint(x: x, y: y)
                 await context.simulateMouseOperation(type: type, at: targetPoint)
-            } else { return .failure }
+            } else {
+                return .failure
+            }
         } else if type.lowercased().contains("scroll") {
             let amount = Int(val1.trimmingCharacters(in: .whitespaces)) ?? 1
             await context.simulateScroll(type: type, amount: amount)
@@ -434,6 +464,8 @@ struct MouseOperationExecutor: RPAActionExecutor {
     }
 }
 
+// MARK: - 打开应用程序执行器
+/// 负责应用的启动，支持新实例多开与静默唤起
 struct OpenAppExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         let parts = context.parseVariables(action.parameter).components(separatedBy: "|")
@@ -453,7 +485,6 @@ struct OpenAppExecutor: RPAActionExecutor {
         }
         
         // 3. 优先执行：现代化 NSWorkspace API (macOS 10.15+)
-        // 此方案极其稳定，100% 免疫中英文国际化造成的干扰
         if let url = appURL {
             let config = NSWorkspace.OpenConfiguration()
             config.activates = !silent                // 是否强制拉到前台激活
@@ -486,7 +517,6 @@ struct OpenAppExecutor: RPAActionExecutor {
             let instanceStr = newInstance ? " [新实例多开]" : ""
             context.log("📂 降级命令启动 (\(modeStr))\(instanceStr): \(appTarget)")
             
-            // 补充前置：open -a 无法 100% 保证前置，用 AppleScript 强拉一下
             if !silent {
                 let script = "tell application \"\(appTarget)\" to activate"
                 var errorInfo: NSDictionary?
@@ -504,6 +534,8 @@ struct OpenAppExecutor: RPAActionExecutor {
     }
 }
 
+// MARK: - 打开网址执行器
+/// 负责操控浏览器，支持系统内置浏览器调度与外部浏览器拉起
 struct OpenURLExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         let parsedParam = context.parseVariables(action.parameter)
@@ -607,28 +639,47 @@ struct OpenURLExecutor: RPAActionExecutor {
     }
 }
 
+// MARK: - 键盘输入执行器
+/// 负责模拟人类打字以及全局键盘组合键的发送
 struct TypeTextExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
-        await context.simulateKeyboardInput(input: context.parseVariables(action.parameter))
+        let parts = action.parameter.components(separatedBy: "|")
+        let text = parts.count > 0 ? parts[0] : action.parameter
+        let speed = parts.count > 1 ? parts[1] : "normal"
+        
+        let parsedText = context.parseVariables(text)
+        await context.simulateKeyboardInput(input: parsedText, speedMode: speed)
         return .always
     }
 }
 
+// MARK: - 等待延时执行器
+/// 负责阻塞当前流程，进行单纯的睡眠等待
 struct WaitExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
-        let sec = Double(context.parseVariables(action.parameter)) ?? 1.0; try? await Task.sleep(for: .seconds(sec))
+        let sec = Double(context.parseVariables(action.parameter)) ?? 1.0
+        try? await Task.sleep(for: .seconds(sec))
         return .always
     }
 }
 
+// MARK: - 条件判断执行器
+/// 提供基础的包含、等于验证逻辑，用于指引流程在工作流中的走向
 struct ConditionExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         let parts = context.parseVariables(action.parameter).components(separatedBy: "|")
         if parts.count >= 3 {
-            let leftValue = parts[0]; let op = parts[1]; let rightValue = parts[2]
+            let leftValue = parts[0]
+            let op = parts[1]
+            let rightValue = parts[2]
             var isMatched = false
-            if op == "==" { isMatched = (leftValue == rightValue) }
-            else if op == "contains" { isMatched = leftValue.contains(rightValue) }
+            
+            if op == "==" {
+                isMatched = (leftValue == rightValue)
+            } else if op == "contains" {
+                isMatched = leftValue.contains(rightValue)
+            }
+            
             context.log("⚖️ 判断: '\(leftValue)' \(op) '\(rightValue)' -> \(isMatched)")
             return isMatched ? .success : .failure
         }
@@ -636,6 +687,8 @@ struct ConditionExecutor: RPAActionExecutor {
     }
 }
 
+// MARK: - 系统消息弹窗执行器
+/// 提供后台静默横幅，或者前端阻断式的交互提醒窗口
 struct ShowNotificationExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         let parsedParam = context.parseVariables(action.parameter)
@@ -652,7 +705,6 @@ struct ShowNotificationExecutor: RPAActionExecutor {
         let safeTitle = title.replacingOccurrences(of: "\"", with: "\\\"")
         
         // 对于 AppleScript，如果直接注入 \n 会导致脚本多行截断报错。
-        // 我们需要把真实文本中的 \n 替换为 AppleScript 认识的拼接常量 " & return & "
         let safeBodyForAppleScript = body
             .replacingOccurrences(of: "\"", with: "\\\"")
             .replacingOccurrences(of: "\n", with: "\" & return & \"")
@@ -695,6 +747,8 @@ struct ShowNotificationExecutor: RPAActionExecutor {
     }
 }
 
+// MARK: - 剪贴板写入执行器
+/// 覆写操作系统剪贴板
 struct WriteClipboardExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         NSPasteboard.general.clearContents()
@@ -703,6 +757,8 @@ struct WriteClipboardExecutor: RPAActionExecutor {
     }
 }
 
+// MARK: - 剪贴板读取执行器
+/// 读取剪贴板内容并存入内置的 clipboard 变量中
 struct ReadClipboardExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         if let text = NSPasteboard.general.string(forType: .string) {
@@ -714,10 +770,19 @@ struct ReadClipboardExecutor: RPAActionExecutor {
     }
 }
 
+// MARK: - Shell 脚本执行器
+/// 负责直接从底层调度 `/bin/bash` 执行系统命令
 struct RunShellExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
-        let task = Process(); task.launchPath = "/bin/bash"; task.arguments = ["-c", context.parseVariables(action.parameter)]
-        let pipe = Pipe(); task.standardOutput = pipe; try? task.run(); task.waitUntilExit()
+        let task = Process()
+        task.launchPath = "/bin/bash"
+        task.arguments = ["-c", context.parseVariables(action.parameter)]
+        
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        try? task.run()
+        task.waitUntilExit()
+        
         if let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8), !output.isEmpty {
             context.log("💻 Shell 输出:\n\(output.trimmingCharacters(in: .whitespacesAndNewlines))")
         }
@@ -725,23 +790,32 @@ struct RunShellExecutor: RPAActionExecutor {
     }
 }
 
+// MARK: - AppleScript 执行器
+/// 通过 OSA 框架执行苹果专用 AppleScript 自动化脚本
 struct RunAppleScriptExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         var err: NSDictionary?
         if let scriptObj = NSAppleScript(source: context.parseVariables(action.parameter)) {
             scriptObj.executeAndReturnError(&err)
-            if let e = err { context.log("❌ AS 错误: \(e)") } else { context.log("✅ AS 执行完成") }
+            if let e = err {
+                context.log("❌ AS 错误: \(e)")
+            } else {
+                context.log("✅ AS 执行完成")
+            }
         }
         return .always
     }
 }
 
+// MARK: - AI 纯视觉分析执行器
+/// 用于单纯的截屏并结合 prompt 将图像分析出结果
 struct AIVisionExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         do {
             let cgImage = try await ScreenCaptureUtility.captureScreen()
             let nsImage = NSImage(cgImage: cgImage, size: .zero)
             let promptText = context.parseVariables(action.parameter)
+            
             let message = LLMMessage(role: .user, text: promptText, images: [nsImage])
             let stream = LLMService.shared.stream(messages: [message])
             
@@ -785,7 +859,8 @@ struct AIVisionExecutor: RPAActionExecutor {
     }
 }
 
-// MARK: - 重构的 Web 智能体 4.0 执行器 (支持多步规划、Hover 及 感知监控面板)
+// MARK: - Web 智能体执行器
+/// WebAgent 4.0 的核心逻辑：循环获取结构、触发多模态模型、下发行为，最后通过双引擎断言验证
 struct WebAgentExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         let params = WebAgentParams.parse(from: action.parameter)
@@ -888,7 +963,7 @@ struct WebAgentExecutor: RPAActionExecutor {
                     }
                 }
                 
-                guard let jsonStr = extractJSON(from: aiResponse),
+                guard let jsonStr = aiResponse.extractJSON(),
                       let jsonData = jsonStr.data(using: .utf8),
                       let plan = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
                     context.log("\n⚠️ [WebAgent] JSON 格式异常，重试。")
@@ -978,7 +1053,6 @@ struct WebAgentExecutor: RPAActionExecutor {
         // ==========================================
         // 第二阶段：[✨升级] 支持双引擎的最终视觉断言阶段
         // ==========================================
-        // 如果用户配置了断言，不管循环是因为 finish 结束还是达到 maxRounds 结束，都强制进行一次最终裁判校验
         if !params.successAssertion.isEmpty {
             let modeStr = params.assertionType == "ocr" ? "极速 OCR 识字" : "AI 多模态裁判"
             context.log("🔍 [WebAgent] 开始最终独立视觉断言检查 (模式: \(modeStr))...")
@@ -987,18 +1061,17 @@ struct WebAgentExecutor: RPAActionExecutor {
             // 1. 给页面的跳转、加载或动画留出充足的缓冲时间
             try? await Task.sleep(nanoseconds: 2_000_000_000)
             
-            // 2. 跟屏幕感知一样，严格按【视觉范围】配置截取屏幕区域 (此时已经是过滤好边界的纯净图像了)
+            // 2. 截取屏幕区域
             let targetCaptureApp: String? = (params.captureMode == "fullscreen") ? nil : (params.browser == "InternalBrowser" ? ProcessInfo.processInfo.processName : params.browser)
             let targetWindowTitle: String? = (params.captureMode == "fullscreen") ? nil : (params.browser == "InternalBrowser" ? "开发者浏览器" : nil)
             
             if let assertionImage = try? await ScreenCaptureUtility.captureScreen(forAppName: targetCaptureApp, targetWindowTitle: targetWindowTitle) {
                 
-                // 刷新监控面板，让用户直观看到用于断言的最终精准截图
                 await MainActor.run { AgentMonitorManager.shared.currentVision = NSImage(cgImage: assertionImage, size: .zero) }
                 
                 if params.assertionType == "ocr" {
                     // ------------------------------------------
-                    // [✨新增] 分支 A：本地 Vision OCR 极速断言
+                    // 分支 A：本地 Vision OCR 极速断言
                     // ------------------------------------------
                     context.log("📸 [WebAgent] 正在限定视觉区域内扫描文本: '\(params.successAssertion)'")
                     
@@ -1012,7 +1085,6 @@ struct WebAgentExecutor: RPAActionExecutor {
                         
                         if let observations = request.results as? [VNRecognizedTextObservation] {
                             let isFound = observations.contains { obs in
-                                // 取最高置信度的候选文本进行容错比对
                                 let text = obs.topCandidates(1).first?.string ?? ""
                                 return text.localizedCaseInsensitiveContains(params.successAssertion)
                             }
@@ -1053,7 +1125,7 @@ struct WebAgentExecutor: RPAActionExecutor {
                     
                     context.log("🧠 裁判介入，校验最终任务结果...")
                     if let resultStr = try? await LLMService.shared.generate(messages: [message]),
-                       let jsonStr = self.extractJSON(from: resultStr),
+                       let jsonStr = resultStr.extractJSON(),
                        let jsonData = jsonStr.data(using: .utf8),
                        let resultDict = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
                        let isSuccess = resultDict["is_success"] as? Bool {
@@ -1074,29 +1146,11 @@ struct WebAgentExecutor: RPAActionExecutor {
                 context.log("⚠️ 断言截屏失败，降级依赖运行状态。")
             }
         } else if currentRound >= maxRounds && !isTaskCompleted {
-            // 如果没有配置断言且达到了最大轮数
             context.log("🛑 [WebAgent] 已达到系统设置的最大允许轮数 (\(maxRounds) 轮)，强制中断。")
         }
         
         await MainActor.run { AgentMonitorManager.shared.isProcessing = false }
         return isTaskCompleted ? .success : .failure
-    }
-    
-    private func extractJSON(from text: String) -> String? {
-        // Markdown 代码块的正则表达式（支持``` 或者 ~~~ 作为分隔符）
-        let markdownPattern = "(?<=^|\\n)(```|~~~)\\s*(\\{(?:[^{}]|(?:\\{[^{}]*\\}))*\\})\\s*(?=\\1$)"
-        
-        if let regex = try? NSRegularExpression(pattern: markdownPattern, options: [.dotMatchesLineSeparators]) {
-            let nsString = text as NSString
-            let results = regex.matches(in: text, options: [], range: NSRange(location: 0, length: nsString.length))
-            if let firstMatch = results.first {
-                // 提取匹配到的 JSON 内容
-                return nsString.substring(with: firstMatch.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-        }
-        
-        // 如果没有找到 Markdown 格式的代码块，返回整个文本并去除首尾空白字符
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

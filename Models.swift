@@ -394,4 +394,22 @@ extension String {
         }
         return last.last ?? 0
     }
+    
+    // 提炼AI对话返回的文本中的json格式，去除干扰。
+    func extractJSON() -> String? {
+        // Markdown 代码块的正则表达式（支持``` 或者 ~~~ 作为分隔符）
+        let markdownPattern = "(?<=^|\\n)(```|~~~)\\s*(\\{(?:[^{}]|(?:\\{[^{}]*\\}))*\\})\\s*(?=\\1$)"
+        
+        if let regex = try? NSRegularExpression(pattern: markdownPattern, options: [.dotMatchesLineSeparators]) {
+            let nsString = self as NSString
+            let results = regex.matches(in: self, options: [], range: NSRange(location: 0, length: nsString.length))
+            if let firstMatch = results.first {
+                // 提取匹配到的 JSON 内容
+                return nsString.substring(with: firstMatch.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        
+        // 如果没有找到 Markdown 格式的代码块，返回整个文本并去除首尾空白字符
+        return self.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 }

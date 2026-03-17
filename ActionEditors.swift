@@ -2,212 +2,331 @@
 // 文件名：ActionEditors.swift
 // 文件说明：这是适用于 macos 14+ 的RPA组件配置编辑器与交互工具集合
 // 功能说明：存放所有的组件配置弹窗、参数表单、MiniDesktop 和底层屏幕拾取器。
-// 代码要求：保留了所有的极客级小组件和底层原生 UI 元素拾取防死锁逻辑。
+// 代码要求：没有要求修改不用输出代码，请保证代码的逻辑和完整性，保留代码中的所有注释内容
 //////////////////////////////////////////////////////////////////
 
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
+// MARK: - 主配置弹窗入口
+/// 负责根据 Action 的类型分发渲染对应的独立编辑器视图
 struct ActionSettingsPopoverView: View {
     @Binding var action: RPAAction
     @Binding var showSettings: Bool
-    var body: some View { VStack(alignment: .leading, spacing: 12) { HStack { Text("\(action.displayTitle)").font(.headline); Spacer(); Button("关闭") { showSettings = false } }; Divider(); actionParameterView() }.padding().frame(width: 460) }
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("\(action.displayTitle)").font(.headline)
+                Spacer()
+                Button("关闭") { showSettings = false }
+            }
+            Divider()
+            actionParameterView()
+        }
+        .padding()
+        .frame(width: 460)
+    }
     
     @ViewBuilder private func actionParameterView() -> some View {
         switch action.type {
-        case .openURL:
-            let parts = action.parameter.components(separatedBy: "|")
-            let url = parts.count > 0 ? parts[0] : action.parameter
-            let browser = parts.count > 1 ? parts[1] : "InternalBrowser"
-            let silent = parts.count > 2 ? (parts[2] == "true") : false
-            let incognito = parts.count > 3 ? (parts[3] == "true") : false // [✨新增] 无痕模式
-            
-            VStack(alignment: .leading, spacing: 10) {
-                TextField("网址 (例如: bing.com，支持 {{变量}})", text: Binding(
-                    get: { url },
-                    set: { action.parameter = "\($0)|\(browser)|\(silent ? "true" : "false")|\(incognito ? "true" : "false")" }
-                ))
-                .textFieldStyle(.roundedBorder)
-                
-                HStack {
-                    Text("目标浏览器:").font(.caption)
-                    Picker("", selection: Binding(
-                        get: { browser },
-                        set: { action.parameter = "\(url)|\($0)|\(silent ? "true" : "false")|\(incognito ? "true" : "false")" }
-                    )) {
-                        Text("🚀 内置开发者浏览器").tag("InternalBrowser")
-                        Text("系统默认浏览器").tag("System")
-                        Text("Safari").tag("Safari")
-                        Text("Google Chrome").tag("Google Chrome")
-                        Text("Microsoft Edge").tag("Microsoft Edge")
-                    }.labelsHidden().frame(width: 160)
-                }
-                
-                HStack(spacing: 16) {
-                    Toggle("🥷 后台静默 (不抢夺焦点)", isOn: Binding(
-                        get: { silent },
-                        set: { action.parameter = "\(url)|\(browser)|\($0 ? "true" : "false")|\(incognito ? "true" : "false")" }
-                    ))
-                    .toggleStyle(.switch).controlSize(.mini).tint(.blue)
-                    
-                    // [✨智能交互] 仅当选中 Chromium 系浏览器时，开放无痕模式
-                    if browser.contains("Chrome") || browser.contains("Edge") {
-                        Toggle("🕶️ 无痕模式", isOn: Binding(
-                            get: { incognito },
-                            set: { action.parameter = "\(url)|\(browser)|\(silent ? "true" : "false")|\($0 ? "true" : "false")" }
-                        ))
-                        .toggleStyle(.switch).controlSize(.mini).tint(.purple)
-                    }
-                }
-            }
-        case .openApp:
-            let parts = action.parameter.components(separatedBy: "|")
-            let appTarget = parts.count > 0 ? parts[0] : action.parameter
-            let silent = parts.count > 1 ? (parts[1] == "true") : false
-            let newInstance = parts.count > 2 ? (parts[2] == "true") : false // [✨新增] 多开能力
-            
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    TextField("App名称/路径/包名(如 com.tencent.xinWeChat)", text: Binding(
-                        get: { appTarget },
-                        set: { action.parameter = "\($0)|\(silent ? "true" : "false")|\(newInstance ? "true" : "false")" }
-                    ))
-                    .textFieldStyle(.roundedBorder)
-                    
-                    Menu {
-                        Button(action: {
-                            let panel = NSOpenPanel()
-                            panel.allowsMultipleSelection = false
-                            panel.canChooseDirectories = false
-                            panel.canChooseFiles = true
-                            if #available(macOS 11.0, *) {
-                                panel.allowedContentTypes = [.application]
-                            }
-                            panel.directoryURL = URL(fileURLWithPath: "/Applications")
-                            
-                            if panel.runModal() == .OK, let url = panel.url {
-                                // [✨核心优化] 优先使用底层 Bundle ID，退化使用绝对路径。彻底杜绝 Where is 报错！
-                                let target = Bundle(url: url)?.bundleIdentifier ?? url.path
-                                action.parameter = "\(target)|\(silent ? "true" : "false")|\(newInstance ? "true" : "false")"
-                                // 自动帮用户把节点展示名改为友好的名称
-                                action.customName = "打开 \(url.deletingPathExtension().lastPathComponent)"
-                            }
-                        }) { Label("浏览本地应用程序...", systemImage: "folder.badge.magnifyingglass") }
-                        
-                        Divider()
-                        
-                        let runningApps = NSWorkspace.shared.runningApplications
-                            .filter { $0.activationPolicy == .regular }
-                            .sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
-                        
-                        ForEach(runningApps, id: \.processIdentifier) { app in
-                            // [✨核心优化] 提取运行中程序的 Bundle ID 存入底层
-                            if let name = app.localizedName, let bundleId = app.bundleIdentifier {
-                                Button("\(name)") {
-                                    action.parameter = "\(bundleId)|\(silent ? "true" : "false")|\(newInstance ? "true" : "false")"
-                                    action.customName = "打开 \(name)"
-                                }
-                            }
-                        }
-                    } label: { Image(systemName: "app.dashed") }.fixedSize()
-                    .help("从运行中或本地库中选择 App")
-                }
-                
-                HStack(spacing: 16) {
-                    Toggle("🥷 后台静默启动", isOn: Binding(get: { silent }, set: { action.parameter = "\(appTarget)|\($0 ? "true" : "false")|\(newInstance ? "true" : "false")" }))
-                        .toggleStyle(.switch).controlSize(.mini).tint(.blue)
-                    
-                    Toggle("👯‍♂️ 强制多开新实例", isOn: Binding(get: { newInstance }, set: { action.parameter = "\(appTarget)|\(silent ? "true" : "false")|\($0 ? "true" : "false")" }))
-                        .toggleStyle(.switch).controlSize(.mini).tint(.purple)
-                }
-                
-                Text("💡 推荐通过右侧图标选取。底层将提取 BundleID(包名) 彻底解决中英文名称识别失败的问题。").font(.caption2).foregroundColor(.secondary)
-            }
-        case .webAgent: WebAgentEditor(action: $action)
-        case .uiInteraction: UIInteractionEditor(parameter: $action.parameter)
-        case .setVariable:
-            let parts = action.parameter.components(separatedBy: "|")
-            let key = parts.count > 0 ? parts[0] : ""
-            let val = parts.count > 1 ? parts[1] : ""
-            VStack(alignment: .leading, spacing: 8) {
-                TextField("变量名 (例: name)", text: Binding(get: { key }, set: { action.parameter = "\($0)|\(val)" })).textFieldStyle(.roundedBorder)
-                TextField("变量值", text: Binding(get: { val }, set: { action.parameter = "\(key)|\($0)" })).textFieldStyle(.roundedBorder)
-                Text("设置后，后续节点可使用 {{变量名}} 调用。").font(.caption).foregroundColor(.secondary)
-            }
-        case .httpRequest:
-            let parts = action.parameter.components(separatedBy: "|")
-            let url = parts.count > 0 ? parts[0] : ""
-            let method = parts.count > 1 ? parts[1] : "GET"
-            VStack(alignment: .leading, spacing: 8) {
-                TextField("API 地址", text: Binding(get: { url }, set: { action.parameter = "\($0)|\(method)" })).textFieldStyle(.roundedBorder)
-                Picker("请求方法", selection: Binding(get: { method }, set: { action.parameter = "\(url)|\($0)" })) { Text("GET").tag("GET"); Text("POST").tag("POST") }
-                Text("请求结果将自动存入 {{http_response}} 变量。").font(.caption).foregroundColor(.secondary)
-            }
-        case .ocrText: OCRActionEditor(action: $action)
-        case .mouseOperation: MouseActionEditor(parameter: $action.parameter)
-        case .condition: ConditionEditor(parameter: $action.parameter)
+        case .openURL:          OpenURLEditor(action: $action)
+        case .openApp:          OpenAppEditor(action: $action)
+        case .webAgent:         WebAgentEditor(action: $action)
+        case .uiInteraction:    UIInteractionEditor(parameter: $action.parameter)
+        case .setVariable:      SetVariableEditor(action: $action)
+        case .httpRequest:      HTTPRequestEditor(action: $action)
+        case .ocrText:          OCRActionEditor(action: $action)
+        case .mouseOperation:   MouseActionEditor(parameter: $action.parameter)
+        case .condition:        ConditionEditor(parameter: $action.parameter)
         case .showNotification: NotificationEditor(parameter: $action.parameter)
-        case .runShell, .runAppleScript:
-            VStack(alignment: .leading) { TextEditor(text: $action.parameter).font(.system(size: 11, design: .monospaced)).frame(height: 120).padding(4).background(Color.gray.opacity(0.1)).cornerRadius(4); Text("支持变量插值，如 {{clipboard}}").font(.caption2).foregroundColor(.blue) }
-        case .typeText:
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    TextField("输入文本", text: $action.parameter)
-                        .textFieldStyle(.roundedBorder)
-                    Menu {
-                        Button("[ENTER] 回车") { action.parameter += "[ENTER]" }
-                        Button("[BACKSPACE] 退格") { action.parameter += "[BACKSPACE]" }
-                        Divider()
-                        Group {
-                            Button("全选 (CMD+A)") { action.parameter += "[CMD+A]" }
-                            Button("复制 (CMD+C)") { action.parameter += "[CMD+C]" }
-                            Button("粘贴 (CMD+V)") { action.parameter += "[CMD+V]" }
-                        }
-                        Divider()
-                        Group {
-                            Button("跳至顶端 (CMD+UP)") { action.parameter += "[CMD+UP]" }
-                            Button("跳至底端 (CMD+DOWN)") { action.parameter += "[CMD+DOWN]" }
-                        }
-                        Divider()
-                        Button("剪贴板变量") { action.parameter += "{{clipboard}}" }
-                    } label: { Image(systemName: "keyboard.badge.ellipsis") }.fixedSize()
-                }
-                Text("支持组合键如 [CMD+A]、[BACKSPACE] 及变量").font(.system(size: 10)).foregroundColor(.secondary)
-            }
-        case .wait: HStack { TextField("秒数", text: $action.parameter).textFieldStyle(.roundedBorder); Text("秒") }
-        case .callWorkflow:
-            VStack(alignment: .leading, spacing: 10) {
-                Text("选择要执行的子工作流：").font(.caption)
-                
-                let allWorkflows = StorageManager.shared.load()
-                
-                // 【✨核心修复 1】通过当前 action 的 ID 反查它属于哪个工作流，从而拿到“当前工作流 ID”
-                let currentWorkflowId = allWorkflows.first(where: { wf in
-                    wf.actions.contains(where: { $0.id == action.id })
-                })?.id.uuidString ?? ""
-                
-                // 使用原生的 Picker 绑定
-                Picker("", selection: $action.parameter) {
-                    Text("请选择...").tag("")
-                    
-                    ForEach(allWorkflows) { wf in
-                        // 【✨核心修复 2】只排除“当前工作流”自己，彻底杜绝死循环，且不会导致选中后变空白
-                        if wf.id.uuidString != currentWorkflowId {
-                            Text(wf.name).tag(wf.id.uuidString)
-                        }
-                    }
-                }
-                .labelsHidden()
-                
-                Text("执行到此节点时，将挂起当前流程，等待子流程执行完毕后继续。").font(.caption2).foregroundColor(.secondary)
-            }
-        default: TextField("参数设置", text: $action.parameter).textFieldStyle(.roundedBorder)
+        case .runShell, .runAppleScript: RunScriptEditor(action: $action)
+        case .typeText:         TypeTextEditor(action: $action)
+        case .wait:             WaitEditor(action: $action)
+        case .callWorkflow:     CallWorkflowEditor(action: $action)
+        default:
+            TextField("参数设置", text: $action.parameter).textFieldStyle(.roundedBorder)
         }
     }
 }
 
-// MARK: - [✨精简版] Web 智能体节点编辑器
+// MARK: - [系统与应用] 打开网址编辑器
+/// 提供网址输入、浏览器选择、静默模式与无痕模式配置
+struct OpenURLEditor: View {
+    @Binding var action: RPAAction
+    
+    var body: some View {
+        let parts = action.parameter.components(separatedBy: "|")
+        let url = parts.count > 0 ? parts[0] : action.parameter
+        let browser = parts.count > 1 ? parts[1] : "InternalBrowser"
+        let silent = parts.count > 2 ? (parts[2] == "true") : false
+        let incognito = parts.count > 3 ? (parts[3] == "true") : false // [✨新增] 无痕模式
+        
+        VStack(alignment: .leading, spacing: 10) {
+            TextField("网址 (例如: bing.com，支持 {{变量}})", text: Binding(
+                get: { url },
+                set: { action.parameter = "\($0)|\(browser)|\(silent ? "true" : "false")|\(incognito ? "true" : "false")" }
+            ))
+            .textFieldStyle(.roundedBorder)
+            
+            HStack {
+                Text("目标浏览器:").font(.caption)
+                Picker("", selection: Binding(
+                    get: { browser },
+                    set: { action.parameter = "\(url)|\($0)|\(silent ? "true" : "false")|\(incognito ? "true" : "false")" }
+                )) {
+                    Text("🚀 内置开发者浏览器").tag("InternalBrowser")
+                    Text("系统默认浏览器").tag("System")
+                    Text("Safari").tag("Safari")
+                    Text("Google Chrome").tag("Google Chrome")
+                    Text("Microsoft Edge").tag("Microsoft Edge")
+                }.labelsHidden().frame(width: 160)
+            }
+            
+            HStack(spacing: 16) {
+                Toggle("🥷 后台静默 (不抢夺焦点)", isOn: Binding(
+                    get: { silent },
+                    set: { action.parameter = "\(url)|\(browser)|\($0 ? "true" : "false")|\(incognito ? "true" : "false")" }
+                ))
+                .toggleStyle(.switch).controlSize(.mini).tint(.blue)
+                
+                // [✨智能交互] 仅当选中 Chromium 系浏览器时，开放无痕模式
+                if browser.contains("Chrome") || browser.contains("Edge") {
+                    Toggle("🕶️ 无痕模式", isOn: Binding(
+                        get: { incognito },
+                        set: { action.parameter = "\(url)|\(browser)|\(silent ? "true" : "false")|\($0 ? "true" : "false")" }
+                    ))
+                    .toggleStyle(.switch).controlSize(.mini).tint(.purple)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - [系统与应用] 打开应用程序编辑器
+/// 提供本地应用选取、进程选取、多开与后台静默控制
+struct OpenAppEditor: View {
+    @Binding var action: RPAAction
+    
+    var body: some View {
+        let parts = action.parameter.components(separatedBy: "|")
+        let appTarget = parts.count > 0 ? parts[0] : action.parameter
+        let silent = parts.count > 1 ? (parts[1] == "true") : false
+        let newInstance = parts.count > 2 ? (parts[2] == "true") : false // [✨新增] 多开能力
+        
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                TextField("App名称/路径/包名(如 com.tencent.xinWeChat)", text: Binding(
+                    get: { appTarget },
+                    set: { action.parameter = "\($0)|\(silent ? "true" : "false")|\(newInstance ? "true" : "false")" }
+                ))
+                .textFieldStyle(.roundedBorder)
+                
+                Menu {
+                    Button(action: {
+                        let panel = NSOpenPanel()
+                        panel.allowsMultipleSelection = false
+                        panel.canChooseDirectories = false
+                        panel.canChooseFiles = true
+                        if #available(macOS 11.0, *) { panel.allowedContentTypes = [.application] }
+                        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+                        
+                        if panel.runModal() == .OK, let url = panel.url {
+                            // [✨核心优化] 优先使用底层 Bundle ID，退化使用绝对路径
+                            let target = Bundle(url: url)?.bundleIdentifier ?? url.path
+                            action.parameter = "\(target)|\(silent ? "true" : "false")|\(newInstance ? "true" : "false")"
+                            action.customName = "打开 \(url.deletingPathExtension().lastPathComponent)"
+                        }
+                    }) { Label("浏览本地应用程序...", systemImage: "folder.badge.magnifyingglass") }
+                    
+                    Divider()
+                    
+                    let runningApps = NSWorkspace.shared.runningApplications
+                        .filter { $0.activationPolicy == .regular }
+                        .sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
+                    
+                    ForEach(runningApps, id: \.processIdentifier) { app in
+                        if let name = app.localizedName, let bundleId = app.bundleIdentifier {
+                            Button("\(name)") {
+                                action.parameter = "\(bundleId)|\(silent ? "true" : "false")|\(newInstance ? "true" : "false")"
+                                action.customName = "打开 \(name)"
+                            }
+                        }
+                    }
+                } label: { Image(systemName: "app.dashed") }.fixedSize()
+                .help("从运行中或本地库中选择 App")
+            }
+            
+            HStack(spacing: 16) {
+                Toggle("🥷 后台静默启动", isOn: Binding(get: { silent }, set: { action.parameter = "\(appTarget)|\($0 ? "true" : "false")|\(newInstance ? "true" : "false")" }))
+                    .toggleStyle(.switch).controlSize(.mini).tint(.blue)
+                
+                Toggle("👯‍♂️ 强制多开新实例", isOn: Binding(get: { newInstance }, set: { action.parameter = "\(appTarget)|\(silent ? "true" : "false")|\($0 ? "true" : "false")" }))
+                    .toggleStyle(.switch).controlSize(.mini).tint(.purple)
+            }
+            
+            Text("💡 推荐通过右侧图标选取。底层将提取 BundleID(包名) 彻底解决中英文名称识别失败的问题。").font(.caption2).foregroundColor(.secondary)
+        }
+    }
+}
+
+// MARK: - [逻辑与数据] 变量设置编辑器
+/// 提供键值对的声明绑定
+struct SetVariableEditor: View {
+    @Binding var action: RPAAction
+    
+    var body: some View {
+        let parts = action.parameter.components(separatedBy: "|")
+        let key = parts.count > 0 ? parts[0] : ""
+        let val = parts.count > 1 ? parts[1] : ""
+        VStack(alignment: .leading, spacing: 8) {
+            TextField("变量名 (例: name)", text: Binding(get: { key }, set: { action.parameter = "\($0)|\(val)" })).textFieldStyle(.roundedBorder)
+            TextField("变量值", text: Binding(get: { val }, set: { action.parameter = "\(key)|\($0)" })).textFieldStyle(.roundedBorder)
+            Text("设置后，后续节点可使用 {{变量名}} 调用。").font(.caption).foregroundColor(.secondary)
+        }
+    }
+}
+
+// MARK: - [逻辑与数据] HTTP 请求编辑器
+/// 轻量级 API 调用配置
+struct HTTPRequestEditor: View {
+    @Binding var action: RPAAction
+    
+    var body: some View {
+        let parts = action.parameter.components(separatedBy: "|")
+        let url = parts.count > 0 ? parts[0] : ""
+        let method = parts.count > 1 ? parts[1] : "GET"
+        VStack(alignment: .leading, spacing: 8) {
+            TextField("API 地址", text: Binding(get: { url }, set: { action.parameter = "\($0)|\(method)" })).textFieldStyle(.roundedBorder)
+            Picker("请求方法", selection: Binding(get: { method }, set: { action.parameter = "\(url)|\($0)" })) {
+                Text("GET").tag("GET")
+                Text("POST").tag("POST")
+            }
+            Text("请求结果将自动存入 {{http_response}} 变量。").font(.caption).foregroundColor(.secondary)
+        }
+    }
+}
+
+// MARK: - [鼠标与键盘] 键盘输入编辑器
+/// 支持速度调节与特殊宏指令写入
+struct TypeTextEditor: View {
+    @Binding var action: RPAAction
+    
+    var body: some View {
+        let parts = action.parameter.components(separatedBy: "|")
+        let textValue = parts.count > 0 ? parts[0] : action.parameter
+        // [✨新增] 解析键盘敲击速度
+        let speedMode = parts.count > 1 ? parts[1] : "normal"
+        
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                // 使用垂直轴向的文本框，支持输入多行脚本和组合宏
+                TextField("输入文本 (例如: Hello[ENTER])", text: Binding(
+                    get: { textValue },
+                    set: { action.parameter = "\($0)|\(speedMode)" }
+                ), axis: .vertical)
+                .lineLimit(3...6)
+                .textFieldStyle(.roundedBorder)
+                
+                Menu {
+                    Section("功能键") {
+                        Button("[ENTER] 回车") { action.parameter = "\(textValue)[ENTER]|\(speedMode)" }
+                        Button("[TAB] 缩进") { action.parameter = "\(textValue)[TAB]|\(speedMode)" }
+                        Button("[ESC] 取消") { action.parameter = "\(textValue)[ESC]|\(speedMode)" }
+                    }
+                    Section("编辑操作") {
+                        Button("全选 (CMD+A)") { action.parameter = "\(textValue)[CMD+A]|\(speedMode)" }
+                        Button("复制 (CMD+C)") { action.parameter = "\(textValue)[CMD+C]|\(speedMode)" }
+                        Button("粘贴 (CMD+V)") { action.parameter = "\(textValue)[CMD+V]|\(speedMode)" }
+                    }
+                    Section("全局变量") {
+                        Button("剪贴板内容") { action.parameter = "\(textValue){{clipboard}}|\(speedMode)" }
+                    }
+                } label: { Image(systemName: "keyboard.badge.ellipsis") }.fixedSize()
+            }
+            
+            HStack {
+                Text("打字速度:").font(.caption).foregroundColor(.secondary)
+                Picker("", selection: Binding(
+                    get: { speedMode },
+                    set: { action.parameter = "\(textValue)|\($0)" }
+                )) {
+                    Text("⚡️ 极速 (免延时)").tag("fast")
+                    Text("🚶 普通 (标准机打)").tag("normal")
+                    Text("🙋‍♂️ 拟人 (思考停顿)").tag("human")
+                }.labelsHidden().pickerStyle(.segmented).frame(width: 250)
+            }
+        }
+    }
+}
+
+// MARK: - [逻辑与数据] 延时编辑器
+/// 配置动作强行阻塞时间
+struct WaitEditor: View {
+    @Binding var action: RPAAction
+    
+    var body: some View {
+        HStack {
+            TextField("秒数", text: $action.parameter).textFieldStyle(.roundedBorder)
+            Text("秒")
+        }
+    }
+}
+
+// MARK: - [逻辑与数据] 脚本执行编辑器
+/// 供 Shell 和 AppleScript 通用的多行文本域
+struct RunScriptEditor: View {
+    @Binding var action: RPAAction
+    
+    var body: some View {
+        VStack(alignment: .leading) {
+            TextEditor(text: $action.parameter)
+                .font(.system(size: 11, design: .monospaced))
+                .frame(height: 120)
+                .padding(4)
+                .background(Color.gray.opacity(0.1))
+                .cornerRadius(4)
+            Text("支持变量插值，如 {{clipboard}}").font(.caption2).foregroundColor(.blue)
+        }
+    }
+}
+
+// MARK: - [逻辑与数据] 子工作流调用编辑器
+/// 提供从系统中读取可用工作流并防止死循环的调用机制
+struct CallWorkflowEditor: View {
+    @Binding var action: RPAAction
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("选择要执行的子工作流：").font(.caption)
+            
+            let allWorkflows = StorageManager.shared.load()
+            
+            // 【✨核心修复 1】通过当前 action 的 ID 反查它属于哪个工作流，从而拿到“当前工作流 ID”
+            let currentWorkflowId = allWorkflows.first(where: { wf in
+                wf.actions.contains(where: { $0.id == action.id })
+            })?.id.uuidString ?? ""
+            
+            // 使用原生的 Picker 绑定
+            Picker("", selection: $action.parameter) {
+                Text("请选择...").tag("")
+                
+                ForEach(allWorkflows) { wf in
+                    // 【✨核心修复 2】只排除“当前工作流”自己，彻底杜绝死循环，且不会导致选中后变空白
+                    if wf.id.uuidString != currentWorkflowId {
+                        Text(wf.name).tag(wf.id.uuidString)
+                    }
+                }
+            }
+            .labelsHidden()
+            
+            Text("执行到此节点时，将挂起当前流程，等待子流程执行完毕后继续。").font(.caption2).foregroundColor(.secondary)
+        }
+    }
+}
+
+// MARK: - [逻辑与数据] Web 智能体节点编辑器
 struct WebAgentEditor: View {
     @Binding var action: RPAAction
     
@@ -440,32 +559,269 @@ struct UIInteractionEditor: View {
 // 💡极客级辅助视图代码 (MiniDesktop, OCRMiniDesktop, 连接线绘制, 截屏工具等)
 // -----------------------------------------------------------------------------------
 
+// MARK: - 迷你桌面渲染器 (鼠标动作)
+/// 可视化指示鼠标将要在屏幕上执行的坐标动作
 struct MouseMiniDesktop: View {
-    @Binding var point1Str: String; @Binding var point2Str: String; var isDrag: Bool; var isRelative: Bool
+    @Binding var point1Str: String
+    @Binding var point2Str: String
+    var isDrag: Bool
+    var isRelative: Bool
+    
     let screen = NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
-    @State private var dragStartP1: CGPoint? = nil; @State private var dragStartP2: CGPoint? = nil
-    func getPoint(_ str: String, defaultPt: CGPoint) -> CGPoint { let parts = str.split(separator: ","); if parts.count == 2, let x = Double(parts[0].trimmingCharacters(in: .whitespaces)), let y = Double(parts[1].trimmingCharacters(in: .whitespaces)) { return CGPoint(x: x, y: y) }; return defaultPt }
-    var body: some View { GeometryReader { geo in let scaleX = geo.size.width / screen.width; let scaleY = geo.size.height / screen.height; ZStack(alignment: .topLeading) { RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.8)); RoundedRectangle(cornerRadius: 6).stroke(Color.gray, lineWidth: 2); let center = CGPoint(x: geo.size.width / 2, y: geo.size.height / 2); if isRelative { Path { p in p.move(to: CGPoint(x: center.x, y: 0)); p.addLine(to: CGPoint(x: center.x, y: geo.size.height)); p.move(to: CGPoint(x: 0, y: center.y)); p.addLine(to: CGPoint(x: geo.size.width, y: center.y)) }.stroke(Color.white.opacity(0.2), lineWidth: 1) }; let p1 = getPoint(point1Str, defaultPt: isRelative ? .zero : CGPoint(x: screen.width/2, y: screen.height/2)); let vP1 = isRelative ? CGPoint(x: center.x + p1.x * scaleX, y: center.y + p1.y * scaleY) : CGPoint(x: p1.x * scaleX, y: p1.y * scaleY); if isDrag { let p2 = getPoint(point2Str, defaultPt: isRelative ? .zero : CGPoint(x: screen.width/2 + 50, y: screen.height/2 + 50)); let vP2 = isRelative ? CGPoint(x: vP1.x + p2.x * scaleX, y: vP1.y + p2.y * scaleY) : CGPoint(x: p2.x * scaleX, y: p2.y * scaleY); Path { p in p.move(to: vP1); p.addLine(to: vP2) }.stroke(Color.blue, style: StrokeStyle(lineWidth: 2, dash: [4, 4])); Circle().fill(Color.red).frame(width: 14, height: 14).position(vP2).overlay(Text("终").font(.system(size: 9)).position(vP2).foregroundColor(.white)).gesture(DragGesture().onChanged { val in if dragStartP2 == nil { dragStartP2 = p2 }; if let start = dragStartP2 { point2Str = "\(Int(start.x + val.translation.width / scaleX)), \(Int(start.y + val.translation.height / scaleY))" } }.onEnded { _ in dragStartP2 = nil }) }; Circle().fill(Color.green).frame(width: 14, height: 14).position(vP1).overlay(Text(isDrag ? "起" : "点").font(.system(size: 9)).position(vP1).foregroundColor(.white)).gesture(DragGesture().onChanged { val in if dragStartP1 == nil { dragStartP1 = p1 }; if let start = dragStartP1 { point1Str = "\(Int(start.x + val.translation.width / scaleX)), \(Int(start.y + val.translation.height / scaleY))" } }.onEnded { _ in dragStartP1 = nil }) } }.frame(height: 120) }
-}
-
-struct OCRMiniDesktop: View {
-    @Binding var regionStr: String; @Binding var offsetX: Double; @Binding var offsetY: Double
-    let screen = NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
-    @State private var dragStartRegion: CGRect? = nil; @State private var dragStartOffset: CGPoint? = nil
-    var currentRegion: CGRect { let parts = regionStr.split(separator: ","); if parts.count == 4, let x = Double(parts[0].trimmingCharacters(in: .whitespaces)), let y = Double(parts[1].trimmingCharacters(in: .whitespaces)), let w = Double(parts[2].trimmingCharacters(in: .whitespaces)), let h = Double(parts[3].trimmingCharacters(in: .whitespaces)) { return CGRect(x: x, y: y, width: w, height: h) }; return CGRect(x: 0, y: 0, width: screen.width, height: screen.height) }
-    var body: some View { GeometryReader { geo in let scaleX = geo.size.width / screen.width; let scaleY = geo.size.height / screen.height; ZStack(alignment: .topLeading) { RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.8)); RoundedRectangle(cornerRadius: 6).stroke(Color.gray, lineWidth: 2); let r = currentRegion; let viewRect = CGRect(x: r.minX * scaleX, y: r.minY * scaleY, width: r.width * scaleX, height: r.height * scaleY); Rectangle().fill(Color.blue.opacity(0.3)).border(Color.blue, width: 1).frame(width: max(viewRect.width, 10), height: max(viewRect.height, 10)).offset(x: viewRect.minX, y: viewRect.minY).gesture(DragGesture().onChanged { val in if dragStartRegion == nil { dragStartRegion = r }; if let start = dragStartRegion { let newX = max(0, min(screen.width - start.width, start.minX + val.translation.width / scaleX)); let newY = max(0, min(screen.height - start.height, start.minY + val.translation.height / scaleY)); regionStr = "\(Int(newX)), \(Int(newY)), \(Int(start.width)), \(Int(start.height))" } }.onEnded { _ in dragStartRegion = nil }); let center = CGPoint(x: viewRect.midX, y: viewRect.midY); let offsetViewX = offsetX * scaleX; let offsetViewY = offsetY * scaleY; let target = CGPoint(x: center.x + offsetViewX, y: center.y + offsetViewY); Path { p in p.move(to: center); p.addLine(to: target) }.stroke(Color.red, style: StrokeStyle(lineWidth: 1, dash: [2,2])); Circle().fill(Color.green).frame(width: 6, height: 6).position(center); Circle().fill(Color.red).frame(width: 14, height: 14).position(target).overlay(Text("点").font(.system(size: 9)).position(target).foregroundColor(.white)).gesture(DragGesture().onChanged { val in if dragStartOffset == nil { dragStartOffset = CGPoint(x: offsetX, y: offsetY) }; if let start = dragStartOffset { offsetX = start.x + val.translation.width / scaleX; offsetY = start.y + val.translation.height / scaleY } }.onEnded { _ in dragStartOffset = nil }) } }.frame(height: 120) }
-}
-
-struct MouseActionEditor: View {
-    @Binding var parameter: String
+    @State private var dragStartP1: CGPoint? = nil
+    @State private var dragStartP2: CGPoint? = nil
+    
+    func getPoint(_ str: String, defaultPt: CGPoint) -> CGPoint {
+        let parts = str.split(separator: ",")
+        if parts.count == 2,
+           let x = Double(parts[0].trimmingCharacters(in: .whitespaces)),
+           let y = Double(parts[1].trimmingCharacters(in: .whitespaces)) {
+            return CGPoint(x: x, y: y)
+        }
+        return defaultPt
+    }
+    
     var body: some View {
-        let parts = parameter.components(separatedBy: "|"); let mouseType = parts.count > 1 ? parts[0] : "leftClick"; let mouseVal1 = parts.count > 1 ? parts[1] : (parameter.contains(",") ? parameter : "0, 0"); let mouseVal2 = parts.count > 2 ? parts[2] : "0, 0"; let isRelative = parts.count > 3 ? (parts[3] == "true") : false
-        let mainTab = mouseType.lowercased().contains("scroll") ? "scroll" : mouseType
-        let updateParam = { (type: String, v1: String, v2: String, rel: Bool) in parameter = "\(type)|\(v1)|\(v2)|\(rel ? "true" : "false")" }
-        VStack(alignment: .leading, spacing: 8) { HStack { Picker("", selection: Binding(get: { mainTab }, set: { let newType = $0 == "scroll" ? "scrollDown" : $0; updateParam(newType, mouseVal1, mouseVal2, isRelative) })) { Text("移动").tag("move"); Text("点击").tag("leftClick"); Text("右键").tag("rightClick"); Text("双击").tag("doubleClick"); Text("拖拽").tag("drag"); Text("滚轮").tag("scroll") }.pickerStyle(.segmented) }; if mainTab != "scroll" { Toggle("相对当前光标", isOn: Binding(get: { isRelative }, set: { updateParam(mouseType, mouseVal1, mouseVal2, $0) })).toggleStyle(.switch).controlSize(.mini); MouseMiniDesktop(point1Str: Binding(get: { mouseVal1 }, set: { updateParam(mouseType, $0, mouseVal2, isRelative) }), point2Str: Binding(get: { mouseVal2 }, set: { updateParam(mouseType, mouseVal1, $0, isRelative) }), isDrag: mainTab == "drag", isRelative: isRelative) } else { HStack { Picker("", selection: Binding(get: { mouseType }, set: { updateParam($0, mouseVal1, mouseVal2, isRelative) })) { Text("向上").tag("scrollUp"); Text("向下").tag("scrollDown") }.frame(width: 140); TextField("行数", text: Binding(get: { mouseVal1 }, set: { updateParam(mouseType, $0, mouseVal2, isRelative) })).textFieldStyle(.roundedBorder) } } }
+        GeometryReader { geo in
+            let scaleX = geo.size.width / screen.width
+            let scaleY = geo.size.height / screen.height
+            
+            ZStack(alignment: .topLeading) {
+                RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.8))
+                RoundedRectangle(cornerRadius: 6).stroke(Color.gray, lineWidth: 2)
+                
+                let center = CGPoint(x: geo.size.width / 2, y: geo.size.height / 2)
+                
+                if isRelative {
+                    Path { p in
+                        p.move(to: CGPoint(x: center.x, y: 0))
+                        p.addLine(to: CGPoint(x: center.x, y: geo.size.height))
+                        p.move(to: CGPoint(x: 0, y: center.y))
+                        p.addLine(to: CGPoint(x: geo.size.width, y: center.y))
+                    }.stroke(Color.white.opacity(0.2), lineWidth: 1)
+                }
+                
+                let p1 = getPoint(point1Str, defaultPt: isRelative ? .zero : CGPoint(x: screen.width/2, y: screen.height/2))
+                let vP1 = isRelative ? CGPoint(x: center.x + p1.x * scaleX, y: center.y + p1.y * scaleY) : CGPoint(x: p1.x * scaleX, y: p1.y * scaleY)
+                
+                if isDrag {
+                    let p2 = getPoint(point2Str, defaultPt: isRelative ? .zero : CGPoint(x: screen.width/2 + 50, y: screen.height/2 + 50))
+                    let vP2 = isRelative ? CGPoint(x: vP1.x + p2.x * scaleX, y: vP1.y + p2.y * scaleY) : CGPoint(x: p2.x * scaleX, y: p2.y * scaleY)
+                    
+                    Path { p in
+                        p.move(to: vP1)
+                        p.addLine(to: vP2)
+                    }.stroke(Color.blue, style: StrokeStyle(lineWidth: 2, dash: [4, 4]))
+                    
+                    Circle()
+                        .fill(Color.red)
+                        .frame(width: 14, height: 14)
+                        .position(vP2)
+                        .overlay(Text("终").font(.system(size: 9)).position(vP2).foregroundColor(.white))
+                        .gesture(
+                            DragGesture()
+                                .onChanged { val in
+                                    if dragStartP2 == nil { dragStartP2 = p2 }
+                                    if let start = dragStartP2 {
+                                        point2Str = "\(Int(start.x + val.translation.width / scaleX)), \(Int(start.y + val.translation.height / scaleY))"
+                                    }
+                                }
+                                .onEnded { _ in dragStartP2 = nil }
+                        )
+                }
+                
+                Circle()
+                    .fill(Color.green)
+                    .frame(width: 14, height: 14)
+                    .position(vP1)
+                    .overlay(Text(isDrag ? "起" : "点").font(.system(size: 9)).position(vP1).foregroundColor(.white))
+                    .gesture(
+                        DragGesture()
+                            .onChanged { val in
+                                if dragStartP1 == nil { dragStartP1 = p1 }
+                                if let start = dragStartP1 {
+                                    point1Str = "\(Int(start.x + val.translation.width / scaleX)), \(Int(start.y + val.translation.height / scaleY))"
+                                }
+                            }
+                            .onEnded { _ in dragStartP1 = nil }
+                    )
+            }
+        }.frame(height: 120)
     }
 }
 
+// MARK: - OCR区域截取迷你桌面
+/// 用于展示和微调视觉搜索区域的缩略图组件
+struct OCRMiniDesktop: View {
+    @Binding var regionStr: String
+    @Binding var offsetX: Double
+    @Binding var offsetY: Double
+    
+    let screen = NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
+    @State private var dragStartRegion: CGRect? = nil
+    @State private var dragStartOffset: CGPoint? = nil
+    
+    var currentRegion: CGRect {
+        let parts = regionStr.split(separator: ",")
+        if parts.count == 4,
+           let x = Double(parts[0].trimmingCharacters(in: .whitespaces)),
+           let y = Double(parts[1].trimmingCharacters(in: .whitespaces)),
+           let w = Double(parts[2].trimmingCharacters(in: .whitespaces)),
+           let h = Double(parts[3].trimmingCharacters(in: .whitespaces)) {
+            return CGRect(x: x, y: y, width: w, height: h)
+        }
+        return CGRect(x: 0, y: 0, width: screen.width, height: screen.height)
+    }
+    
+    var body: some View {
+        GeometryReader { geo in
+            let scaleX = geo.size.width / screen.width
+            let scaleY = geo.size.height / screen.height
+            
+            ZStack(alignment: .topLeading) {
+                RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.8))
+                RoundedRectangle(cornerRadius: 6).stroke(Color.gray, lineWidth: 2)
+                
+                let r = currentRegion
+                let viewRect = CGRect(x: r.minX * scaleX, y: r.minY * scaleY, width: r.width * scaleX, height: r.height * scaleY)
+                
+                Rectangle()
+                    .fill(Color.blue.opacity(0.3))
+                    .border(Color.blue, width: 1)
+                    .frame(width: max(viewRect.width, 10), height: max(viewRect.height, 10))
+                    .offset(x: viewRect.minX, y: viewRect.minY)
+                    .gesture(
+                        DragGesture()
+                            .onChanged { val in
+                                if dragStartRegion == nil { dragStartRegion = r }
+                                if let start = dragStartRegion {
+                                    let newX = max(0, min(screen.width - start.width, start.minX + val.translation.width / scaleX))
+                                    let newY = max(0, min(screen.height - start.height, start.minY + val.translation.height / scaleY))
+                                    regionStr = "\(Int(newX)), \(Int(newY)), \(Int(start.width)), \(Int(start.height))"
+                                }
+                            }
+                            .onEnded { _ in dragStartRegion = nil }
+                    )
+                
+                let center = CGPoint(x: viewRect.midX, y: viewRect.midY)
+                let offsetViewX = offsetX * scaleX
+                let offsetViewY = offsetY * scaleY
+                let target = CGPoint(x: center.x + offsetViewX, y: center.y + offsetViewY)
+                
+                Path { p in
+                    p.move(to: center)
+                    p.addLine(to: target)
+                }.stroke(Color.red, style: StrokeStyle(lineWidth: 1, dash: [2,2]))
+                
+                Circle().fill(Color.green).frame(width: 6, height: 6).position(center)
+                
+                Circle()
+                    .fill(Color.red)
+                    .frame(width: 14, height: 14)
+                    .position(target)
+                    .overlay(Text("点").font(.system(size: 9)).position(target).foregroundColor(.white))
+                    .gesture(
+                        DragGesture()
+                            .onChanged { val in
+                                if dragStartOffset == nil { dragStartOffset = CGPoint(x: offsetX, y: offsetY) }
+                                if let start = dragStartOffset {
+                                    offsetX = start.x + val.translation.width / scaleX
+                                    offsetY = start.y + val.translation.height / scaleY
+                                }
+                            }
+                            .onEnded { _ in dragStartOffset = nil }
+                    )
+            }
+        }.frame(height: 120)
+    }
+}
+
+// MARK: - [✨重构] 鼠标操作编辑器（融合直观的屏幕拾取器）
+struct MouseActionEditor: View {
+    @Binding var parameter: String
+    @State private var isPicking = false
+    
+    var body: some View {
+        let parts = parameter.components(separatedBy: "|")
+        let mouseType = parts.count > 0 ? parts[0] : "leftClick"
+        // 兼容旧数据的异常
+        let mouseVal1 = parts.count > 1 ? parts[1] : (parameter.contains(",") ? parameter : "0, 0")
+        let mouseVal2 = parts.count > 2 ? parts[2] : "0, 0"
+        let isRelative = parts.count > 3 ? (parts[3] == "true") : false
+        
+        let mainTab = mouseType.lowercased().contains("scroll") ? "scroll" : mouseType
+        
+        let updateParam = { (type: String, v1: String, v2: String, rel: Bool) in
+            parameter = "\(type)|\(v1)|\(v2)|\(rel ? "true" : "false")"
+        }
+        
+        VStack(alignment: .leading, spacing: 12) {
+            Picker("", selection: Binding(
+                get: { mainTab },
+                set: {
+                    let newType = $0 == "scroll" ? "scrollDown" : $0
+                    updateParam(newType, mouseVal1, mouseVal2, isRelative)
+                }
+            )) {
+                Text("移动").tag("move")
+                Text("点击").tag("leftClick")
+                Text("右键").tag("rightClick")
+                Text("双击").tag("doubleClick")
+                Text("拖拽").tag("drag")
+                Text("滚轮").tag("scroll")
+            }
+            .pickerStyle(.segmented)
+            
+            if mainTab != "scroll" {
+                HStack {
+                    Toggle("相对当前光标位置偏移", isOn: Binding(
+                        get: { isRelative },
+                        set: { updateParam(mouseType, mouseVal1, mouseVal2, $0) }
+                    )).toggleStyle(.switch).controlSize(.mini)
+                    
+                    Spacer()
+                    
+                    // [✨新增] 一键实景拾取能力
+                    Button(action: {
+                        isPicking = true
+                        ScreenPointPicker.shared.pickPoint { point in
+                            isPicking = false
+                            if let pt = point {
+                                // 自动帮用户填入准确的坐标
+                                updateParam(mouseType, "\(Int(pt.x)), \(Int(pt.y))", mouseVal2, isRelative)
+                            }
+                        }
+                    }) {
+                        Label(isPicking ? "正在拾取..." : "🎯 屏幕实景拾取", systemImage: "scope")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(isPicking ? .orange : .blue)
+                    .controlSize(.small)
+                }
+                
+                // 原有 MiniDesktop 依旧保留，作为微调和可视化反馈
+                MouseMiniDesktop(
+                    point1Str: Binding(get: { mouseVal1 }, set: { updateParam(mouseType, $0, mouseVal2, isRelative) }),
+                    point2Str: Binding(get: { mouseVal2 }, set: { updateParam(mouseType, mouseVal1, $0, isRelative) }),
+                    isDrag: mainTab == "drag",
+                    isRelative: isRelative
+                )
+            } else {
+                HStack {
+                    Picker("方向", selection: Binding(get: { mouseType }, set: { updateParam($0, mouseVal1, mouseVal2, isRelative) })) {
+                        Text("向下滚动").tag("scrollDown")
+                        Text("向上滚动").tag("scrollUp")
+                    }.frame(width: 150)
+                    
+                    TextField("滚动行数 (如: 5)", text: Binding(get: { mouseVal1 }, set: { updateParam(mouseType, $0, mouseVal2, isRelative) }))
+                        .textFieldStyle(.roundedBorder)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - [AI与视觉] OCR文本识别交互编辑器
 struct OCRActionEditor: View {
     @Binding var action: RPAAction
     @State private var isPickingRegion = false
@@ -609,7 +965,7 @@ struct OCRActionEditor: View {
                         .toggleStyle(.switch).controlSize(.small).tint(.orange)
                 }
                 
-                // [✨新增] 滚屏配置下沉菜单 (仅在开启滚屏时显示，保持界面整洁)
+                // [✨新增] 滚屏配置下沉菜单
                 if autoScroll {
                     HStack(spacing: 10) {
                         Image(systemName: "arrow.up.and.down").foregroundColor(.blue).font(.caption)
@@ -650,13 +1006,13 @@ struct NotificationEditor: View {
                 set: { parameter = "\($0)|\(bodyText)|\(notifyType)|\(playSound ? "true" : "false")" }
             )).textFieldStyle(.roundedBorder)
             
-            // [✨修改] 开启垂直轴向，变成多行文本域，完美保留边框和占位符
+            // [✨修改] 开启垂直轴向，变成多行文本域
             TextField("详细内容 (支持换行和 {{变量}})", text: Binding(
                 get: { bodyText },
                 set: { parameter = "\(title)|\($0)|\(notifyType)|\(playSound ? "true" : "false")" }
             ), axis: .vertical)
             .textFieldStyle(.roundedBorder)
-            .lineLimit(3...8) // [✨新增] 默认展示3行高度，内容过多时最多撑到8行然后可滚动
+            .lineLimit(3...8)
             
             HStack {
                 Text("提醒方式:").font(.caption)
@@ -683,7 +1039,31 @@ struct NotificationEditor: View {
     }
 }
 
-struct ConditionEditor: View { @Binding var parameter: String; var body: some View { let parts = parameter.components(separatedBy: "|"); let leftValue = parts.count > 0 ? parts[0] : "{{clipboard}}"; let op = parts.count > 1 ? parts[1] : "contains"; let rightValue = parts.count > 2 ? parts[2] : ""; HStack { TextField("左值", text: Binding(get: { leftValue }, set: { parameter = "\($0)|\(op)|\(rightValue)" })).textFieldStyle(.roundedBorder); Picker("", selection: Binding(get: { op }, set: { parameter = "\(leftValue)|\($0)|\(rightValue)" })) { Text("包含").tag("contains"); Text("等于").tag("==") }.frame(width: 80); TextField("对比值", text: Binding(get: { rightValue }, set: { parameter = "\(leftValue)|\(op)|\($0)" })).textFieldStyle(.roundedBorder) } } }
+// MARK: - [逻辑与数据] 条件判断分支编辑器
+/// 配置条件分支的左值、比较操作符和右值
+struct ConditionEditor: View {
+    @Binding var parameter: String
+    
+    var body: some View {
+        let parts = parameter.components(separatedBy: "|")
+        let leftValue = parts.count > 0 ? parts[0] : "{{clipboard}}"
+        let op = parts.count > 1 ? parts[1] : "contains"
+        let rightValue = parts.count > 2 ? parts[2] : ""
+        
+        HStack {
+            TextField("左值", text: Binding(get: { leftValue }, set: { parameter = "\($0)|\(op)|\(rightValue)" }))
+                .textFieldStyle(.roundedBorder)
+            
+            Picker("", selection: Binding(get: { op }, set: { parameter = "\(leftValue)|\($0)|\(rightValue)" })) {
+                Text("包含").tag("contains")
+                Text("等于").tag("==")
+            }.frame(width: 80)
+            
+            TextField("对比值", text: Binding(get: { rightValue }, set: { parameter = "\(leftValue)|\(op)|\($0)" }))
+                .textFieldStyle(.roundedBorder)
+        }
+    }
+}
 
 // MARK: - [✨修复] 框选视图安全重构
 class RegionPickerView: NSView {
@@ -924,7 +1304,6 @@ class UIElementPicker {
         if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
         
         // 🚨 核心改动：必须使用 DispatchQueue.main.async 异步派发！
-        // 等待底层的 C 回调栈彻底 pop 出去后，再修改上层的 SwiftUI 状态并清理内存
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             self.pickCompletion?(app, role, title)
@@ -955,7 +1334,6 @@ class UIElementPicker {
         }
         
         var childrenRef: CFTypeRef?
-        // [✨修复] 将 as? 替换为 as!，消除编译器警告
         if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success {
             let children = childrenRef as! [AXUIElement]
             for child in children {
@@ -970,6 +1348,7 @@ class UIElementPicker {
         return ""
     }
 }
+
 /////////////////////////////////////////////////////////
 // MARK: - UI 元素拾取遮罩视图
 ////////////////////////////////////////////////////////
@@ -1009,5 +1388,87 @@ class UIElementOverlayView: NSView {
         let textRect = CGRect(x: targetRect.origin.x, y: targetRect.origin.y + targetRect.height + 5, width: size.width, height: size.height)
         
         (infoStr as NSString).draw(in: textRect, withAttributes: attrs)
+    }
+}
+
+// MARK: - [✨新增] 屏幕精准坐标拾取器
+class PointPickerView: NSView {
+    var completion: ((CGPoint) -> Void)?
+    
+    override func resetCursorRects() {
+        // 使用系统原生的十字瞄准星光标
+        addCursorRect(bounds, cursor: .crosshair)
+    }
+    
+    override func mouseDown(with event: NSEvent) {
+        // 获取全局的绝对物理坐标 (左上角原点，与 CGEvent 体系完美契合)
+        if let cgLoc = CGEvent(source: nil)?.location {
+            completion?(cgLoc)
+        } else {
+            completion?(.zero)
+        }
+    }
+    
+    override func draw(_ dirtyRect: NSRect) {
+        // 绘制微弱的全屏遮罩，暗示正在拾取
+        NSColor(white: 0, alpha: 0.15).set()
+        bounds.fill()
+    }
+}
+
+class ScreenPointPicker {
+    static let shared = ScreenPointPicker()
+    private var window: NSWindow?
+    private var eventMonitor: Any?
+    
+    @MainActor func pickPoint(completion: @escaping (CGPoint?) -> Void) {
+        if window != nil { return }
+        
+        // 暂时隐藏主窗口防遮挡
+        NSApp.windows.first(where: { $0.className.contains("AppKitWindow") })?.miniaturize(nil)
+        
+        var totalRect = CGRect.zero
+        for screen in NSScreen.screens {
+            totalRect = totalRect.union(screen.frame)
+        }
+        
+        let win = NSWindow(contentRect: totalRect, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        win.level = .screenSaver
+        win.backgroundColor = .clear
+        win.isOpaque = false
+        win.hasShadow = false
+        win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        
+        let view = PointPickerView()
+        
+        let cleanup = { [weak self] (point: CGPoint?) in
+            DispatchQueue.main.async {
+                if let monitor = self?.eventMonitor {
+                    NSEvent.removeMonitor(monitor)
+                    self?.eventMonitor = nil
+                }
+                self?.window?.close()
+                self?.window = nil
+                completion(point)
+                NSApp.windows.first(where: { $0.className.contains("AppKitWindow") })?.deminiaturize(nil)
+            }
+        }
+        
+        view.completion = { point in
+            cleanup(point)
+        }
+        
+        win.contentView = view
+        win.makeKeyAndOrderFront(nil)
+        self.window = win
+        
+        // 支持 ESC 退出
+        self.eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            if event.keyCode == 53 {
+                cleanup(nil)
+                return nil
+            }
+            return event
+        }
     }
 }

@@ -632,15 +632,114 @@ class WorkflowEngine {
         CGEvent(mouseEventSource: eventSource, mouseType: .leftMouseUp, mouseCursorPosition: end, mouseButton: .left)?.post(tap: .cghidEventTap)
     }
     
+    // MARK: - [✨重构] 拟人化平滑鼠标引擎
     func simulateMouseOperation(type: String, at point: CGPoint) async {
-        CGWarpMouseCursorPosition(point); if type == "move" { return }
-        try? await Task.sleep(for: .milliseconds(200)); let eventSource = CGEventSource(stateID: .hidSystemState)
-        var mdType: CGEventType = .leftMouseDown; var muType: CGEventType = .leftMouseUp; var button: CGMouseButton = .left; var clickState: Int64 = 1
-        if type == "rightClick" { mdType = .rightMouseDown; muType = .rightMouseUp; button = .right } else if type == "doubleClick" { clickState = 2 }
-        if let md = CGEvent(mouseEventSource: eventSource, mouseType: mdType, mouseCursorPosition: point, mouseButton: button), let mu = CGEvent(mouseEventSource: eventSource, mouseType: muType, mouseCursorPosition: point, mouseButton: button) {
-            md.setIntegerValueField(.mouseEventClickState, value: clickState); mu.setIntegerValueField(.mouseEventClickState, value: clickState)
-            md.post(tap: .cghidEventTap); try? await Task.sleep(for: .milliseconds(50)); mu.post(tap: .cghidEventTap)
-            if clickState == 2 { try? await Task.sleep(for: .milliseconds(80)); md.post(tap: .cghidEventTap); try? await Task.sleep(for: .milliseconds(50)); mu.post(tap: .cghidEventTap) }
+        let eventSource = CGEventSource(stateID: .hidSystemState)
+        let startPoint = CGEvent(source: nil)?.location ?? point
+        
+        // 1. 拟人化轨迹平滑移动 (利用 easeOutCubic 曲线)
+        let distance = hypot(point.x - startPoint.x, point.y - startPoint.y)
+        // 动态计算步数：距离越远，分的步数越多，上限 35 步
+        let steps = max(5, min(35, Int(distance / 20.0)))
+        
+        for i in 1...steps {
+            let progress = CGFloat(i) / CGFloat(steps)
+            let easeProgress = 1.0 - pow(1.0 - progress, 3) // easeOut
+            let currentPoint = CGPoint(
+                x: startPoint.x + (point.x - startPoint.x) * easeProgress,
+                y: startPoint.y + (point.y - startPoint.y) * easeProgress
+            )
+            CGEvent(mouseEventSource: eventSource, mouseType: .mouseMoved, mouseCursorPosition: currentPoint, mouseButton: .left)?.post(tap: .cghidEventTap)
+            // 每次微小移动停顿 5~8 毫秒，呈现极其丝滑顺畅的物理动画
+            try? await Task.sleep(nanoseconds: UInt64(Int.random(in: 5...8) * 1_000_000))
+        }
+        
+        // 确保最终坐标精准锁定
+        CGWarpMouseCursorPosition(point)
+        if type == "move" { return }
+        
+        // 给目标元素一个响应悬停态的时间
+        try? await Task.sleep(for: .milliseconds(50))
+        
+        var mdType: CGEventType = .leftMouseDown
+        var muType: CGEventType = .leftMouseUp
+        var button: CGMouseButton = .left
+        var clickState: Int64 = 1
+        
+        if type == "rightClick" { mdType = .rightMouseDown; muType = .rightMouseUp; button = .right }
+        else if type == "doubleClick" { clickState = 2 }
+        
+        if let md = CGEvent(mouseEventSource: eventSource, mouseType: mdType, mouseCursorPosition: point, mouseButton: button),
+           let mu = CGEvent(mouseEventSource: eventSource, mouseType: muType, mouseCursorPosition: point, mouseButton: button) {
+            
+            md.setIntegerValueField(.mouseEventClickState, value: clickState)
+            mu.setIntegerValueField(.mouseEventClickState, value: clickState)
+            
+            md.post(tap: .cghidEventTap)
+            try? await Task.sleep(for: .milliseconds(Int.random(in: 40...70))) // 模拟真实按压时长
+            mu.post(tap: .cghidEventTap)
+            
+            if clickState == 2 {
+                try? await Task.sleep(for: .milliseconds(80))
+                md.post(tap: .cghidEventTap)
+                try? await Task.sleep(for: .milliseconds(50))
+                mu.post(tap: .cghidEventTap)
+            }
+        }
+    }
+
+    // MARK: - [✨重构] 带有节拍器的键盘引擎
+    func simulateKeyboardInput(input: String, speedMode: String = "normal") async {
+        let eventSource = CGEventSource(stateID: .hidSystemState)
+        var i = input.startIndex
+        
+        while i < input.endIndex {
+            let remainder = String(input[i...])
+            
+            // 匹配组合宏 [CMD+A]
+            if let matchRange = remainder.range(of: #"^\[(?:CMD|SHIFT|OPT|CTRL|\+)+(?:[a-zA-Z0-9]|UP|DOWN|LEFT|RIGHT|ENTER|TAB|SPACE|ESC|DEL|BACKSPACE|HOME|END|F\d{1,2})\]"#, options: [.regularExpression, .caseInsensitive]) {
+                let comboStr = String(remainder[matchRange])
+                await executeHotkey(comboStr, source: eventSource)
+                i = input.index(i, offsetBy: comboStr.count)
+                try? await Task.sleep(for: .milliseconds(100)) // 宏触发完固定缓冲一下
+                continue
+            }
+            
+            // 匹配单键宏 [ENTER]
+            if let specialRange = remainder.range(of: #"^\[(ENTER|TAB|SPACE|ESC|UP|DOWN|LEFT|RIGHT|DEL|BACKSPACE|HOME|END|F\d{1,2})\]"#, options: [.regularExpression, .caseInsensitive]) {
+                let specialStr = String(remainder[specialRange])
+                if let key = checkSpecialKey(specialStr) {
+                    postKeyEvent(key: key, source: eventSource)
+                }
+                i = input.index(i, offsetBy: specialStr.count)
+                continue
+            }
+            
+            // 普通字符敲击
+            let char = input[i]
+            postCharacterEvent(char, source: eventSource)
+            
+            // 🌟 核心：动态随机延时调度
+            let delayMs: Int
+            switch speedMode {
+            case "fast":
+                delayMs = Int.random(in: 1...5)    // 极速灌入，几乎无延迟
+            case "human":
+                // 拟人模式：普通的键入速度偏慢，且 5% 概率模拟人类停顿思考
+                if Int.random(in: 1...100) > 95 {
+                    delayMs = Int.random(in: 300...600)
+                } else {
+                    delayMs = Int.random(in: 60...120)
+                }
+            default: // normal
+                delayMs = Int.random(in: 20...50)  // 机械平滑输入
+            }
+            
+            if delayMs > 0 {
+                try? await Task.sleep(for: .milliseconds(delayMs))
+            }
+            
+            i = input.index(after: i)
         }
     }
     
