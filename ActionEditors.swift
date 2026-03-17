@@ -337,7 +337,7 @@ struct OCRActionEditor: View {
     @State private var isPickingRegion = false
     
     var body: some View {
-        // 解析最多 12 个参数，兼容旧版本短参数
+        // [✨解析扩充到 14 个参数]
         let parts = action.parameter.components(separatedBy: "|")
         let targetText = parts.count > 0 ? parts[0] : action.parameter
         let legacyShouldClick = parts.count > 1 ? (parts[1] == "true") : true
@@ -353,21 +353,24 @@ struct OCRActionEditor: View {
         let fuzzyTolerance = parts.count > 10 ? parts[10] : "1"
         let enhanceContrast = parts.count > 11 ? (parts[11] == "true") : false
         
-        let updateParam = { (t: String, aType: String, r: String, app: String, mode: String, tm: String, idx: String, varName: String, scroll: Bool, fuzzy: String, enhance: Bool) in
-            // 维持第二位参数 boolean 状态以兼容旧版引擎的粗略判定
+        // [✨新增] 滚屏高级配置
+        let scrollDirection = parts.count > 12 ? parts[12] : "down"
+        let scrollAmount = parts.count > 13 ? parts[13] : "5"
+        
+        let updateParam = { (t: String, aType: String, r: String, app: String, mode: String, tm: String, idx: String, varName: String, scroll: Bool, fuzzy: String, enhance: Bool, sDir: String, sAmt: String) in
             let c = (aType != "none" && aType != "waitVanish" && aType != "read")
-            action.parameter = "\(t)|\(c ? "true" : "false")|\(r)|\(app)|\(aType)|\(mode)|\(tm)|\(idx)|\(varName)|\(scroll ? "true" : "false")|\(fuzzy)|\(enhance ? "true" : "false")"
+            action.parameter = "\(t)|\(c ? "true" : "false")|\(r)|\(app)|\(aType)|\(mode)|\(tm)|\(idx)|\(varName)|\(scroll ? "true" : "false")|\(fuzzy)|\(enhance ? "true" : "false")|\(sDir)|\(sAmt)"
         }
         
         VStack(alignment: .leading, spacing: 12) {
             
             // 1. 目标设定与匹配规则
             VStack(alignment: .leading, spacing: 8) {
-                TextField("要识别的目标文字 (支持正则)", text: Binding(get: { targetText }, set: { updateParam($0, actionType, regionStr, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast) }))
+                TextField("要识别的目标文字 (支持正则)", text: Binding(get: { targetText }, set: { updateParam($0, actionType, regionStr, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast, scrollDirection, scrollAmount) }))
                     .textFieldStyle(.roundedBorder)
                 
                 HStack {
-                    Picker("匹配模式:", selection: Binding(get: { matchMode }, set: { updateParam(targetText, actionType, regionStr, targetApp, $0, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast) })) {
+                    Picker("匹配模式:", selection: Binding(get: { matchMode }, set: { updateParam(targetText, actionType, regionStr, targetApp, $0, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast, scrollDirection, scrollAmount) })) {
                         Text("包含 (Contains)").tag("contains")
                         Text("精确等于 (Exact)").tag("exact")
                         Text("模糊纠错 (Fuzzy)").tag("fuzzy")
@@ -376,42 +379,45 @@ struct OCRActionEditor: View {
                     
                     if matchMode == "fuzzy" {
                         Text("容错字数:").font(.caption).foregroundColor(.orange)
-                        TextField("1", text: Binding(get: { fuzzyTolerance }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, $0, enhanceContrast) }))
+                        TextField("1", text: Binding(get: { fuzzyTolerance }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, $0, enhanceContrast, scrollDirection, scrollAmount) }))
                             .textFieldStyle(.roundedBorder).frame(width: 30)
                     }
                     
                     Spacer()
                     
                     Text("命中序号:").font(.caption)
-                    TextField("-1为智能", text: Binding(get: { targetIndex }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, timeout, $0, variableName, autoScroll, fuzzyTolerance, enhanceContrast) }))
+                    TextField("-1为智能", text: Binding(get: { targetIndex }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, timeout, $0, variableName, autoScroll, fuzzyTolerance, enhanceContrast, scrollDirection, scrollAmount) }))
                         .textFieldStyle(.roundedBorder).frame(width: 60)
-                        .help("0代表第1个匹配项，1代表第2个... -1代表交由特征图智能比对")
                 }
             }
             
             // 2. 目标 App 过滤器
             HStack {
                 Text("限定 App:").font(.caption).frame(width: 60, alignment: .leading)
-                TextField("留空为全屏智能扫描", text: Binding(get: { targetApp }, set: { updateParam(targetText, actionType, regionStr, $0, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast) }))
+                TextField("留空为全屏智能扫描", text: Binding(get: { targetApp }, set: { updateParam(targetText, actionType, regionStr, $0, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast, scrollDirection, scrollAmount) }))
                     .textFieldStyle(.roundedBorder)
                 
                 Menu {
+                    Button("🌐 内置开发者浏览器") {
+                        updateParam(targetText, actionType, regionStr, "InternalBrowser", matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast, scrollDirection, scrollAmount)
+                    }
+                    Divider()
+                    
                     let runningApps = NSWorkspace.shared.runningApplications
                         .filter { $0.activationPolicy == .regular }
                         .compactMap { $0.localizedName }.sorted()
                     ForEach(runningApps, id: \.self) { appName in
-                        Button(appName) { updateParam(targetText, actionType, regionStr, appName, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast) }
+                        Button(appName) { updateParam(targetText, actionType, regionStr, appName, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast, scrollDirection, scrollAmount) }
                     }
                 } label: { Image(systemName: "list.bullet.rectangle.portrait") }
                 .fixedSize()
-                .help("选择后将利用底层能力过滤其他遮挡窗口，仅识别该程序画面。")
             }
             
             Divider()
             
             // 3. 动作与变量设置区
             HStack {
-                Picker("命中后动作:", selection: Binding(get: { actionType }, set: { updateParam(targetText, $0, regionStr, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast) })) {
+                Picker("命中后动作:", selection: Binding(get: { actionType }, set: { updateParam(targetText, $0, regionStr, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast, scrollDirection, scrollAmount) })) {
                     Text("左键点击").tag("leftClick")
                     Text("双击").tag("doubleClick")
                     Text("右键点击").tag("rightClick")
@@ -425,16 +431,15 @@ struct OCRActionEditor: View {
                 Spacer()
                 
                 Text("最大等待:").font(.caption)
-                TextField("秒", text: Binding(get: { timeout }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, $0, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast) }))
+                TextField("秒", text: Binding(get: { timeout }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, $0, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast, scrollDirection, scrollAmount) }))
                     .textFieldStyle(.roundedBorder).frame(width: 40)
             }
             
-            // 如果选择提取文本，动态显示变量设置框
             if actionType == "read" {
                 HStack {
                     Image(systemName: "text.insert").foregroundColor(.orange)
                     Text("保存至变量:").font(.caption).foregroundColor(.secondary)
-                    TextField("例如: order_id", text: Binding(get: { variableName }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, timeout, targetIndex, $0, autoScroll, fuzzyTolerance, enhanceContrast) }))
+                    TextField("例如: order_id", text: Binding(get: { variableName }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, timeout, targetIndex, $0, autoScroll, fuzzyTolerance, enhanceContrast, scrollDirection, scrollAmount) }))
                         .textFieldStyle(.roundedBorder)
                 }
                 .padding(.vertical, 4)
@@ -445,28 +450,47 @@ struct OCRActionEditor: View {
             
             // 4. 空间与拾取区
             HStack {
-                TextField("视觉搜索区域 (X,Y,宽,高)", text: Binding(get: { regionStr }, set: { updateParam(targetText, actionType, $0, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast) }))
+                TextField("视觉搜索区域 (X,Y,宽,高)", text: Binding(get: { regionStr }, set: { updateParam(targetText, actionType, $0, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast, scrollDirection, scrollAmount) }))
                     .textFieldStyle(.roundedBorder)
                 Button(action: {
                     isPickingRegion = true
                     ScreenRegionPicker.shared.pickRegion { rect in
-                        if let r = rect { updateParam(targetText, actionType, "\(Int(r.minX)), \(Int(r.minY)), \(Int(r.width)), \(Int(r.height))", targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast) }
+                        if let r = rect { updateParam(targetText, actionType, "\(Int(r.minX)), \(Int(r.minY)), \(Int(r.width)), \(Int(r.height))", targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast, scrollDirection, scrollAmount) }
                         isPickingRegion = false
                     }
                 }) { Label("框选", systemImage: "viewfinder") }.buttonStyle(.bordered)
             }
             
-            OCRMiniDesktop(regionStr: Binding(get: { regionStr }, set: { updateParam(targetText, actionType, $0, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast) }), offsetX: $action.offsetX, offsetY: $action.offsetY)
+            OCRMiniDesktop(regionStr: Binding(get: { regionStr }, set: { updateParam(targetText, actionType, $0, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast, scrollDirection, scrollAmount) }), offsetX: $action.offsetX, offsetY: $action.offsetY)
             
-            // 5. 高级能力开关
-            HStack {
-                Toggle("未找到时自动滚屏", isOn: Binding(get: { autoScroll }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, timeout, targetIndex, variableName, $0, fuzzyTolerance, enhanceContrast) }))
-                    .toggleStyle(.switch).controlSize(.small)
+            // 5. 高级能力开关与细化面板
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Toggle("未找到时自动滚屏", isOn: Binding(get: { autoScroll }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, timeout, targetIndex, variableName, $0, fuzzyTolerance, enhanceContrast, scrollDirection, scrollAmount) }))
+                        .toggleStyle(.switch).controlSize(.small).tint(.blue)
+                    
+                    Spacer()
+                    
+                    Toggle("🌟 图像锐化增强", isOn: Binding(get: { enhanceContrast }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, $0, scrollDirection, scrollAmount) }))
+                        .toggleStyle(.switch).controlSize(.small).tint(.orange)
+                }
                 
-                Spacer()
-                
-                Toggle("🌟 图像锐化增强 (暗黑模式/低对比度)", isOn: Binding(get: { enhanceContrast }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, $0) }))
-                    .toggleStyle(.switch).controlSize(.small).tint(.orange)
+                // [✨新增] 滚屏配置下沉菜单 (仅在开启滚屏时显示，保持界面整洁)
+                if autoScroll {
+                    HStack(spacing: 10) {
+                        Image(systemName: "arrow.up.and.down").foregroundColor(.blue).font(.caption)
+                        Picker("方向:", selection: Binding(get: { scrollDirection }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast, $0, scrollAmount) })) {
+                            Text("向下 (Scroll Down)").tag("down")
+                            Text("向上 (Scroll Up)").tag("up")
+                        }.frame(width: 140)
+                        
+                        Text("单次幅度(行):").font(.caption)
+                        TextField("5", text: Binding(get: { scrollAmount }, set: { updateParam(targetText, actionType, regionStr, targetApp, matchMode, timeout, targetIndex, variableName, autoScroll, fuzzyTolerance, enhanceContrast, scrollDirection, $0) }))
+                            .textFieldStyle(.roundedBorder).frame(width: 40)
+                    }
+                    .padding(.leading, 4)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
             }
         }
     }

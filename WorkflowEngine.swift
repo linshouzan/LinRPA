@@ -472,9 +472,9 @@ class WorkflowEngine {
     }
     
     // [✨终极升级] 增加 fuzzy 模式与容错距离
-    func findTextOnScreen(text: String, sampleBase64: String, region: CGRect?, appName: String? = nil, matchMode: String = "contains", targetIndex: Int = -1, fuzzyTolerance: Int = 0, enhanceContrast: Bool = false) async -> (point: CGPoint, text: String)? {
+    func findTextOnScreen(text: String, sampleBase64: String, region: CGRect?, appName: String? = nil, windowTitle: String? = nil, matchMode: String = "contains", targetIndex: Int = -1, fuzzyTolerance: Int = 0, enhanceContrast: Bool = false) async -> (point: CGPoint, text: String)? {
             
-            guard let fullCGImage = try? await ScreenCaptureUtility.captureScreen(forAppName: appName) else { return nil }
+        guard let fullCGImage = try? await ScreenCaptureUtility.captureScreen(forAppName: appName, targetWindowTitle: windowTitle) else { return nil }
             
             let bounds = CGDisplayBounds(CGMainDisplayID())
             var targetCGImage = fullCGImage; var cropOffset = CGPoint.zero; var cropSize = bounds.size
@@ -591,10 +591,39 @@ class WorkflowEngine {
         }
     }
     
+    // [✨修复] 精准滚屏补偿与方向修正
     func simulateScroll(type: String, amount: Int) async {
-        let isUp = (type == "scrollUp" || type == "cmdScrollUp"); let wheel1Value = isUp ? Int32(amount) : Int32(-amount)
-        if let event = CGEvent(scrollWheelEvent2Source: CGEventSource(stateID: .hidSystemState), units: .line, wheelCount: 1, wheel1: wheel1Value, wheel2: 0, wheel3: 0) {
-            if type.hasPrefix("cmd") { event.flags = .maskCommand }; event.post(tap: .cghidEventTap)
+        // 1. 修正方向：
+        // macOS CGEvent 底层逻辑：正数(+)向上滚，负数(-)向下滚
+        let directionMultiplier: Int32 = (type == "scrollDown") ? -1 : 1
+        
+        // 2. 修正幅度：
+        // 弃用微弱的 .line 单位，改用 .pixel。
+        // 设定 1 逻辑行 ≈ 40 像素，这样用户输入 5 行，实际滚动 200 像素，幅度肉眼可见且精确。
+        let pixelsPerLine: Int32 = 40
+        let totalPixels = Int32(amount) * pixelsPerLine * directionMultiplier
+        
+        // 3. 拟人化平滑滚动：
+        // 如果一瞬间把几百像素滚完，很多网页的 Vue/React 懒加载监听器会反应不过来。
+        // 我们将其切分为 5 步平滑发出，模拟人类手指滑动触控板的物理惯性。
+        let steps: Int32 = 5
+        let stepPixels = totalPixels / steps
+        
+        guard let source = CGEventSource(stateID: .hidSystemState) else { return }
+        
+        for _ in 0..<steps {
+            if let scrollEvent = CGEvent(
+                scrollWheelEvent2Source: source,
+                units: .pixel, // 🌟 核心：强制使用 pixel 替代 line，解决滚动幅度太小的问题
+                wheelCount: 1,
+                wheel1: stepPixels,
+                wheel2: 0,
+                wheel3: 0
+            ) {
+                scrollEvent.post(tap: .cghidEventTap)
+            }
+            // 每次滚动间隔 15 毫秒，呈现丝滑的滚动动画
+            try? await Task.sleep(nanoseconds: 15_000_000)
         }
     }
     

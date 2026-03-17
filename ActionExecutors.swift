@@ -191,12 +191,12 @@ struct HTTPRequestExecutor: RPAActionExecutor {
     }
 }
 
+// 替换 ActionExecutors.swift 中的 OCRTextExecutor
 struct OCRTextExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         let parsedParam = context.parseVariables(action.parameter)
         let parts = parsedParam.components(separatedBy: "|")
         
-        // 解析全部 12 个参数
         let targetText = parts.count > 0 ? parts[0] : parsedParam
         let regionStr = parts.count > 2 ? parts[2] : ""
         let targetApp = parts.count > 3 ? parts[3] : ""
@@ -210,6 +210,10 @@ struct OCRTextExecutor: RPAActionExecutor {
         let fuzzyTolerance = Int(parts.count > 10 ? parts[10] : "1") ?? 1
         let enhanceContrast = parts.count > 11 ? (parts[11] == "true") : false
         
+        // [✨解析滚屏新参数]
+        let scrollDirection = parts.count > 12 ? parts[12] : "down"
+        let scrollAmount = Int(parts.count > 13 ? parts[13] : "5") ?? 5
+        
         var regionRect: CGRect? = nil
         if !regionStr.isEmpty {
             let coords = regionStr.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
@@ -217,11 +221,13 @@ struct OCRTextExecutor: RPAActionExecutor {
         }
         
         let modeDesc = matchMode == "fuzzy" ? "容错:\(fuzzyTolerance)" : matchMode
-        context.log("📸 OCR 寻找 [\((targetApp.isEmpty ? "全屏" : targetApp))]: '\(targetText)' (模式:\(modeDesc), 操作:\(actionType), 滚屏:\(autoScroll ? "开" : "关"), 图像增强:\(enhanceContrast ? "开" : "关"))")
+        context.log("📸 OCR 寻找 [\((targetApp.isEmpty ? "全屏" : targetApp))]: '\(targetText)' (模式:\(modeDesc), 滚屏:\(autoScroll ? scrollDirection : "关"))")
         
-        // 如果指定了应用且不是被动等待，尝试将其唤起至前台
         if !targetApp.isEmpty && actionType != "none" && actionType != "waitVanish" {
-            if let app = NSWorkspace.shared.runningApplications.first(where: { $0.localizedName == targetApp }) {
+            if targetApp == "InternalBrowser" {
+                await MainActor.run { BrowserWindowController.showSharedWindow() }
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            } else if let app = NSWorkspace.shared.runningApplications.first(where: { $0.localizedName == targetApp }) {
                 app.activate(options: .activateIgnoringOtherApps)
                 try? await Task.sleep(nanoseconds: 300_000_000)
             }
@@ -230,38 +236,45 @@ struct OCRTextExecutor: RPAActionExecutor {
         let startTime = Date()
         var attemptCount = 0
         
-        // ---------------------------------------------------------
-        // 特殊分支：等待元素消失
-        // ---------------------------------------------------------
+        let actualAppName = (targetApp == "InternalBrowser") ? ProcessInfo.processInfo.processName : (targetApp.isEmpty ? nil : targetApp)
+        let actualWindowTitle = (targetApp == "InternalBrowser") ? "开发者浏览器" : nil
+        
+        let executeSearch = { () async -> (CGPoint, String)? in
+            return await context.findTextOnScreen(
+                text: targetText,
+                sampleBase64: action.sampleImageBase64,
+                region: regionRect,
+                appName: actualAppName,
+                windowTitle: actualWindowTitle,
+                matchMode: matchMode,
+                targetIndex: targetIndex,
+                fuzzyTolerance: fuzzyTolerance,
+                enhanceContrast: enhanceContrast
+            )
+        }
+        
         if actionType == "waitVanish" {
             while Date().timeIntervalSince(startTime) < timeout && context.isRunning {
                 attemptCount += 1
-                let result = await context.findTextOnScreen(text: targetText, sampleBase64: action.sampleImageBase64, region: regionRect, appName: targetApp.isEmpty ? nil : targetApp, matchMode: matchMode, targetIndex: targetIndex, fuzzyTolerance: fuzzyTolerance, enhanceContrast: enhanceContrast)
-                
+                let result = await executeSearch()
                 if result == nil {
                     context.log("✅ 成功：第 \(attemptCount) 次轮询确认目标文字已从屏幕消失。")
                     return .success
                 }
-                // 等待 0.5s 后再次验证
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
             context.log("❌ 超时 (\(timeout)s)，目标文字依然存在。")
             return .failure
         }
         
-        // ---------------------------------------------------------
-        // 正常分支：寻找元素并交互/读取 (包含自动滚屏逻辑)
-        // ---------------------------------------------------------
         while Date().timeIntervalSince(startTime) < timeout && context.isRunning {
             attemptCount += 1
-            
-            if let result = await context.findTextOnScreen(text: targetText, sampleBase64: action.sampleImageBase64, region: regionRect, appName: targetApp.isEmpty ? nil : targetApp, matchMode: matchMode, targetIndex: targetIndex, fuzzyTolerance: fuzzyTolerance, enhanceContrast: enhanceContrast) {
-                
-                let finalPoint = CGPoint(x: result.point.x + action.offsetX, y: result.point.y + action.offsetY)
+            if let result = await executeSearch() {
+                let finalPoint = CGPoint(x: result.0.x + action.offsetX, y: result.0.y + action.offsetY)
                 
                 if actionType == "read" {
-                    context.variables[variableName] = result.text
-                    context.log("📖 第 \(attemptCount) 次寻找成功，提取文字存入 {{\(variableName)}}: \(result.text)")
+                    context.variables[variableName] = result.1
+                    context.log("📖 第 \(attemptCount) 次寻找成功，提取文字存入 {{\(variableName)}}: \(result.1)")
                 } else if actionType != "none" {
                     context.log("🎯 第 \(attemptCount) 次寻找成功，落点: (\(Int(finalPoint.x)), \(Int(finalPoint.y)))，执行 \(actionType)")
                     await context.simulateMouseOperation(type: actionType, at: finalPoint)
@@ -271,14 +284,27 @@ struct OCRTextExecutor: RPAActionExecutor {
                 return .success
             }
             
-            // 未找到的情况：判断是否启用智能滚屏
+            // [✨终极优化] 智能定点滚屏
             if autoScroll {
-                context.log("⏬ 未发现文字，尝试向下滚动屏幕寻找...")
-                await context.simulateScroll(type: "scrollDown", amount: 5)
-                // 滚动后多等待一点时间，让 UI 动画平滑停止、文字渲染完毕
+                let dirText = scrollDirection == "up" ? "向上" : "向下"
+                context.log("⏬ 未发现文字，准备\(dirText)滚动 (幅度:\(scrollAmount))...")
+                
+                // 1. 智能寻址：如果配置了搜索区域，先将鼠标悄悄移到区域中心，确保滚动的是该子容器！
+                if let rect = regionRect {
+                    let centerX = rect.origin.x + rect.size.width / 2.0
+                    let centerY = rect.origin.y + rect.size.height / 2.0
+                    let moveEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: CGPoint(x: centerX, y: centerY), mouseButton: .left)
+                    moveEvent?.post(tap: .cghidEventTap)
+                    try? await Task.sleep(nanoseconds: 100_000_000) // 极短延时让前端响应 hover 状态
+                }
+                
+                // 2. 触发系统级物理滚动
+                let mappedType = scrollDirection == "up" ? "scrollUp" : "scrollDown"
+                await context.simulateScroll(type: mappedType, amount: scrollAmount)
+                
+                // 3. 动画补偿：等待UI停止滚动且文字渲染清晰
                 try? await Task.sleep(nanoseconds: 800_000_000)
             } else {
-                // 原地轮询，等待 0.5 秒
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
         }
@@ -552,7 +578,7 @@ struct WebAgentExecutor: RPAActionExecutor {
         await context.activateBrowser(params.browser)
         
         await MainActor.run {
-            AgentMonitorManager.shared.showWindow()
+            AgentMonitorManager.shared.showWindow(isAutoTrigger: true)
             AgentMonitorManager.shared.resetForNewTask()
         }
         

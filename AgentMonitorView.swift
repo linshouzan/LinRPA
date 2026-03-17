@@ -22,10 +22,15 @@ class AgentMonitorManager: ObservableObject {
     
     @Published var isProcessing: Bool = false
     
+    @AppStorage("autoShowAgentMonitor") var autoShowAgentMonitor: Bool = false
+    
     private var window: NSWindow?
     
     @MainActor
-    func showWindow() {
+    func showWindow(isAutoTrigger: Bool = false) {
+        if isAutoTrigger && !autoShowAgentMonitor {
+            return
+        }
         if window == nil {
             let view = AgentMonitorView()
             let newWin = NSWindow(
@@ -35,7 +40,7 @@ class AgentMonitorManager: ObservableObject {
                 defer: false
             )
             newWin.title = "🤖 WebAgent 感知与决策监控"
-            newWin.level = .floating
+            newWin.level = .normal
             newWin.isReleasedWhenClosed = false
             newWin.contentView = NSHostingView(rootView: view)
             newWin.center()
@@ -61,106 +66,144 @@ struct AgentMonitorView: View {
     
     var body: some View {
         VStack(spacing: 0) {
-            // 顶部：Agent 视觉区
-            ZStack {
-                Color.black.opacity(0.8)
-                if let img = monitor.currentVision {
-                    Image(nsImage: img)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .padding(8)
-                } else {
-                    VStack {
-                        Image(systemName: "eye.slash.fill").font(.largeTitle).foregroundColor(.gray)
-                        Text("等待 Agent 获取视野...").foregroundColor(.gray).padding(.top, 4)
-                    }
-                }
+            // ==========================================
+            // 顶部状态与控制栏
+            // ==========================================
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(monitor.isProcessing ? Color.green : Color.gray)
+                    .frame(width: 8, height: 8)
                 
-                if monitor.isProcessing {
-                    VStack {
-                        Spacer()
-                        ProgressView().progressViewStyle(CircularProgressViewStyle(tint: .red)).scaleEffect(1.5)
-                        Spacer()
-                    }
-                }
+                Text(monitor.isProcessing ? "Agent 正在思考与执行..." : "Agent 待命中")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(monitor.isProcessing ? .green : .gray)
+                
+                Spacer()
+                
+                // 自动弹出开关，方便用户随时调整
+                Toggle("运行时自动弹出窗口", isOn: $monitor.autoShowAgentMonitor)
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .font(.system(size: 11))
+                    .tint(.blue)
             }
-            .frame(minHeight: 250, maxHeight: 400)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color(NSColor.windowBackgroundColor))
             
-            Divider().background(Color.gray)
+            Divider()
             
-            // 底部：内部状态分析区
+            // ==========================================
+            // 核心布局：左右分栏结构 (HSplitView 支持自由拖拽)
+            // ==========================================
             HSplitView {
-                // 左侧：DOM 结构缓存
-                VStack(alignment: .leading) {
-                    Text("📦 提取的深度DOM树 (SoM)")
-                        .font(.caption).bold().foregroundColor(.cyan)
-                        .padding([.top, .leading], 8)
+                
+                // ------------------------------------------
+                // 左侧面板：视觉画面与大脑思考
+                // ------------------------------------------
+                VStack(spacing: 0) {
+                    if let img = monitor.currentVision {
+                        Image(nsImage: img)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxHeight: 160) // 限制最大高度，避免占据太多垂直空间
+                            .background(Color.black.opacity(0.3))
+                            .clipped()
+                    }
+                    
+                    Divider()
                     
                     ScrollView {
-                        Text(monitor.domSummary.isEmpty ? "暂无数据" : monitor.domSummary)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundColor(.green)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(8)
+                        VStack(alignment: .leading, spacing: 12) {
+                            if !monitor.llmThought.isEmpty {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("🧠 决策思考")
+                                        .font(.system(size: 11, weight: .bold))
+                                        .foregroundColor(.cyan)
+                                    Text(monitor.llmThought)
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            
+                            if !monitor.domSummary.isEmpty {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("📄 DOM 摘要 (精简)")
+                                        .font(.system(size: 11, weight: .bold))
+                                        .foregroundColor(.orange)
+                                    Text(monitor.domSummary)
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(5) // 限制行数，避免太长导致滚动灾难
+                                }
+                            }
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
-                .frame(minWidth: 200)
+                .frame(minWidth: 200, idealWidth: 260)
                 
-                // 右侧：大模型思维链与底层执行日志
-                VStack(alignment: .leading) {
-                    Text("🧠 AI 决策与底层执行日志")
-                        .font(.caption).bold().foregroundColor(.purple)
-                        .padding([.top, .leading], 8)
-                    
-                    ScrollViewReader { proxy in
+                // ------------------------------------------
+                // 右侧面板：执行计划与实时日志
+                // ------------------------------------------
+                VStack(spacing: 0) {
+                    // 1. 计划区
+                    if !monitor.plannedSteps.isEmpty {
                         ScrollView {
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text(monitor.llmThought.isEmpty ? "等待流式推理..." : monitor.llmThought)
-                                    .font(.system(size: 12))
-                                    .foregroundColor(.primary)
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("📋 当前执行计划")
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundColor(.green)
                                 
-                                if !monitor.plannedSteps.isEmpty {
-                                    Divider()
-                                    Text("⚡️ 动作队列序列:")
-                                        .font(.system(size: 11, weight: .bold)).foregroundColor(.orange)
-                                    ForEach(monitor.plannedSteps, id: \.self) { step in
-                                        Text(step)
-                                            .font(.system(size: 11, design: .monospaced))
-                                            .foregroundColor(.white)
-                                            .padding(.vertical, 2).padding(.horizontal, 6)
-                                            .background(Color.blue.opacity(0.3)).cornerRadius(4)
-                                    }
-                                }
-                                
-                                // [✨新增] 底层 JS 脚本与返回结果监控区
-                                if !monitor.actionExecutionLogs.isEmpty {
-                                    Divider()
-                                    Text("🛠️ 底层 JS 注入与执行反馈:")
-                                        .font(.system(size: 11, weight: .bold)).foregroundColor(.pink)
-                                    
-                                    ForEach(monitor.actionExecutionLogs.indices, id: \.self) { index in
-                                        Text(monitor.actionExecutionLogs[index])
-                                            .font(.system(size: 10, design: .monospaced))
+                                ForEach(monitor.plannedSteps.indices, id: \.self) { idx in
+                                    HStack(alignment: .top, spacing: 4) {
+                                        Text("\(idx+1).")
+                                            .font(.system(size: 10, weight: .bold))
                                             .foregroundColor(.gray)
-                                            .padding(6)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                            .background(Color.black.opacity(0.3))
-                                            .cornerRadius(6)
-                                            .id("log_\(index)") // 锚点用于滚动
+                                        Text(monitor.plannedSteps[idx])
+                                            .font(.system(size: 10))
                                     }
                                 }
                             }
-                            .padding(8)
+                            .padding(10)
                         }
+                        .frame(maxHeight: 130) // 限制计划区域高度
+                        
+                        Divider()
+                    }
+                    
+                    // 2. 日志区
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("⚡️ 动作执行日志")
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundColor(.pink)
+                                
+                                ForEach(monitor.actionExecutionLogs.indices, id: \.self) { index in
+                                    Text(monitor.actionExecutionLogs[index])
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .foregroundColor(Color.gray.opacity(0.9))
+                                        .padding(.vertical, 4)
+                                        .padding(.horizontal, 6)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .background(Color.black.opacity(0.2))
+                                        .cornerRadius(4)
+                                        .id("log_\(index)")
+                                }
+                            }
+                            .padding(10)
+                        }
+                        .background(Color(NSColor.controlBackgroundColor))
                         .onChange(of: monitor.actionExecutionLogs.count) { _, newCount in
-                            // 当有新日志写入时，自动滚动到最底部
                             if newCount > 0 {
                                 withAnimation { proxy.scrollTo("log_\(newCount - 1)", anchor: .bottom) }
                             }
                         }
                     }
                 }
-                .frame(minWidth: 250)
+                .frame(minWidth: 250, idealWidth: 390)
             }
         }
         .background(Color(NSColor.windowBackgroundColor))
