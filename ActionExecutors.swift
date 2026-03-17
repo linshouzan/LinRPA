@@ -9,6 +9,47 @@ import Foundation
 import AppKit
 import Vision
 
+// MARK: - [稳定性基建] 节点智能重试装饰器机制
+extension RPAActionExecutor {
+    /// 带有自动重试机制的执行包装器
+    /// - Parameters:
+    ///   - action: 当前执行的动作
+    ///   - context: 引擎上下文
+    ///   - maxRetries: 最大重试次数 (默认 3 次)
+    ///   - baseDelay: 基础延迟秒数 (每次重试时间会递增)
+    /// - Returns: 最终的执行状态
+    func executeWithRetry(action: RPAAction, context: WorkflowEngine, maxRetries: Int = 3, baseDelay: Double = 2.0) async -> ConnectionCondition {
+        var attempt = 1
+        
+        while attempt <= maxRetries {
+            // 真正调用节点本身的 execute
+            let result = await self.execute(action: action, context: context)
+            
+            if result == .success || result == .always {
+                if attempt > 1 {
+                    context.log("⚠️ 第 \\(attempt) 次重试成功。")
+                }
+                return result
+            }
+            
+            if attempt < maxRetries {
+                // 指数退避等待 (2s, 4s, 8s...)
+                let delay = baseDelay * pow(2.0, Double(attempt - 1))
+                context.log("⏳ 节点执行失败，准备第 \\(attempt + 1) 次重试 (等待 \\(String(format: \"%.1f\", delay)) 秒)...")
+                
+                // 异步休眠，不阻塞主线程
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                attempt += 1
+            } else {
+                context.log("❌ 节点已达到最大重试次数 (\\(maxRetries)次)，宣告失败。")
+                break
+            }
+        }
+        
+        return .failure
+    }
+}
+
 // MARK: - 执行器基础协议
 /// 定义了所有 RPA 组件执行器必须遵循的基础协议
 protocol RPAActionExecutor {
@@ -34,6 +75,7 @@ struct ActionExecutorFactory {
         case .openURL:          return OpenURLExecutor()
         case .typeText:         return TypeTextExecutor()
         case .wait:             return WaitExecutor()
+        case .askUserInput:     return AskUserInputExecutor()
         case .condition:        return ConditionExecutor()
         case .showNotification: return ShowNotificationExecutor()
         case .ocrText:          return OCRTextExecutor()
@@ -43,6 +85,13 @@ struct ActionExecutorFactory {
         case .runShell:         return RunShellExecutor()
         case .runAppleScript:   return RunAppleScriptExecutor()
         case .callWorkflow:     return CallWorkflowExecutor()
+        case .fileOperation:    return FileOperationExecutor()
+        case .dataExtraction:   return DataExtractionExecutor()
+        case .windowOperation:  return WindowOperationExecutor()
+        case .loopItems:        return LoopItemsExecutor()
+        case .ocrExtract:       return OCRExtractExecutor()
+        case .aiVisionLocator:  return AIVisionLocatorExecutor()
+        case .aiDataParse:      return AITextParseExecutor()
         }
     }
 }
@@ -421,49 +470,6 @@ struct OCRTextExecutor: RPAActionExecutor {
     }
 }
 
-// MARK: - 鼠标操作执行器
-/// 处理点击、移动、双击、滚轮、拖拽等原生物理光标输入
-struct MouseOperationExecutor: RPAActionExecutor {
-    func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
-        let parsedParam = context.parseVariables(action.parameter)
-        let parts = parsedParam.components(separatedBy: "|")
-        let type = parts.count > 0 ? parts[0] : "leftClick"
-        let val1 = parts.count > 1 ? parts[1] : parsedParam
-        let val2 = parts.count > 2 ? parts[2] : "0, 0"
-        let isRelative = parts.count > 3 ? (parts[3] == "true") : false
-        let currentLoc = CGEvent(source: nil)?.location ?? .zero
-        
-        if type == "drag" {
-            let startCoords = val1.split(separator: ",")
-            let endCoords = val2.split(separator: ",")
-            
-            if startCoords.count == 2, endCoords.count == 2,
-               let sx = Double(startCoords[0].trimmingCharacters(in: .whitespaces)),
-               let sy = Double(startCoords[1].trimmingCharacters(in: .whitespaces)),
-               let ex = Double(endCoords[0].trimmingCharacters(in: .whitespaces)),
-               let ey = Double(endCoords[1].trimmingCharacters(in: .whitespaces)) {
-                let startPoint = isRelative ? CGPoint(x: currentLoc.x + sx, y: currentLoc.y + sy) : CGPoint(x: sx, y: sy)
-                let endPoint = isRelative ? CGPoint(x: startPoint.x + ex, y: startPoint.y + ey) : CGPoint(x: ex, y: ey)
-                await context.simulateDrag(from: startPoint, to: endPoint)
-            } else {
-                return .failure
-            }
-        } else if ["leftClick", "rightClick", "doubleClick", "move"].contains(type) {
-            let coords = val1.split(separator: ",")
-            if coords.count == 2, let x = Double(coords[0].trimmingCharacters(in: .whitespaces)), let y = Double(coords[1].trimmingCharacters(in: .whitespaces)) {
-                let targetPoint = isRelative ? CGPoint(x: currentLoc.x + x, y: currentLoc.y + y) : CGPoint(x: x, y: y)
-                await context.simulateMouseOperation(type: type, at: targetPoint)
-            } else {
-                return .failure
-            }
-        } else if type.lowercased().contains("scroll") {
-            let amount = Int(val1.trimmingCharacters(in: .whitespaces)) ?? 1
-            await context.simulateScroll(type: type, amount: amount)
-        }
-        return .always
-    }
-}
-
 // MARK: - 打开应用程序执行器
 /// 负责应用的启动，支持新实例多开与静默唤起
 struct OpenAppExecutor: RPAActionExecutor {
@@ -639,6 +645,79 @@ struct OpenURLExecutor: RPAActionExecutor {
     }
 }
 
+// MARK: - 鼠标操作执行器
+/// 处理点击、移动、双击、滚轮、拖拽等原生物理光标输入
+struct MouseOperationExecutor: RPAActionExecutor {
+    func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
+        let parsedParam = context.parseVariables(action.parameter)
+        let parts = parsedParam.components(separatedBy: "|")
+        let type = parts.count > 0 ? parts[0] : "leftClick"
+        let val1 = parts.count > 1 ? parts[1] : parsedParam
+        let val2 = parts.count > 2 ? parts[2] : "0, 0"
+        let isRelative = parts.count > 3 ? (parts[3] == "true") : false
+        
+        // [✨核心防呆] 拦截占位符，如果没填应用名，则当作绝对坐标处理
+        let rawTargetApp = parts.count > 4 ? parts[4] : ""
+        let targetApp = rawTargetApp == "__WAIT_INPUT__" ? "" : rawTargetApp
+        
+        let currentLoc = CGEvent(source: nil)?.location ?? .zero
+        
+        var appOriginOffset = CGPoint.zero
+        if !targetApp.isEmpty {
+            let options = CGWindowListOption(arrayLiteral: .excludeDesktopElements, .optionOnScreenOnly)
+            if let windowListInfo = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] {
+                for info in windowListInfo {
+                    if let ownerName = info[kCGWindowOwnerName as String] as? String, ownerName == targetApp {
+                        if let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+                           let bounds = CGRect(dictionaryRepresentation: boundsDict) {
+                            
+                            appOriginOffset = bounds.origin
+                            context.log("🪟 动态锁定 [\(targetApp)] 窗口坐标: (\(Int(appOriginOffset.x)), \(Int(appOriginOffset.y)))")
+                            break
+                        }
+                    }
+                }
+            }
+            if appOriginOffset == .zero {
+                context.log("⚠️ 未在屏幕上检测到 [\(targetApp)] 的活动窗口，降级为全屏绝对坐标...")
+            }
+        }
+        
+        if type == "drag" {
+            let startCoords = val1.split(separator: ",")
+            let endCoords = val2.split(separator: ",")
+            
+            if startCoords.count == 2, endCoords.count == 2,
+               let sx = Double(startCoords[0].trimmingCharacters(in: .whitespaces)),
+               let sy = Double(startCoords[1].trimmingCharacters(in: .whitespaces)),
+               let ex = Double(endCoords[0].trimmingCharacters(in: .whitespaces)),
+               let ey = Double(endCoords[1].trimmingCharacters(in: .whitespaces)) {
+                
+                let startPoint = isRelative ? CGPoint(x: currentLoc.x + sx, y: currentLoc.y + sy) : CGPoint(x: sx + appOriginOffset.x, y: sy + appOriginOffset.y)
+                let endPoint = isRelative ? CGPoint(x: startPoint.x + ex, y: startPoint.y + ey) : CGPoint(x: ex + appOriginOffset.x, y: ey + appOriginOffset.y)
+                await context.simulateDrag(from: startPoint, to: endPoint)
+            } else {
+                return .failure
+            }
+        } else if ["leftClick", "rightClick", "doubleClick", "move"].contains(type) {
+            let coords = val1.split(separator: ",")
+            if coords.count == 2, let x = Double(coords[0].trimmingCharacters(in: .whitespaces)), let y = Double(coords[1].trimmingCharacters(in: .whitespaces)) {
+                
+                // [✨坐标换算] 根据模式：(相对鼠标 / 应用相对偏移 / 绝对坐标)
+                let targetPoint = isRelative ? CGPoint(x: currentLoc.x + x, y: currentLoc.y + y) : CGPoint(x: x + appOriginOffset.x, y: y + appOriginOffset.y)
+                
+                await context.simulateMouseOperation(type: type, at: targetPoint)
+            } else {
+                return .failure
+            }
+        } else if type.lowercased().contains("scroll") {
+            let amount = Int(val1.trimmingCharacters(in: .whitespaces)) ?? 1
+            await context.simulateScroll(type: type, amount: amount)
+        }
+        return .always
+    }
+}
+
 // MARK: - 键盘输入执行器
 /// 负责模拟人类打字以及全局键盘组合键的发送
 struct TypeTextExecutor: RPAActionExecutor {
@@ -660,6 +739,77 @@ struct WaitExecutor: RPAActionExecutor {
         let sec = Double(context.parseVariables(action.parameter)) ?? 1.0
         try? await Task.sleep(for: .seconds(sec))
         return .always
+    }
+}
+
+// MARK: - 人机协同：人工介入执行器
+/// 挂起当前协程，切回主线程弹出 macOS 原生 Alert 拦截用户，拿到结果后恢复执行
+struct AskUserInputExecutor: RPAActionExecutor {
+    func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
+        let parts = context.parseVariables(action.parameter).components(separatedBy: "|")
+        let promptText = parts.count > 0 ? parts[0] : "需要人工干预"
+        let dialogType = parts.count > 1 ? parts[1] : "input"
+        let targetVar = parts.count > 3 ? parts[3] : "user_input"
+        
+        context.log("🙋‍♂️ 流程暂停，等待人工介入：\\(promptText)")
+        
+        // 播放系统提示音，提醒用户回到电脑前
+        NSSound(named: "Glass")?.play()
+        
+        // 使用 Continuation 将异步任务挂起，等待基于回调的 UI 弹窗结果
+        let userResult: (success: Bool, value: String) = await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = "RPA 需要您的协助"
+                alert.informativeText = promptText
+                alert.alertStyle = .warning
+                
+                // 确保弹窗无论如何都在最前沿
+                NSApp.activate(ignoringOtherApps: true)
+                
+                var inputTextField: NSTextField?
+                
+                if dialogType == "input" {
+                    alert.addButton(withTitle: "提交")
+                    alert.addButton(withTitle: "取消中断")
+                    
+                    let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 250, height: 24))
+                    textField.placeholderString = "请在此输入..."
+                    alert.accessoryView = textField
+                    inputTextField = textField
+                    
+                    // 自动获得焦点
+                    alert.window.initialFirstResponder = textField
+                } else {
+                    alert.addButton(withTitle: "确认继续")
+                    alert.addButton(withTitle: "取消并停止")
+                }
+                
+                let response = alert.runModal()
+                
+                if response == .alertFirstButtonReturn {
+                    // 用户点击了 提交/确认
+                    let val = inputTextField?.stringValue ?? "true"
+                    continuation.resume(returning: (true, val))
+                } else {
+                    // 用户点击了 取消
+                    continuation.resume(returning: (false, ""))
+                }
+            }
+        }
+        
+        if userResult.success {
+            if dialogType == "input" {
+                context.variables[targetVar] = userResult.value
+                context.log("✅ 用户输入完毕，值已存入 {{\\(targetVar)}}，流程继续。")
+            } else {
+                context.log("✅ 用户已确认，流程继续。")
+            }
+            return .success
+        } else {
+            context.log("❌ 用户取消了人工介入或拒绝了操作，流程将走向失败分支。")
+            return .failure
+        }
     }
 }
 
@@ -687,63 +837,94 @@ struct ConditionExecutor: RPAActionExecutor {
     }
 }
 
-// MARK: - 系统消息弹窗执行器
-/// 提供后台静默横幅，或者前端阻断式的交互提醒窗口
+// MARK: - 系统消息提醒执行器 (重构优化版)
+/// 负责发送 macOS 原生系统通知，支持【横幅通知】与【原生强制弹窗】两种模式
 struct ShowNotificationExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         let parsedParam = context.parseVariables(action.parameter)
         let parts = parsedParam.components(separatedBy: "|")
         
-        let isOldFormat = parts.count == 1 && !action.parameter.contains("|")
+        // 严格按照新版规范解构参数
+        let rawTitle = parts.count > 0 ? parts[0].trimmingCharacters(in: .whitespacesAndNewlines) : ""
+        let title = rawTitle.isEmpty ? "LinRPA 机器人通知" : rawTitle
         
-        let title = isOldFormat ? "RPA 提醒" : (parts.count > 0 ? parts[0] : "RPA 提醒")
-        let body = isOldFormat ? parsedParam : (parts.count > 1 ? parts[1] : "")
-        let notifyType = parts.count > 2 ? parts[2] : "banner"
+        let rawMessage = parts.count > 1 ? parts[1] : ""
+        let mode = parts.count > 2 && !parts[2].isEmpty ? parts[2].trimmingCharacters(in: .whitespacesAndNewlines).lowercased() : "banner"
         let playSound = parts.count > 3 ? (parts[3] == "true") : true
         
-        // [✨核心优化] 防注入与多行换行符处理
-        let safeTitle = title.replacingOccurrences(of: "\"", with: "\\\"")
+        // 1. 智能格式化与美化 (支持 JSON 漂亮打印，方便开发者直接在通知里打印 API 返回值)
+        let formattedMessage = formatToReadableText(rawMessage)
         
-        // 对于 AppleScript，如果直接注入 \n 会导致脚本多行截断报错。
-        let safeBodyForAppleScript = body
-            .replacingOccurrences(of: "\"", with: "\\\"")
-            .replacingOccurrences(of: "\n", with: "\" & return & \"")
-        
-        if notifyType == "alert" {
+        if mode == "dialog" {
+            // 🌟 【原生强制弹窗模式】直接调用 AppKit 原生 NSAlert，100% 居中阻塞弹窗
             await MainActor.run {
-                NSApp.activate(ignoringOtherApps: true)
+                if playSound {
+                    // 弹窗模式下触发清脆的系统提示音 (修复：使用字符串字面量调用 macOS 经典系统音效)
+                    NSSound(named: "Glass")?.play()
+                }
+                
                 let alert = NSAlert()
                 alert.messageText = title
-                alert.informativeText = body // NSAlert 原生支持 \n 换行，无需特殊处理
+                
+                // 弹窗模式可以容纳更多字符
+                let maxLength = 2000
+                alert.informativeText = formattedMessage.count > maxLength
+                    ? String(formattedMessage.prefix(maxLength)) + "\n...(内容过长已截断)"
+                    : formattedMessage
+                
                 alert.alertStyle = .informational
                 alert.addButton(withTitle: "确定")
                 
-                if playSound { NSSound.beep() }
+                // 强制将 RPA App 提至最前，确保弹窗绝对可见，不被遮挡
+                NSApp.activate(ignoringOtherApps: true)
+                
+                // 阻塞式运行弹窗，直到用户点击
                 alert.runModal()
             }
-            context.log("💬 [弹窗确认] 用户已阅: \(title)")
-        } else {
-            // 使用安全处理过多行字符的字符串注入 AppleScript
-            var scriptSource = "display notification \"\(safeBodyForAppleScript)\" with title \"\(safeTitle)\""
-            if playSound {
-                scriptSource += " sound name \"Glass\""
-            }
+            context.log("🔔 触达原生强制弹窗 [\(title)]")
             
-            if let script = NSAppleScript(source: scriptSource) {
-                var error: NSDictionary?
-                script.executeAndReturnError(&error)
-                
-                if let err = error {
-                    context.log("⚠️ 横幅通知发送受阻: \(err)")
+        } else {
+            // 🌟 【横幅通知模式】使用 AppleScript 触发系统级静默横幅
+            let maxLength = 300
+            let finalMessage = formattedMessage.count > maxLength
+                ? String(formattedMessage.prefix(maxLength)) + "\n...(内容过长已截断)"
+                : formattedMessage
+            
+            // 安全转义双引号，防止 AppleScript 语法错误
+            let safeTitle = title.replacingOccurrences(of: "\"", with: "\\\"")
+            let safeMessage = finalMessage.replacingOccurrences(of: "\"", with: "\\\"")
+            
+            // [✨补齐能力] 动态拼接声音参数
+            let soundScript = playSound ? " sound name \"Glass\"" : ""
+            let scriptStr = "display notification \"\(safeMessage)\" with title \"\(safeTitle)\"\(soundScript)"
+            
+            var errorInfo: NSDictionary?
+            if let scriptObj = NSAppleScript(source: scriptStr) {
+                scriptObj.executeAndReturnError(&errorInfo)
+                if let err = errorInfo {
+                    context.log("⚠️ 横幅通知发送失败: \(err)")
                 } else {
-                    // 为了日志整洁，把换行符替换为空格输出到日志
-                    let logBody = body.replacingOccurrences(of: "\n", with: " ")
-                    context.log("💬 [横幅通知] \(title) - \(logBody)")
+                    context.log("🔔 触达横幅通知 [\(title)]")
                 }
             }
         }
         
-        return .always
+        // 通知不参与逻辑流阻断（除非是等待用户点击），固定返回 .success 顺利推进下一个节点
+        return .success
+    }
+    
+    /// 用于对 JSON 格式的变量字符串进行 Pretty Print 美化，提升可读性
+    private func formatToReadableText(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if (trimmed.hasPrefix("{") && trimmed.hasSuffix("}")) || (trimmed.hasPrefix("[") && trimmed.hasSuffix("]")) {
+            if let data = trimmed.data(using: .utf8),
+               let jsonObject = try? JSONSerialization.jsonObject(with: data, options: []),
+               let prettyData = try? JSONSerialization.data(withJSONObject: jsonObject, options: [.prettyPrinted, .withoutEscapingSlashes]),
+               let prettyString = String(data: prettyData, encoding: .utf8) {
+                return prettyString
+            }
+        }
+        return text
     }
 }
 
@@ -1169,6 +1350,587 @@ struct CallWorkflowExecutor: RPAActionExecutor {
         context.log("🔗 子工作流执行完毕，返回主流程。")
         
         return success ? .success : .failure
+    }
+}
+
+// MARK: - 文件操作执行器
+struct FileOperationExecutor: RPAActionExecutor {
+    func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
+        let parts = action.parameter.components(separatedBy: "|")
+        let opType = parts.count > 0 ? parts[0] : "read"
+        let rawFilePath = parts.count > 1 ? parts[1] : ""
+        let rawContentOrVar = parts.count > 2 ? parts[2] : ""
+        
+        // 解析路径中的环境变量
+        let filePath = context.parseVariables(rawFilePath).trimmingCharacters(in: .whitespacesAndNewlines)
+        let fileURL = URL(fileURLWithPath: filePath)
+        let fm = FileManager.default
+        
+        if opType == "exists" {
+            let exists = fm.fileExists(atPath: filePath)
+            if !rawContentOrVar.isEmpty { context.variables[rawContentOrVar] = exists ? "true" : "false" }
+            context.log("📁 检查文件: \(filePath) -> \(exists ? "存在" : "不存在")")
+            return exists ? .success : .failure
+        }
+        
+        if opType == "read" {
+            do {
+                let content = try String(contentsOf: fileURL, encoding: .utf8)
+                if !rawContentOrVar.isEmpty { context.variables[rawContentOrVar] = content }
+                context.log("📖 成功读取文件: \(filePath) (\(content.count) 字符)")
+                return .success
+            } catch {
+                context.log("❌ 读取文件失败: \(error.localizedDescription)")
+                return .failure
+            }
+        }
+        
+        let contentToWrite = context.parseVariables(rawContentOrVar)
+        
+        if opType == "write" {
+            do {
+                try contentToWrite.write(to: fileURL, atomically: true, encoding: .utf8)
+                context.log("✍️ 成功覆写文件: \(filePath)")
+                return .success
+            } catch {
+                context.log("❌ 写入文件失败: \(error.localizedDescription)")
+                return .failure
+            }
+        }
+        
+        if opType == "append" {
+            if !fm.fileExists(atPath: filePath) {
+                do { try contentToWrite.write(to: fileURL, atomically: true, encoding: .utf8) }
+                catch { return .failure }
+            } else {
+                do {
+                    let fileHandle = try FileHandle(forWritingTo: fileURL)
+                    fileHandle.seekToEndOfFile()
+                    if let data = contentToWrite.data(using: .utf8) {
+                        fileHandle.write(data)
+                        fileHandle.closeFile()
+                    }
+                } catch {
+                    context.log("❌ 追加文件失败: \(error.localizedDescription)")
+                    return .failure
+                }
+            }
+            context.log("➕ 成功追加内容至文件: \(filePath)")
+            return .success
+        }
+        return .failure
+    }
+}
+
+// MARK: - 数据提取执行器
+struct DataExtractionExecutor: RPAActionExecutor {
+    func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
+        let parts = action.parameter.components(separatedBy: "|")
+        let sourceData = context.parseVariables(parts.count > 0 ? parts[0] : "")
+        let extractType = parts.count > 1 ? parts[1] : "json"
+        let rule = context.parseVariables(parts.count > 2 ? parts[2] : "")
+        let targetVar = parts.count > 3 ? parts[3] : "extracted_value"
+        
+        if extractType == "regex" {
+            do {
+                let regex = try NSRegularExpression(pattern: rule, options: [])
+                let nsString = sourceData as NSString
+                let results = regex.matches(in: sourceData, options: [], range: NSRange(location: 0, length: nsString.length))
+                
+                if let firstMatch = results.first {
+                    let extracted = nsString.substring(with: firstMatch.range)
+                    context.variables[targetVar] = extracted
+                    context.log("🔍 正则提取成功: 找到 [\(extracted)] 并存入 {{\(targetVar)}}")
+                    return .success
+                } else {
+                    context.log("⚠️ 正则提取未找到匹配项")
+                    return .failure
+                }
+            } catch {
+                context.log("❌ 正则规则无效: \(error.localizedDescription)")
+                return .failure
+            }
+        }
+        else if extractType == "json" {
+            // 轻量级简易 JSON 解析 (支持如 data.user.id 的按层级点语法获取)
+            guard let data = sourceData.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                context.log("❌ 数据来源不是合法的 JSON 对象")
+                return .failure
+            }
+            
+            let keys = rule.split(separator: ".").map(String.init)
+            var currentObj: Any = json
+            
+            for key in keys {
+                if let dict = currentObj as? [String: Any], let nextObj = dict[key] {
+                    currentObj = nextObj
+                } else {
+                    context.log("⚠️ JSON 提取失败: 未找到键路径 [\(rule)]")
+                    return .failure
+                }
+            }
+            
+            let resultStr = String(describing: currentObj)
+            context.variables[targetVar] = resultStr
+            context.log("🔍 JSON 提取成功: [\(rule)] = \(resultStr)")
+            return .success
+        }
+        
+        return .failure
+    }
+}
+
+// MARK: - 窗口控制执行器
+/// 负责调度系统级 AppleScript 对指定应用的窗口进行操纵
+struct WindowOperationExecutor: RPAActionExecutor {
+    func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
+        let parts = context.parseVariables(action.parameter).components(separatedBy: "|")
+        let appName = parts.count > 0 ? parts[0] : ""
+        let operation = parts.count > 1 ? parts[1] : "maximize"
+        let bounds = parts.count > 2 ? parts[2] : "0, 0, 800, 600"
+        
+        guard !appName.isEmpty else {
+            context.log("❌ 窗口控制失败：目标应用名称为空。")
+            return .failure
+        }
+        
+        var scriptStr = ""
+        
+        // 使用 AppleScript 进行原生的窗口控制
+        switch operation {
+        case "maximize":
+            scriptStr = """
+            tell application "System Events"
+                tell process "\(appName)"
+                    set frontmost to true
+                    try
+                        click (button 2 of window 1) -- 点击全屏/最大化按钮(绿灯)
+                    on error
+                        set value of attribute "AXFullScreen" of window 1 to true
+                    end try
+                end tell
+            end tell
+            """
+        case "minimize":
+            scriptStr = """
+            tell application "System Events"
+                tell process "\(appName)"
+                    set value of attribute "AXMinimized" of window 1 to true
+                end tell
+            end tell
+            """
+        case "close":
+            scriptStr = "tell application \"\(appName)\" to close window 1"
+        case "bounds":
+            let coords = bounds.components(separatedBy: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+            if coords.count == 4 {
+                scriptStr = """
+                tell application "System Events"
+                    tell process "\(appName)"
+                        set frontmost to true
+                        set position of window 1 to {\(coords[0]), \(coords[1])}
+                        set size of window 1 to {\(coords[2]), \(coords[3])}
+                    end tell
+                end tell
+                """
+            } else {
+                context.log("❌ 窗口坐标格式解析失败。")
+                return .failure
+            }
+        default:
+            return .failure
+        }
+        
+        var errorInfo: NSDictionary?
+        if let scriptObj = NSAppleScript(source: scriptStr) {
+            scriptObj.executeAndReturnError(&errorInfo)
+            
+            if let err = errorInfo {
+                // [✨体验优化] 精准捕获 macOS 经典的 -1743 权限拦截错误
+                if let errNumber = err["NSAppleScriptErrorNumber"] as? Int, errNumber == -1743 {
+                    context.log("⛔️ 窗口控制被系统拦截！请进入 [系统设置] -> [隐私与安全性] -> [自动化]，允许本程序控制 System Events。")
+                    // 可选：你甚至可以直接调用引擎方法打开隐私面板
+                    // await MainActor.run { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")!) }
+                } else {
+                    context.log("⚠️ 窗口控制 [\(operation)] 执行受阻 (目标可能未启动或无窗口): \(err["NSAppleScriptErrorMessage"] ?? err)")
+                }
+                return .failure
+            } else {
+                context.log("🪟 成功对 [\(appName)] 执行窗口控制: \(operation)")
+                return .success
+            }
+        }
+        return .failure
+    }
+}
+
+// MARK: - 循环遍历执行器
+/// 将复杂的循环逻辑降维转换为：数组解析 -> 设置单项变量 -> 递归调用子流程
+struct LoopItemsExecutor: RPAActionExecutor {
+    func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
+        let parts = action.parameter.components(separatedBy: "|")
+        let rawSource = parts.count > 0 ? parts[0] : ""
+        let itemVarName = parts.count > 1 ? parts[1] : "item"
+        let rawWorkflowId = parts.count > 2 ? parts[2] : ""
+        
+        let sourceData = context.parseVariables(rawSource).trimmingCharacters(in: .whitespacesAndNewlines)
+        let targetIdStr = context.parseVariables(rawWorkflowId).trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        guard let targetId = UUID(uuidString: targetIdStr) else {
+            context.log("❌ 循环遍历失败：调用的子工作流 ID 格式无效。")
+            return .failure
+        }
+        
+        // 尝试将来源数据解析为 JSON 数组
+        guard let jsonData = sourceData.data(using: .utf8),
+              let jsonArray = try? JSONSerialization.jsonObject(with: jsonData) as? [Any] else {
+            context.log("❌ 循环遍历失败：数据源无法解析为合法的 JSON 数组。\n数据: \(sourceData.prefix(50))...")
+            return .failure
+        }
+        
+        if jsonArray.isEmpty {
+            context.log("⚠️ 遍历数据为空，跳过循环。")
+            return .success
+        }
+        
+        context.log("🔁 开始循环遍历，共 \(jsonArray.count) 条数据...")
+        
+        for (index, item) in jsonArray.enumerated() {
+            guard context.isRunning else { break }
+            
+            // 将当前项转换为字符串（如果是字典或数组，序列化为 JSON 字符串；如果是标量，转为普通字符串）
+            var itemString = ""
+            if let dictOrArr = item as? [String: Any] {
+                if let data = try? JSONSerialization.data(withJSONObject: dictOrArr), let str = String(data: data, encoding: .utf8) { itemString = str }
+            } else if let arr = item as? [Any] {
+                if let data = try? JSONSerialization.data(withJSONObject: arr), let str = String(data: data, encoding: .utf8) { itemString = str }
+            } else {
+                itemString = "\(item)"
+            }
+            
+            // 注入变量池
+            context.variables[itemVarName] = itemString
+            context.log("🔄 [循环 \(index + 1)/\(jsonArray.count)] 已注入变量 {{\(itemVarName)}}")
+            
+            // 阻塞式调用子流程
+            let success = await context.runWorkflow(by: targetId)
+            
+            if !success {
+                context.log("⚠️ 循环在第 \(index + 1) 次时遇到子流程异常，循环提前终止。")
+                return .failure
+            }
+        }
+        
+        context.log("✅ 循环遍历执行完毕。")
+        return .success
+    }
+}
+
+// MARK: - OCR 结构化全文提取执行器
+/// 负责截取屏幕/窗口/区域，通过 Vision 框架提取全部文字，并进行 macOS 物理坐标系智能翻转计算
+struct OCRExtractExecutor: RPAActionExecutor {
+    func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
+        let parsedParam = context.parseVariables(action.parameter)
+        let parts = parsedParam.components(separatedBy: "|")
+        
+        let regionStr = parts.count > 0 ? parts[0] : ""
+        let targetApp = parts.count > 1 ? parts[1] : ""
+        let outputFormat = parts.count > 2 ? parts[2] : "json"
+        let languages = parts.count > 3 ? parts[3] : "zh-Hans,en-US"
+        let level = parts.count > 4 ? parts[4] : "accurate"
+        let variableName = parts.count > 5 ? parts[5] : "ocr_data"
+        
+        // 1. 区域解析
+        var regionRect: CGRect? = nil
+        if !regionStr.isEmpty {
+            let coords = regionStr.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+            if coords.count == 4 { regionRect = CGRect(x: coords[0], y: coords[1], width: coords[2], height: coords[3]) }
+        }
+        
+        // 2. 截取屏幕资源
+        let actualAppName = (targetApp == "InternalBrowser") ? ProcessInfo.processInfo.processName : (targetApp.isEmpty ? nil : targetApp)
+        let actualWindowTitle = (targetApp == "InternalBrowser") ? "开发者浏览器" : nil
+        
+        guard let fullCGImage = try? await ScreenCaptureUtility.captureScreen(forAppName: actualAppName, targetWindowTitle: actualWindowTitle) else {
+            context.log("❌ 截屏失败，无法提取文本。请检查应用名称或屏幕录制权限。")
+            return .failure
+        }
+        
+        let bounds = CGDisplayBounds(CGMainDisplayID())
+        var targetCGImage = fullCGImage
+        var cropOffset = CGPoint.zero
+        var cropSize = bounds.size
+        
+        // 3. 裁剪处理
+        if let r = regionRect {
+            let safeRect = r.intersection(bounds)
+            if !safeRect.isNull {
+                // [✨核心修复] Retina 屏幕缩放比适配 (Points -> Pixels)
+                let scaleX = CGFloat(fullCGImage.width) / bounds.width
+                let scaleY = CGFloat(fullCGImage.height) / bounds.height
+                
+                let pixelRect = CGRect(
+                    x: safeRect.origin.x * scaleX,
+                    y: safeRect.origin.y * scaleY,
+                    width: safeRect.width * scaleX,
+                    height: safeRect.height * scaleY
+                )
+                
+                if let cropped = fullCGImage.cropping(to: pixelRect) {
+                    targetCGImage = cropped
+                    cropOffset = safeRect.origin // 记录逻辑偏移，因为最终抛出的坐标需是逻辑坐标
+                    cropSize = safeRect.size     // 记录逻辑尺寸
+                } else {
+                    context.log("⚠️ 警告：图像裁切越界，降级使用全图。")
+                }
+            }
+        }
+        
+        context.log("📸 正在提取[\(targetApp.isEmpty ? "全屏" : targetApp)]文本 (语言:\(languages), 精度:\(level))...")
+        
+        // 4. 配置 Vision OCR 引擎
+        let request = VNRecognizeTextRequest()
+        request.recognitionLanguages = languages.components(separatedBy: ",")
+        request.recognitionLevel = level == "fast" ? .fast : .accurate
+        request.usesLanguageCorrection = true
+        
+        do {
+            let handler = VNImageRequestHandler(cgImage: targetCGImage, options: [:])
+            try handler.perform([request])
+            
+            guard let observations = request.results as? [VNRecognizedTextObservation] else {
+                context.log("⚠️ 提取完毕，但未发现任何有效文本。")
+                context.variables[variableName] = outputFormat == "json" ? "[]" : ""
+                return .success
+            }
+            
+            // 5. 数据处理与坐标翻转
+            if outputFormat == "json" {
+                var jsonResult: [[String: Any]] = []
+                
+                for obs in observations {
+                    if let topCandidate = obs.topCandidates(1).first {
+                        // 🌟 核心算法：Vision 的 Y 轴是自底向上的 (0~1)，且是基于裁剪图像的比例
+                        // 我们必须将其翻转并映射回 macOS 全局屏幕坐标 (Top-Left 原点)
+                        let rawBox = obs.boundingBox
+                        
+                        let width = rawBox.width * cropSize.width
+                        let height = rawBox.height * cropSize.height
+                        
+                        let localX = rawBox.minX * cropSize.width
+                        let localY = (1.0 - rawBox.maxY) * cropSize.height // Top-Left 翻转
+                        
+                        let absoluteX = cropOffset.x + localX
+                        let absoluteY = cropOffset.y + localY
+                        
+                        jsonResult.append([
+                            "text": topCandidate.string,
+                            "confidence": topCandidate.confidence,
+                            "x": Int(absoluteX),
+                            "y": Int(absoluteY),
+                            "width": Int(width),
+                            "height": Int(height)
+                        ])
+                    }
+                }
+                
+                let jsonData = try JSONSerialization.data(withJSONObject: jsonResult, options: [.prettyPrinted])
+                let jsonString = String(data: jsonData, encoding: .utf8) ?? "[]"
+                context.variables[variableName] = jsonString
+                context.log("✅ 成功提取 \(jsonResult.count) 条结构化 JSON 数据并存入 {{\(variableName)}}")
+                
+            } else {
+                // 纯文本合并模式
+                let allText = observations.compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+                context.variables[variableName] = allText
+                context.log("✅ 成功提取纯文本 (\(allText.count) 字) 并存入 {{\(variableName)}}")
+            }
+            
+            return .success
+            
+        } catch {
+            context.log("❌ OCR 提取引擎发生异常: \(error.localizedDescription)")
+            return .failure
+        }
+    }
+}
+
+// MARK: - AI 视觉元素定位执行器 (终极版)
+/// 支持窗口隔离以降低幻觉，支持区域框选裁剪(节省Token与耗时)，并支持自定义坐标偏移修正
+struct AIVisionLocatorExecutor: RPAActionExecutor {
+    func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
+        let parts = context.parseVariables(action.parameter).components(separatedBy: "|")
+        let targetDesc = parts.count > 0 ? parts[0] : ""
+        let actionType = parts.count > 1 ? parts[1] : "leftClick"
+        let ignoreError = parts.count > 3 ? (parts[3] == "true") : false
+        let targetApp = parts.count > 4 ? parts[4] : ""
+        let offsetStr = parts.count > 5 ? parts[5] : "0,0"
+        let regionStr = parts.count > 6 ? parts[6] : ""
+        
+        if targetDesc.isEmpty {
+            context.log("❌ 视觉定位失败：目标描述为空。")
+            return ignoreError ? .always : .failure
+        }
+        
+        // 解析坐标偏移
+        var offsetX: Double = 0; var offsetY: Double = 0
+        let offsetParts = offsetStr.split(separator: ",")
+        if offsetParts.count == 2 {
+            offsetX = Double(offsetParts[0].trimmingCharacters(in: .whitespaces)) ?? 0
+            offsetY = Double(offsetParts[1].trimmingCharacters(in: .whitespaces)) ?? 0
+        }
+        
+        // 解析框选区域
+        var regionRect: CGRect? = nil
+        if !regionStr.isEmpty {
+            let coords = regionStr.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+            if coords.count == 4 { regionRect = CGRect(x: coords[0], y: coords[1], width: coords[2], height: coords[3]) }
+        }
+        
+        do {
+            // 1. 截取屏幕 (如果指定了 App，会过滤出该 App 的图层)
+            let fullCGImage = try await ScreenCaptureUtility.captureScreen(forAppName: targetApp.isEmpty ? nil : targetApp)
+            
+            let bounds = CGDisplayBounds(CGMainDisplayID())
+            var targetCGImage = fullCGImage
+            var cropOffset = CGPoint.zero
+            var cropSize = bounds.size // 逻辑尺寸
+            
+            // 2. 图像裁剪 (Viewport Cropping)
+            if let r = regionRect {
+                let safeRect = r.intersection(bounds)
+                if !safeRect.isNull {
+                    // 处理 Retina 屏幕缩放比 (Points -> Pixels)
+                    let scaleX = CGFloat(fullCGImage.width) / bounds.width
+                    let scaleY = CGFloat(fullCGImage.height) / bounds.height
+                    
+                    let pixelRect = CGRect(
+                        x: safeRect.origin.x * scaleX,
+                        y: safeRect.origin.y * scaleY,
+                        width: safeRect.width * scaleX,
+                        height: safeRect.height * scaleY
+                    )
+                    
+                    if let cropped = fullCGImage.cropping(to: pixelRect) {
+                        targetCGImage = cropped
+                        cropOffset = safeRect.origin // 记录裁剪在全屏中的逻辑偏移坐标
+                        cropSize = safeRect.size     // 记录裁剪的逻辑宽高
+                    } else {
+                        context.log("⚠️ 警告：设定的视觉区域越界，降级使用全图分析。")
+                    }
+                }
+            }
+            
+            let width = targetCGImage.width
+            let height = targetCGImage.height
+            let nsImage = NSImage(cgImage: targetCGImage, size: .zero)
+            
+            let scopeStr = targetApp.isEmpty ? "全屏" : "[\(targetApp)]窗口"
+            let regionLog = regionRect != nil ? " 指定区域内" : ""
+            context.log("📸 [AI视觉定位] 正在 \(scopeStr)\(regionLog) 寻找: '\(targetDesc)' ...")
+            
+            // 3. 构造强约束 Prompt
+            let prompt = """
+            你是一个精准的屏幕坐标定位 AI。这是一张尺寸为 \(width)x\(height) 像素的屏幕截图（左上角为 0,0）。
+            请在图中找到描述为：“\(targetDesc)” 的目标元素，并估算其【正中心点】的 X 和 Y 坐标像素值。
+            
+            你必须且只能输出如下 JSON 格式，绝不允许输出任何其他解释性文字：
+            {"x": 120, "y": 50}
+            """
+            
+            let message = LLMMessage(role: .user, text: prompt, images: [nsImage])
+            let resultStr = try await LLMService.shared.generate(messages: [message])
+            
+            guard let jsonStr = resultStr.extractJSON(),
+                  let jsonData = jsonStr.data(using: .utf8),
+                  let dict = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                  let xStr = dict["x"], let yStr = dict["y"],
+                  let x = Double("\(xStr)"), let y = Double("\(yStr)") else {
+                
+                context.log("⚠️ AI 无法确定目标位置，原始回复: \(resultStr.prefix(50))...")
+                return ignoreError ? .always : .failure
+            }
+            
+            // 4. 坐标缩放映射 (局部像素 -> 局部逻辑点 -> 全局逻辑点)
+            let scaleX = cropSize.width / CGFloat(width)
+            let scaleY = cropSize.height / CGFloat(height)
+            
+            // 计算出的局部逻辑点 + 裁剪框在全屏的偏移量 + 用户自定义微调偏移量
+            let finalPoint = CGPoint(
+                x: cropOffset.x + (x * scaleX) + offsetX,
+                y: cropOffset.y + (y * scaleY) + offsetY
+            )
+            
+            let offsetLog = (offsetX != 0 || offsetY != 0) ? " (含偏移 X:\(offsetX) Y:\(offsetY))" : ""
+            context.log("🎯 AI 定位成功，全局落点: (\(Int(finalPoint.x)), \(Int(finalPoint.y)))\(offsetLog)，执行 \(actionType)")
+            
+            // 5. 执行鼠标动作
+            await context.simulateMouseOperation(type: actionType, at: finalPoint)
+            return .success
+            
+        } catch {
+            context.log("❌ AI 视觉定位调用异常: \(error.localizedDescription)")
+            return ignoreError ? .always : .failure
+        }
+    }
+}
+
+// MARK: - AI 智能数据结构化执行器 (进阶版)
+/// 支持强 Schema 约束，确保输出数据的稳定性和代码鲁棒性
+struct AITextParseExecutor: RPAActionExecutor {
+    func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
+        let parts = action.parameter.components(separatedBy: "|")
+        let sourceData = context.parseVariables(parts.count > 0 ? parts[0] : "")
+        let instruction = context.parseVariables(parts.count > 1 ? parts[1] : "")
+        let targetVar = parts.count > 2 ? parts[2] : "parsed_data"
+        let jsonTemplate = context.parseVariables(parts.count > 3 ? parts[3] : "")
+        
+        if sourceData.isEmpty || instruction.isEmpty {
+            context.log("⚠️ AI 解析跳过：数据源或指令为空。")
+            return .failure
+        }
+        
+        context.log("🧠 正在使用 AI 解析与清洗文本数据 (长度: \(sourceData.count))...")
+        
+        // [✨进阶升级] 动态组装强约束 Prompt
+        var prompt = """
+        【处理任务】
+        \(instruction)
+        
+        【原始数据】
+        \(sourceData)
+        
+        【要求】
+        请只输出合法的 JSON 字符串，不要包含任何 Markdown 格式(如```json)或额外的解释性文字。
+        """
+        
+        if !jsonTemplate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            prompt += """
+            
+            【强制输出结构】
+            请严格按照以下 JSON 结构输出你的提取结果。如果原始数据中找不到某个字段，请使用 null、空字符串或 0 填充。
+            模板：
+            \(jsonTemplate)
+            """
+        }
+        
+        let message = LLMMessage(role: .user, text: prompt)
+        
+        do {
+            let resultStr = try await LLMService.shared.generate(messages: [message])
+            
+            // 使用你的 String 扩展提取 JSON，剔除废话
+            let cleanJSON = resultStr.extractJSON() ?? resultStr
+            
+            context.variables[targetVar] = cleanJSON
+            context.log("✅ AI 数据结构化完成，存入 {{\(targetVar)}}。")
+            
+            return .success
+        } catch {
+            context.log("❌ AI 解析调用失败: \(error.localizedDescription)")
+            return .failure
+        }
     }
 }
 

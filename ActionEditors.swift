@@ -44,7 +44,15 @@ struct ActionSettingsPopoverView: View {
         case .runShell, .runAppleScript: RunScriptEditor(action: $action)
         case .typeText:         TypeTextEditor(action: $action)
         case .wait:             WaitEditor(action: $action)
+        case .askUserInput:     AskUserInputEditor(action: $action)
         case .callWorkflow:     CallWorkflowEditor(action: $action)
+        case .fileOperation:    FileOperationEditor(action: $action)
+        case .dataExtraction:   DataExtractionEditor(action: $action)
+        case .windowOperation:  WindowOperationEditor(action: $action)
+        case .loopItems:        LoopItemsEditor(action: $action)
+        case .ocrExtract:       OCRExtractEditor(action: $action)
+        case .aiVisionLocator:  AIVisionLocatorEditor(action: $action)
+        case .aiDataParse:      AITextParseEditor(action: $action)
         default:
             TextField("参数设置", text: $action.parameter).textFieldStyle(.roundedBorder)
         }
@@ -240,6 +248,10 @@ struct TypeTextEditor: View {
                         Button("复制 (CMD+C)") { action.parameter = "\(textValue)[CMD+C]|\(speedMode)" }
                         Button("粘贴 (CMD+V)") { action.parameter = "\(textValue)[CMD+V]|\(speedMode)" }
                     }
+                    Section("导航操作") {
+                        Button("到顶部 (CMD+UP)") { action.parameter = "\(textValue)[CMD+UP]|\(speedMode)" }
+                        Button("到底部 (CMD+DOWN)") { action.parameter = "\(textValue)[CMD+DOWN]|\(speedMode)" }
+                    }
                     Section("全局变量") {
                         Button("剪贴板内容") { action.parameter = "\(textValue){{clipboard}}|\(speedMode)" }
                     }
@@ -255,7 +267,7 @@ struct TypeTextEditor: View {
                     Text("⚡️ 极速 (免延时)").tag("fast")
                     Text("🚶 普通 (标准机打)").tag("normal")
                     Text("🙋‍♂️ 拟人 (思考停顿)").tag("human")
-                }.labelsHidden().pickerStyle(.segmented).frame(width: 250)
+                }.labelsHidden().pickerStyle(.segmented)
             }
         }
     }
@@ -270,6 +282,63 @@ struct WaitEditor: View {
         HStack {
             TextField("秒数", text: $action.parameter).textFieldStyle(.roundedBorder)
             Text("秒")
+        }
+    }
+}
+
+// MARK: - [人机协同] 人工介入与提问编辑器
+/// 暂停流程，向用户弹窗索要输入或确认
+struct AskUserInputEditor: View {
+    @Binding var action: RPAAction
+    
+    var body: some View {
+        // 参数格式: 提示语 | 弹窗类型(input/confirm) | 超时时间 | 保存变量
+        let parts = action.parameter.components(separatedBy: "|")
+        let promptText = parts.count > 0 ? parts[0] : "请输入验证码："
+        let dialogType = parts.count > 1 ? parts[1] : "input"
+        let timeout = parts.count > 2 ? parts[2] : "60"
+        let targetVar = parts.count > 3 ? parts[3] : "user_input"
+        
+        let updateParam = { (pt: String, dt: String, tm: String, tv: String) in
+            action.parameter = "\\(pt)|\\(dt)|\\(tm)|\\(tv)"
+        }
+        
+        VStack(alignment: .leading, spacing: 14) {
+            GroupBox("🙋‍♂️ 提问与提示内容") {
+                VStack(alignment: .leading) {
+                    TextEditor(text: Binding(
+                        get: { promptText },
+                        set: { updateParam($0, dialogType, timeout, targetVar) }
+                    ))
+                    .font(.system(size: 13))
+                    .frame(height: 50)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
+                }.padding(4)
+            }
+            
+            HStack {
+                Text("交互模式:").font(.caption)
+                Picker("", selection: Binding(get: { dialogType }, set: { updateParam(promptText, $0, timeout, targetVar) })) {
+                    Text("⌨️ 文本输入 (如验证码)").tag("input")
+                    Text("✅ 确认/取消 (审批决策)").tag("confirm")
+                }.labelsHidden().frame(width: 180)
+            }
+            
+            if dialogType == "input" {
+                HStack {
+                    Image(systemName: "tray.and.arrow.down").foregroundColor(.orange)
+                    Text("输入存入变量:").font(.caption).foregroundColor(.secondary)
+                    TextField("变量名", text: Binding(get: { targetVar }, set: { updateParam(promptText, dialogType, timeout, $0) }))
+                        .textFieldStyle(.roundedBorder)
+                }
+            }
+            
+            HStack {
+                Text("⏳ 等待超时:").font(.caption)
+                TextField("60", text: Binding(get: { timeout }, set: { updateParam(promptText, dialogType, $0, targetVar) }))
+                    .textFieldStyle(.roundedBorder).frame(width: 40)
+                Text("秒 (超时将走向失败分支)").font(.caption)
+            }
         }
     }
 }
@@ -555,188 +624,7 @@ struct UIInteractionEditor: View {
     }
 }
 
-// -----------------------------------------------------------------------------------
-// 💡极客级辅助视图代码 (MiniDesktop, OCRMiniDesktop, 连接线绘制, 截屏工具等)
-// -----------------------------------------------------------------------------------
-
-// MARK: - 迷你桌面渲染器 (鼠标动作)
-/// 可视化指示鼠标将要在屏幕上执行的坐标动作
-struct MouseMiniDesktop: View {
-    @Binding var point1Str: String
-    @Binding var point2Str: String
-    var isDrag: Bool
-    var isRelative: Bool
-    
-    let screen = NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
-    @State private var dragStartP1: CGPoint? = nil
-    @State private var dragStartP2: CGPoint? = nil
-    
-    func getPoint(_ str: String, defaultPt: CGPoint) -> CGPoint {
-        let parts = str.split(separator: ",")
-        if parts.count == 2,
-           let x = Double(parts[0].trimmingCharacters(in: .whitespaces)),
-           let y = Double(parts[1].trimmingCharacters(in: .whitespaces)) {
-            return CGPoint(x: x, y: y)
-        }
-        return defaultPt
-    }
-    
-    var body: some View {
-        GeometryReader { geo in
-            let scaleX = geo.size.width / screen.width
-            let scaleY = geo.size.height / screen.height
-            
-            ZStack(alignment: .topLeading) {
-                RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.8))
-                RoundedRectangle(cornerRadius: 6).stroke(Color.gray, lineWidth: 2)
-                
-                let center = CGPoint(x: geo.size.width / 2, y: geo.size.height / 2)
-                
-                if isRelative {
-                    Path { p in
-                        p.move(to: CGPoint(x: center.x, y: 0))
-                        p.addLine(to: CGPoint(x: center.x, y: geo.size.height))
-                        p.move(to: CGPoint(x: 0, y: center.y))
-                        p.addLine(to: CGPoint(x: geo.size.width, y: center.y))
-                    }.stroke(Color.white.opacity(0.2), lineWidth: 1)
-                }
-                
-                let p1 = getPoint(point1Str, defaultPt: isRelative ? .zero : CGPoint(x: screen.width/2, y: screen.height/2))
-                let vP1 = isRelative ? CGPoint(x: center.x + p1.x * scaleX, y: center.y + p1.y * scaleY) : CGPoint(x: p1.x * scaleX, y: p1.y * scaleY)
-                
-                if isDrag {
-                    let p2 = getPoint(point2Str, defaultPt: isRelative ? .zero : CGPoint(x: screen.width/2 + 50, y: screen.height/2 + 50))
-                    let vP2 = isRelative ? CGPoint(x: vP1.x + p2.x * scaleX, y: vP1.y + p2.y * scaleY) : CGPoint(x: p2.x * scaleX, y: p2.y * scaleY)
-                    
-                    Path { p in
-                        p.move(to: vP1)
-                        p.addLine(to: vP2)
-                    }.stroke(Color.blue, style: StrokeStyle(lineWidth: 2, dash: [4, 4]))
-                    
-                    Circle()
-                        .fill(Color.red)
-                        .frame(width: 14, height: 14)
-                        .position(vP2)
-                        .overlay(Text("终").font(.system(size: 9)).position(vP2).foregroundColor(.white))
-                        .gesture(
-                            DragGesture()
-                                .onChanged { val in
-                                    if dragStartP2 == nil { dragStartP2 = p2 }
-                                    if let start = dragStartP2 {
-                                        point2Str = "\(Int(start.x + val.translation.width / scaleX)), \(Int(start.y + val.translation.height / scaleY))"
-                                    }
-                                }
-                                .onEnded { _ in dragStartP2 = nil }
-                        )
-                }
-                
-                Circle()
-                    .fill(Color.green)
-                    .frame(width: 14, height: 14)
-                    .position(vP1)
-                    .overlay(Text(isDrag ? "起" : "点").font(.system(size: 9)).position(vP1).foregroundColor(.white))
-                    .gesture(
-                        DragGesture()
-                            .onChanged { val in
-                                if dragStartP1 == nil { dragStartP1 = p1 }
-                                if let start = dragStartP1 {
-                                    point1Str = "\(Int(start.x + val.translation.width / scaleX)), \(Int(start.y + val.translation.height / scaleY))"
-                                }
-                            }
-                            .onEnded { _ in dragStartP1 = nil }
-                    )
-            }
-        }.frame(height: 120)
-    }
-}
-
-// MARK: - OCR区域截取迷你桌面
-/// 用于展示和微调视觉搜索区域的缩略图组件
-struct OCRMiniDesktop: View {
-    @Binding var regionStr: String
-    @Binding var offsetX: Double
-    @Binding var offsetY: Double
-    
-    let screen = NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
-    @State private var dragStartRegion: CGRect? = nil
-    @State private var dragStartOffset: CGPoint? = nil
-    
-    var currentRegion: CGRect {
-        let parts = regionStr.split(separator: ",")
-        if parts.count == 4,
-           let x = Double(parts[0].trimmingCharacters(in: .whitespaces)),
-           let y = Double(parts[1].trimmingCharacters(in: .whitespaces)),
-           let w = Double(parts[2].trimmingCharacters(in: .whitespaces)),
-           let h = Double(parts[3].trimmingCharacters(in: .whitespaces)) {
-            return CGRect(x: x, y: y, width: w, height: h)
-        }
-        return CGRect(x: 0, y: 0, width: screen.width, height: screen.height)
-    }
-    
-    var body: some View {
-        GeometryReader { geo in
-            let scaleX = geo.size.width / screen.width
-            let scaleY = geo.size.height / screen.height
-            
-            ZStack(alignment: .topLeading) {
-                RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.8))
-                RoundedRectangle(cornerRadius: 6).stroke(Color.gray, lineWidth: 2)
-                
-                let r = currentRegion
-                let viewRect = CGRect(x: r.minX * scaleX, y: r.minY * scaleY, width: r.width * scaleX, height: r.height * scaleY)
-                
-                Rectangle()
-                    .fill(Color.blue.opacity(0.3))
-                    .border(Color.blue, width: 1)
-                    .frame(width: max(viewRect.width, 10), height: max(viewRect.height, 10))
-                    .offset(x: viewRect.minX, y: viewRect.minY)
-                    .gesture(
-                        DragGesture()
-                            .onChanged { val in
-                                if dragStartRegion == nil { dragStartRegion = r }
-                                if let start = dragStartRegion {
-                                    let newX = max(0, min(screen.width - start.width, start.minX + val.translation.width / scaleX))
-                                    let newY = max(0, min(screen.height - start.height, start.minY + val.translation.height / scaleY))
-                                    regionStr = "\(Int(newX)), \(Int(newY)), \(Int(start.width)), \(Int(start.height))"
-                                }
-                            }
-                            .onEnded { _ in dragStartRegion = nil }
-                    )
-                
-                let center = CGPoint(x: viewRect.midX, y: viewRect.midY)
-                let offsetViewX = offsetX * scaleX
-                let offsetViewY = offsetY * scaleY
-                let target = CGPoint(x: center.x + offsetViewX, y: center.y + offsetViewY)
-                
-                Path { p in
-                    p.move(to: center)
-                    p.addLine(to: target)
-                }.stroke(Color.red, style: StrokeStyle(lineWidth: 1, dash: [2,2]))
-                
-                Circle().fill(Color.green).frame(width: 6, height: 6).position(center)
-                
-                Circle()
-                    .fill(Color.red)
-                    .frame(width: 14, height: 14)
-                    .position(target)
-                    .overlay(Text("点").font(.system(size: 9)).position(target).foregroundColor(.white))
-                    .gesture(
-                        DragGesture()
-                            .onChanged { val in
-                                if dragStartOffset == nil { dragStartOffset = CGPoint(x: offsetX, y: offsetY) }
-                                if let start = dragStartOffset {
-                                    offsetX = start.x + val.translation.width / scaleX
-                                    offsetY = start.y + val.translation.height / scaleY
-                                }
-                            }
-                            .onEnded { _ in dragStartOffset = nil }
-                    )
-            }
-        }.frame(height: 120)
-    }
-}
-
-// MARK: - [✨重构] 鼠标操作编辑器（融合直观的屏幕拾取器）
+// MARK: - [✨修复] 鼠标操作编辑器（包含占位符机制防弹回）
 struct MouseActionEditor: View {
     @Binding var parameter: String
     @State private var isPicking = false
@@ -744,15 +632,24 @@ struct MouseActionEditor: View {
     var body: some View {
         let parts = parameter.components(separatedBy: "|")
         let mouseType = parts.count > 0 ? parts[0] : "leftClick"
-        // 兼容旧数据的异常
         let mouseVal1 = parts.count > 1 ? parts[1] : (parameter.contains(",") ? parameter : "0, 0")
         let mouseVal2 = parts.count > 2 ? parts[2] : "0, 0"
         let isRelative = parts.count > 3 ? (parts[3] == "true") : false
         
+        // [✨核心修复] 解析底层特殊占位符
+        let rawTargetApp = parts.count > 4 ? parts[4] : ""
+        let targetApp = rawTargetApp == "__WAIT_INPUT__" ? "" : rawTargetApp
+        
         let mainTab = mouseType.lowercased().contains("scroll") ? "scroll" : mouseType
         
-        let updateParam = { (type: String, v1: String, v2: String, rel: Bool) in
-            parameter = "\(type)|\(v1)|\(v2)|\(rel ? "true" : "false")"
+        // 衍生当前的坐标模式用于 UI 绑定：此时依据 rawTargetApp 判断，即使是占位符也能维持住 window 状态
+        let currentMode = isRelative ? "cursor" : (!rawTargetApp.isEmpty ? "window" : "screen")
+        
+        let updateParam = { (type: String, v1: String, v2: String, mode: String, app: String) in
+            let rel = (mode == "cursor")
+            // [✨核心修复] 如果切换到了 window 模式但应用名是空的，写入占位符维持 window 状态不弹回
+            let finalApp = (mode == "window") ? (app.isEmpty ? "__WAIT_INPUT__" : app) : ""
+            parameter = "\(type)|\(v1)|\(v2)|\(rel ? "true" : "false")|\(finalApp)"
         }
         
         VStack(alignment: .leading, spacing: 12) {
@@ -760,7 +657,7 @@ struct MouseActionEditor: View {
                 get: { mainTab },
                 set: {
                     let newType = $0 == "scroll" ? "scrollDown" : $0
-                    updateParam(newType, mouseVal1, mouseVal2, isRelative)
+                    updateParam(newType, mouseVal1, mouseVal2, currentMode, targetApp)
                 }
             )) {
                 Text("移动").tag("move")
@@ -773,22 +670,69 @@ struct MouseActionEditor: View {
             .pickerStyle(.segmented)
             
             if mainTab != "scroll" {
+                VStack(spacing: 8) {
+                    HStack {
+                        Text("坐标基准:").font(.caption).foregroundColor(.secondary)
+                        Picker("", selection: Binding(
+                            get: { currentMode },
+                            set: { updateParam(mouseType, mouseVal1, mouseVal2, $0, targetApp) }
+                        )) {
+                            Text("🖥️ 全屏绝对坐标").tag("screen")
+                            Text("🖱️ 当前光标相对偏移").tag("cursor")
+                            Text("🪟 指定应用窗口内相对坐标").tag("window")
+                        }
+                        .pickerStyle(.menu)
+                        .frame(width: 220)
+                        
+                        Spacer()
+                    }
+                    
+                    // 当选择窗口内相对坐标时，显示 App 选择器
+                    if currentMode == "window" {
+                        HStack {
+                            Text("目标应用:").font(.caption).foregroundColor(.secondary)
+                            TextField("如: Safari", text: Binding(
+                                get: { targetApp },
+                                set: { updateParam(mouseType, mouseVal1, mouseVal2, currentMode, $0) }
+                            )).textFieldStyle(.roundedBorder)
+                            
+                            Menu {
+                                let runningApps = NSWorkspace.shared.runningApplications
+                                    .filter { $0.activationPolicy == .regular }
+                                    .compactMap { $0.localizedName }.sorted()
+                                ForEach(runningApps, id: \.self) { app in
+                                    // 用户从菜单选择后，真实的应用名会覆盖掉占位符
+                                    Button(app) { updateParam(mouseType, mouseVal1, mouseVal2, currentMode, app) }
+                                }
+                            } label: { Image(systemName: "app.dashed") }.fixedSize()
+                        }
+                    }
+                }
+                .padding(8)
+                .background(Color(NSColor.controlBackgroundColor))
+                .cornerRadius(6)
+                
                 HStack {
-                    Toggle("相对当前光标位置偏移", isOn: Binding(
-                        get: { isRelative },
-                        set: { updateParam(mouseType, mouseVal1, mouseVal2, $0) }
-                    )).toggleStyle(.switch).controlSize(.mini)
+                    TextField("坐标 (X, Y)", text: Binding(
+                        get: { mouseVal1 },
+                        set: { updateParam(mouseType, $0, mouseVal2, currentMode, targetApp) }
+                    )).textFieldStyle(.roundedBorder)
                     
-                    Spacer()
-                    
-                    // [✨新增] 一键实景拾取能力
                     Button(action: {
                         isPicking = true
                         ScreenPointPicker.shared.pickPoint { point in
                             isPicking = false
                             if let pt = point {
-                                // 自动帮用户填入准确的坐标
-                                updateParam(mouseType, "\(Int(pt.x)), \(Int(pt.y))", mouseVal2, isRelative)
+                                var finalX = Int(pt.x)
+                                var finalY = Int(pt.y)
+                                
+                                if currentMode == "window" && !targetApp.isEmpty {
+                                    if let appFrame = getAppWindowFrame(appName: targetApp) {
+                                        finalX -= Int(appFrame.minX)
+                                        finalY -= Int(appFrame.minY)
+                                    }
+                                }
+                                updateParam(mouseType, "\(finalX), \(finalY)", mouseVal2, currentMode, targetApp)
                             }
                         }
                     }) {
@@ -799,25 +743,39 @@ struct MouseActionEditor: View {
                     .controlSize(.small)
                 }
                 
-                // 原有 MiniDesktop 依旧保留，作为微调和可视化反馈
                 MouseMiniDesktop(
-                    point1Str: Binding(get: { mouseVal1 }, set: { updateParam(mouseType, $0, mouseVal2, isRelative) }),
-                    point2Str: Binding(get: { mouseVal2 }, set: { updateParam(mouseType, mouseVal1, $0, isRelative) }),
+                    point1Str: Binding(get: { mouseVal1 }, set: { updateParam(mouseType, $0, mouseVal2, currentMode, targetApp) }),
+                    point2Str: Binding(get: { mouseVal2 }, set: { updateParam(mouseType, mouseVal1, $0, currentMode, targetApp) }),
                     isDrag: mainTab == "drag",
-                    isRelative: isRelative
+                    isRelative: currentMode == "cursor"
                 )
             } else {
                 HStack {
-                    Picker("方向", selection: Binding(get: { mouseType }, set: { updateParam($0, mouseVal1, mouseVal2, isRelative) })) {
+                    Picker("方向", selection: Binding(get: { mouseType }, set: { updateParam($0, mouseVal1, mouseVal2, currentMode, targetApp) })) {
                         Text("向下滚动").tag("scrollDown")
                         Text("向上滚动").tag("scrollUp")
                     }.frame(width: 150)
                     
-                    TextField("滚动行数 (如: 5)", text: Binding(get: { mouseVal1 }, set: { updateParam(mouseType, $0, mouseVal2, isRelative) }))
+                    TextField("滚动行数 (如: 5)", text: Binding(get: { mouseVal1 }, set: { updateParam(mouseType, $0, mouseVal2, currentMode, targetApp) }))
                         .textFieldStyle(.roundedBorder)
                 }
             }
         }
+    }
+    
+    private func getAppWindowFrame(appName: String) -> CGRect? {
+        let options = CGWindowListOption(arrayLiteral: .excludeDesktopElements, .optionOnScreenOnly)
+        guard let windowListInfo = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return nil }
+        
+        for info in windowListInfo {
+            if let ownerName = info[kCGWindowOwnerName as String] as? String, ownerName == appName {
+                if let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+                   let rect = CGRect(dictionaryRepresentation: boundsDict) {
+                    return rect
+                }
+            }
+        }
+        return nil
     }
 }
 
@@ -986,56 +944,98 @@ struct OCRActionEditor: View {
     }
 }
 
-// MARK: - ✨系统消息提醒 独立编辑器组件
+// MARK: - ✨系统消息提醒 独立编辑器组件 (重构优化版)
 struct NotificationEditor: View {
     @Binding var parameter: String
     
-    // 动态计算属性，保证输入时的单向数据流与双向绑定安全
-    private var parts: [String] { parameter.components(separatedBy: "|") }
-    private var isOldFormat: Bool { parts.count == 1 && !parameter.contains("|") }
-    
-    private var title: String { isOldFormat ? "RPA 提醒" : (parts.count > 0 ? parts[0] : "RPA 提醒") }
-    private var bodyText: String { isOldFormat ? parameter : (parts.count > 1 ? parts[1] : "") }
-    private var notifyType: String { parts.count > 2 ? parts[2] : "banner" }
-    private var playSound: Bool { parts.count > 3 ? (parts[3] == "true") : true }
+    // 参数格式约定: title | bodyText | notifyType | playSound
+    //             标题   | 内容     | 展现形式     | 是否发声
+    // 采用计算属性安全补齐参数，保证双向绑定的稳定与安全，彻底抛弃旧版格式兼容
+    private var parts: [String] {
+        var p = parameter.components(separatedBy: "|")
+        while p.count < 4 { p.append("") }
+        return p
+    }
     
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            TextField("主标题 (支持 {{变量}})", text: Binding(
-                get: { title },
-                set: { parameter = "\($0)|\(bodyText)|\(notifyType)|\(playSound ? "true" : "false")" }
-            )).textFieldStyle(.roundedBorder)
+        VStack(alignment: .leading, spacing: 14) {
             
-            // [✨修改] 开启垂直轴向，变成多行文本域
-            TextField("详细内容 (支持换行和 {{变量}})", text: Binding(
-                get: { bodyText },
-                set: { parameter = "\(title)|\($0)|\(notifyType)|\(playSound ? "true" : "false")" }
-            ), axis: .vertical)
-            .textFieldStyle(.roundedBorder)
-            .lineLimit(3...8)
-            
-            HStack {
-                Text("提醒方式:").font(.caption)
-                Picker("", selection: Binding(
-                    get: { notifyType },
-                    set: { parameter = "\(title)|\(bodyText)|\($0)|\(playSound ? "true" : "false")" }
-                )) {
-                    Text("消息横幅 (后台闪过，不阻塞)").tag("banner")
-                    Text("系统弹窗 (暂停流程，等待点击)").tag("alert")
-                }.labelsHidden().frame(width: 200)
+            GroupBox("通知内容") {
+                VStack(spacing: 10) {
+                    HStack {
+                        Text("主标题:").font(.caption).foregroundColor(.secondary).frame(width: 50, alignment: .trailing)
+                        TextField("支持 {{变量}}", text: updateBinding(index: 0, defaultVal: "RPA 提醒"))
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    
+                    HStack(alignment: .top) {
+                        Text("详细内容:").font(.caption).foregroundColor(.secondary).frame(width: 50, alignment: .trailing).padding(.top, 4)
+                        TextField("支持换行和 {{变量}}", text: updateBinding(index: 1, defaultVal: ""), axis: .vertical)
+                            .textFieldStyle(.roundedBorder)
+                            .lineLimit(3...6)
+                    }
+                }
+                .padding(.vertical, 4)
             }
             
-            Toggle("🔊 播放提示音", isOn: Binding(
-                get: { playSound },
-                set: { parameter = "\(title)|\(bodyText)|\(notifyType)|\($0 ? "true" : "false")" }
-            )).toggleStyle(.switch).controlSize(.mini).tint(.blue)
+            GroupBox("交互行为") {
+                VStack(spacing: 10) {
+                    HStack {
+                        Text("提醒方式:").font(.caption).foregroundColor(.secondary).frame(width: 60, alignment: .trailing)
+                        Picker("", selection: updateBinding(index: 2, defaultVal: "banner")) {
+                            Text("消息横幅 (后台闪过，不阻塞)").tag("banner")
+                            Text("系统弹窗 (暂停流程，等待点击)").tag("dialog")
+                        }
+                        .labelsHidden()
+                        .frame(width: 220)
+                        
+                        Spacer()
+                    }
+                    
+                    HStack {
+                        Text("附加效果:").font(.caption).foregroundColor(.secondary).frame(width: 60, alignment: .trailing)
+                        Toggle("🔊 播放系统提示音", isOn: Binding<Bool>(
+                            get: { updateBinding(index: 3, defaultVal: "true").wrappedValue == "true" },
+                            set: { newVal in updateBinding(index: 3, defaultVal: "true").wrappedValue = newVal ? "true" : "false" }
+                        ))
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .tint(.blue)
+                        
+                        Spacer()
+                    }
+                }
+                .padding(.vertical, 4)
+            }
             
-            if notifyType == "alert" {
-                Text("⚠️ 流程运行到此节点时会暂停，直到您手动点击确定。")
+            // 针对弹窗模式给予用户的明确警告
+            if parts[2] == "dialog" {
+                Text("⚠️ 注意：流程运行到此节点时会被完全挂起，直到您手动点击弹窗的 [确定] 才会继续执行后续动作。")
                     .font(.caption2)
                     .foregroundColor(.orange)
+                    .padding(.top, 2)
             }
         }
+    }
+    
+    // 安全的双向绑定构造器
+    private func updateBinding(index: Int, defaultVal: String) -> Binding<String> {
+        Binding(
+            get: {
+                let currentVal = parts[index]
+                return currentVal.isEmpty && index == 0 ? defaultVal : currentVal // 仅对标题做默认值视觉填充
+            },
+            set: { newVal in
+                var newParts = parts
+                // 若出现极度异常的情况，兜底空值
+                if newParts[0].isEmpty { newParts[0] = "RPA 提醒" }
+                if newParts[2].isEmpty { newParts[2] = "banner" }
+                if newParts[3].isEmpty { newParts[3] = "true" }
+                
+                newParts[index] = newVal
+                parameter = newParts.joined(separator: "|")
+            }
+        )
     }
 }
 
@@ -1135,11 +1135,15 @@ class ScreenRegionPicker {
     static let shared = ScreenRegionPicker()
     private var window: NSWindow?
     private var eventMonitor: Any?
+    // [✨修复1] 引入弱引用记录拾取前的真实主窗口，彻底抛弃危险的 className 扫描
+    private weak var previousMainWindow: NSWindow?
     
     @MainActor func pickRegion(completion: @escaping (CGRect?) -> Void) {
         if window != nil { return }
         
-        NSApp.windows.first(where: { $0.className.contains("AppKitWindow") })?.miniaturize(nil)
+        // 安全获取当前可见的主窗口并最小化
+        previousMainWindow = NSApp.windows.first(where: { $0.isKeyWindow || ($0.className.contains("AppKitWindow") && $0.isVisible) })
+        previousMainWindow?.miniaturize(nil)
         
         var totalRect = CGRect.zero
         for screen in NSScreen.screens {
@@ -1152,20 +1156,28 @@ class ScreenRegionPicker {
         win.isOpaque = false
         win.hasShadow = false
         win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        win.isReleasedWhenClosed = false
         
         let view = RegionPickerView()
         
-        // [✨核心修复] 异步延迟释放，彻底杜绝 mouseUp 事件周期内销毁窗口导致的崩溃
         let cleanup = { [weak self] (rect: CGRect?) in
-            DispatchQueue.main.async {
+            // [✨修复2] 先仅仅在视觉上隐藏窗口，阻断后续误触，但内存不销毁
+            self?.window?.orderOut(nil)
+            
+            // [✨修复3] 强制延迟 0.15 秒，让底层 AppKit 的 MouseUp 事件循环彻底走完，避免强杀报错
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                 if let monitor = self?.eventMonitor {
                     NSEvent.removeMonitor(monitor)
                     self?.eventMonitor = nil
                 }
+                
                 self?.window?.close()
                 self?.window = nil
                 completion(rect)
-                NSApp.windows.first(where: { $0.className.contains("AppKitWindow") })?.deminiaturize(nil)
+                
+                // [✨修复4] 安全、精准地恢复记录的主窗口
+                self?.previousMainWindow?.deminiaturize(nil)
+                self?.previousMainWindow = nil
             }
         }
         
@@ -1391,6 +1403,387 @@ class UIElementOverlayView: NSView {
     }
 }
 
+// MARK: - [逻辑与数据] 文件操作编辑器
+/// 提供对本地纯文本、CSV 等格式文件的读、写、追加操作
+struct FileOperationEditor: View {
+    @Binding var action: RPAAction
+    
+    var body: some View {
+        let parts = action.parameter.components(separatedBy: "|")
+        let opType = parts.count > 0 ? parts[0] : "read"
+        let filePath = parts.count > 1 ? parts[1] : ""
+        let contentOrVar = parts.count > 2 ? parts[2] : ""
+        
+        let updateParam = { (t: String, p: String, c: String) in
+            action.parameter = "\(t)|\(p)|\(c)"
+        }
+        
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("操作类型:").font(.caption)
+                Picker("", selection: Binding(get: { opType }, set: { updateParam($0, filePath, contentOrVar) })) {
+                    Text("📖 读取文件至变量").tag("read")
+                    Text("✍️ 覆写内容至文件").tag("write")
+                    Text("➕ 追加内容至文件").tag("append")
+                    Text("🔍 检测文件是否存在").tag("exists")
+                }.labelsHidden().frame(width: 180)
+            }
+            
+            HStack {
+                TextField("文件绝对路径 (支持 {{变量}})", text: Binding(get: { filePath }, set: { updateParam(opType, $0, contentOrVar) }))
+                    .textFieldStyle(.roundedBorder)
+                
+                Button(action: {
+                    let panel = NSOpenPanel()
+                    panel.canChooseFiles = true
+                    panel.canChooseDirectories = false
+                    panel.allowsMultipleSelection = false
+                    if panel.runModal() == .OK, let url = panel.url {
+                        updateParam(opType, url.path, contentOrVar)
+                    }
+                }) { Image(systemName: "folder") }
+            }
+            
+            Divider()
+            
+            if opType == "read" || opType == "exists" {
+                HStack {
+                    Image(systemName: "tray.and.arrow.down").foregroundColor(.orange)
+                    Text("结果存入变量:").font(.caption).foregroundColor(.secondary)
+                    TextField("例如: fileData", text: Binding(get: { contentOrVar }, set: { updateParam(opType, filePath, $0) }))
+                        .textFieldStyle(.roundedBorder)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("写入的内容 (支持 {{变量}}):").font(.caption).foregroundColor(.secondary)
+                    TextEditor(text: Binding(get: { contentOrVar }, set: { updateParam(opType, filePath, $0) }))
+                        .font(.system(size: 12))
+                        .frame(height: 80)
+                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
+                }
+            }
+        }
+    }
+}
+
+// MARK: - [逻辑与数据] 数据提取与清洗编辑器
+/// 提供 JSON 解析和 正则表达式 提取能力
+struct DataExtractionEditor: View {
+    @Binding var action: RPAAction
+    
+    var body: some View {
+        let parts = action.parameter.components(separatedBy: "|")
+        let sourceData = parts.count > 0 ? parts[0] : "{{http_response}}"
+        let extractType = parts.count > 1 ? parts[1] : "json"
+        let rule = parts.count > 2 ? parts[2] : ""
+        let targetVar = parts.count > 3 ? parts[3] : "extracted_value"
+        
+        let updateParam = { (s: String, t: String, r: String, v: String) in
+            action.parameter = "\(s)|\(t)|\(r)|\(v)"
+        }
+        
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("数据来源:").font(.caption)
+                TextField("如 {{http_response}}", text: Binding(get: { sourceData }, set: { updateParam($0, extractType, rule, targetVar) }))
+                    .textFieldStyle(.roundedBorder)
+            }
+            
+            HStack {
+                Text("提取方式:").font(.caption)
+                Picker("", selection: Binding(get: { extractType }, set: { updateParam(sourceData, $0, rule, targetVar) })) {
+                    Text("JSON 键值 (Key)").tag("json")
+                    Text("正则表达式 (Regex)").tag("regex")
+                }.labelsHidden().frame(width: 160)
+            }
+            
+            VStack(alignment: .leading, spacing: 4) {
+                Text(extractType == "json" ? "JSON 提取规则 (例如: data.user.id)" : "正则提取规则 (例如: \\d{4,})").font(.caption).foregroundColor(.secondary)
+                TextField("提取规则", text: Binding(get: { rule }, set: { updateParam(sourceData, extractType, $0, targetVar) }))
+                    .textFieldStyle(.roundedBorder)
+            }
+            
+            HStack {
+                Image(systemName: "tray.and.arrow.down").foregroundColor(.orange)
+                Text("结果存入变量:").font(.caption).foregroundColor(.secondary)
+                TextField("变量名", text: Binding(get: { targetVar }, set: { updateParam(sourceData, extractType, rule, $0) }))
+                    .textFieldStyle(.roundedBorder)
+            }
+        }
+    }
+}
+
+// MARK: - [系统与应用] 窗口控制编辑器
+struct WindowOperationEditor: View {
+    @Binding var action: RPAAction
+    
+    var body: some View {
+        let parts = action.parameter.components(separatedBy: "|")
+        let appName = parts.count > 0 ? parts[0] : ""
+        let operation = parts.count > 1 ? parts[1] : "maximize" // maximize, minimize, close, bounds
+        let boundsRect = parts.count > 2 ? parts[2] : "0, 0, 800, 600"
+        
+        let updateParam = { (app: String, op: String, bounds: String) in
+            action.parameter = "\(app)|\(op)|\(bounds)"
+        }
+        
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("目标应用:").font(.caption).foregroundColor(.secondary)
+                TextField("如: Safari", text: Binding(get: { appName }, set: { updateParam($0, operation, boundsRect) }))
+                    .textFieldStyle(.roundedBorder)
+                
+                Menu {
+                    let runningApps = NSWorkspace.shared.runningApplications
+                        .filter { $0.activationPolicy == .regular }
+                        .compactMap { $0.localizedName }.sorted()
+                    ForEach(runningApps, id: \.self) { app in
+                        Button(app) { updateParam(app, operation, boundsRect) }
+                    }
+                } label: { Image(systemName: "app.dashed") }.fixedSize()
+            }
+            
+            HStack {
+                Text("执行动作:").font(.caption).foregroundColor(.secondary)
+                Picker("", selection: Binding(get: { operation }, set: { updateParam(appName, $0, boundsRect) })) {
+                    Text("🟩 全屏 / 最大化").tag("maximize")
+                    Text("🟨 最小化到程序坞").tag("minimize")
+                    Text("🟥 关闭窗口").tag("close")
+                    Text("🔲 调整尺寸与位置").tag("bounds")
+                }.labelsHidden().frame(width: 160)
+            }
+            
+            if operation == "bounds" {
+                HStack {
+                    Text("窗口区域:").font(.caption).foregroundColor(.secondary)
+                    TextField("X, Y, 宽, 高 (如: 0, 0, 800, 600)", text: Binding(get: { boundsRect }, set: { updateParam(appName, operation, $0) }))
+                        .textFieldStyle(.roundedBorder)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - [逻辑与数据] 循环遍历编辑器
+struct LoopItemsEditor: View {
+    @Binding var action: RPAAction
+    
+    var body: some View {
+        let parts = action.parameter.components(separatedBy: "|")
+        let sourceArray = parts.count > 0 ? parts[0] : "{{json_array}}"
+        let itemVarName = parts.count > 1 ? parts[1] : "item"
+        let targetWorkflowId = parts.count > 2 ? parts[2] : ""
+        
+        let updateParam = { (src: String, item: String, wfId: String) in
+            action.parameter = "\(src)|\(item)|\(wfId)"
+        }
+        
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("数据源 (JSON 数组):").font(.caption).foregroundColor(.secondary)
+                TextField("支持 {{变量}}", text: Binding(get: { sourceArray }, set: { updateParam($0, itemVarName, targetWorkflowId) }))
+                    .textFieldStyle(.roundedBorder)
+            }
+            
+            HStack {
+                Image(systemName: "tray.and.arrow.down").foregroundColor(.orange)
+                Text("当前项存入变量:").font(.caption).foregroundColor(.secondary)
+                TextField("例如: item", text: Binding(get: { itemVarName }, set: { updateParam(sourceArray, $0, targetWorkflowId) }))
+                    .textFieldStyle(.roundedBorder)
+            }
+            
+            Divider()
+            
+            VStack(alignment: .leading, spacing: 4) {
+                Text("为每一项执行子工作流：").font(.caption).foregroundColor(.secondary)
+                let allWorkflows = StorageManager.shared.load()
+                let currentWorkflowId = allWorkflows.first(where: { wf in wf.actions.contains(where: { $0.id == action.id }) })?.id.uuidString ?? ""
+                
+                Picker("", selection: Binding(get: { targetWorkflowId }, set: { updateParam(sourceArray, itemVarName, $0) })) {
+                    Text("请选择子工作流...").tag("")
+                    ForEach(allWorkflows) { wf in
+                        // 防死循环机制：排除自己
+                        if wf.id.uuidString != currentWorkflowId {
+                            Text(wf.name).tag(wf.id.uuidString)
+                        }
+                    }
+                }
+                .labelsHidden()
+            }
+            
+            Text("💡 提示：此节点会解析数组，对于数组中的每一个元素，都会将该元素存入变量池中，然后同步调用一次选中的子工作流。").font(.caption2).foregroundColor(.blue)
+        }
+    }
+}
+
+// MARK: - [AI与视觉] AI 视觉元素定位交互编辑器 (终极版)
+/// 支持目标窗口隔离截取、自定义区域框选、以及点击坐标偏移量设置
+struct AIVisionLocatorEditor: View {
+    @Binding var action: RPAAction
+    @State private var isPickingRegion = false
+    
+    var body: some View {
+        // 参数格式: 目标描述 | 动作类型 | 超时时间 | 失败是否忽略 | 目标App | 坐标偏移(X,Y) | 扫描区域(X,Y,W,H)
+        let parts = action.parameter.components(separatedBy: "|")
+        let targetDesc = parts.count > 0 ? parts[0] : ""
+        let actionType = parts.count > 1 ? parts[1] : "leftClick"
+        let timeout = parts.count > 2 ? parts[2] : "10"
+        let ignoreError = parts.count > 3 ? (parts[3] == "true") : false
+        let targetApp = parts.count > 4 ? parts[4] : ""
+        let offsetStr = parts.count > 5 ? parts[5] : "0,0"
+        let regionStr = parts.count > 6 ? parts[6] : ""
+        
+        let updateParam = { (desc: String, type: String, tm: String, ignore: Bool, app: String, off: String, reg: String) in
+            action.parameter = "\(desc)|\(type)|\(tm)|\(ignore ? "true" : "false")|\(app)|\(off)|\(reg)"
+        }
+        
+        VStack(alignment: .leading, spacing: 14) {
+            GroupBox("🎯 视觉目标描述 (Prompt)") {
+                VStack(alignment: .leading, spacing: 4) {
+                    TextEditor(text: Binding(
+                        get: { targetDesc },
+                        set: { updateParam($0, actionType, timeout, ignoreError, targetApp, offsetStr, regionStr) }
+                    ))
+                    .font(.system(size: 12))
+                    .frame(height: 50)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
+                    
+                    Text("提示：如'右上角的齿轮设置图标'，大模型将返回该图标坐标。").font(.caption2).foregroundColor(.purple)
+                }
+                .padding(4)
+            }
+            
+            GroupBox("🔍 扫描范围约束") {
+                VStack(spacing: 10) {
+                    HStack {
+                        Text("限定应用:").font(.caption).foregroundColor(.secondary).frame(width: 60, alignment: .leading)
+                        TextField("留空为扫描全屏幕", text: Binding(get: { targetApp }, set: { updateParam(targetDesc, actionType, timeout, ignoreError, $0, offsetStr, regionStr) }))
+                        
+                        Menu {
+                            let runningApps = NSWorkspace.shared.runningApplications
+                                .filter { $0.activationPolicy == .regular }
+                                .compactMap { $0.localizedName }.sorted()
+                            ForEach(runningApps, id: \.self) { appName in
+                                Button(appName) { updateParam(targetDesc, actionType, timeout, ignoreError, appName, offsetStr, regionStr) }
+                            }
+                        } label: { Image(systemName: "app.dashed") }.fixedSize()
+                    }
+                    
+                    HStack {
+                        Text("限定区域:").font(.caption).foregroundColor(.secondary).frame(width: 60, alignment: .leading)
+                        TextField("X, Y, 宽, 高 (留空为全视窗)", text: Binding(get: { regionStr }, set: { updateParam(targetDesc, actionType, timeout, ignoreError, targetApp, offsetStr, $0) }))
+                        Button(action: {
+                            isPickingRegion = true
+                            ScreenRegionPicker.shared.pickRegion { rect in
+                                if let r = rect { updateParam(targetDesc, actionType, timeout, ignoreError, targetApp, offsetStr, "\(Int(r.minX)), \(Int(r.minY)), \(Int(r.width)), \(Int(r.height))") }
+                                isPickingRegion = false
+                            }
+                        }) { Label("拾取", systemImage: "viewfinder") }
+                    }
+                }
+                .textFieldStyle(.roundedBorder)
+            }
+            
+            HStack(spacing: 16) {
+                HStack {
+                    Text("定位动作:").font(.caption)
+                    Picker("", selection: Binding(get: { actionType }, set: { updateParam(targetDesc, $0, timeout, ignoreError, targetApp, offsetStr, regionStr) })) {
+                        Text("🖱️ 左键点击").tag("leftClick")
+                        Text("🖱️ 双击").tag("doubleClick")
+                        Text("🖱️ 右键点击").tag("rightClick")
+                        Text("📍 仅移动").tag("move")
+                    }.labelsHidden().frame(width: 100)
+                }
+                
+                HStack {
+                    Text("坐标偏移:").font(.caption)
+                    TextField("X,Y", text: Binding(get: { offsetStr }, set: { updateParam(targetDesc, actionType, timeout, ignoreError, targetApp, $0, regionStr) }))
+                        .textFieldStyle(.roundedBorder).frame(width: 60)
+                }
+            }
+            
+            HStack(spacing: 16) {
+                HStack {
+                    Text("⏳ AI超时:").font(.caption)
+                    TextField("10", text: Binding(get: { timeout }, set: { updateParam(targetDesc, actionType, $0, ignoreError, targetApp, offsetStr, regionStr) }))
+                        .textFieldStyle(.roundedBorder).frame(width: 40)
+                    Text("秒").font(.caption)
+                }
+                
+                Toggle("忽略错误并继续", isOn: Binding(
+                    get: { ignoreError },
+                    set: { updateParam(targetDesc, actionType, timeout, $0, targetApp, offsetStr, regionStr) }
+                )).toggleStyle(.switch).controlSize(.mini).tint(.orange)
+            }
+        }
+    }
+}
+
+// MARK: - [逻辑与数据] AI 智能数据结构化编辑器 (进阶版)
+/// 支持强制 JSON Schema 模板校验约束
+struct AITextParseEditor: View {
+    @Binding var action: RPAAction
+    
+    var body: some View {
+        // 参数格式: 数据源 | 提取指令 | 输出变量 | JSON模板
+        let parts = action.parameter.components(separatedBy: "|")
+        let sourceVar = parts.count > 0 ? parts[0] : "{{clipboard}}"
+        let instruction = parts.count > 1 ? parts[1] : ""
+        let targetVar = parts.count > 2 ? parts[2] : "parsed_data"
+        let jsonTemplate = parts.count > 3 ? parts[3] : ""
+        
+        let updateParam = { (src: String, inst: String, tar: String, tpl: String) in
+            action.parameter = "\(src)|\(inst)|\(tar)|\(tpl)"
+        }
+        
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("原始数据源:").font(.caption)
+                TextField("如 {{clipboard}} 或 {{ocr_data}}", text: Binding(get: { sourceVar }, set: { updateParam($0, instruction, targetVar, jsonTemplate) }))
+                    .textFieldStyle(.roundedBorder)
+            }
+            
+            GroupBox("🧠 提取指令与结构要求") {
+                VStack(alignment: .leading, spacing: 8) {
+                    TextEditor(text: Binding(
+                        get: { instruction },
+                        set: { updateParam(sourceVar, $0, targetVar, jsonTemplate) }
+                    ))
+                    .font(.system(size: 12))
+                    .frame(height: 50)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
+                    
+                    Text("强制输出格式模板 (JSON Schema)：").font(.caption).foregroundColor(.secondary)
+                    
+                    // [✨进阶能力] 强制模板约束输入框
+                    TextEditor(text: Binding(
+                        get: { jsonTemplate },
+                        set: { updateParam(sourceVar, instruction, targetVar, $0) }
+                    ))
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(height: 60)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.blue.opacity(0.3)))
+                    
+                    Text("例如填入: {\"name\": \"未知\", \"age\": 0}，可彻底消除下游 JSON 解析崩溃风险。").font(.caption2).foregroundColor(.blue)
+                }
+                .padding(4)
+            }
+            
+            HStack {
+                Image(systemName: "tray.and.arrow.down").foregroundColor(.orange)
+                Text("结果存入变量:").font(.caption).foregroundColor(.secondary)
+                TextField("变量名，例如: user_info", text: Binding(get: { targetVar }, set: { updateParam(sourceVar, instruction, $0, jsonTemplate) }))
+                    .textFieldStyle(.roundedBorder)
+            }
+        }
+    }
+}
+
+
+// -----------------------------------------------------------------------------------
+// 💡极客级辅助视图代码 (MiniDesktop, OCRMiniDesktop, 连接线绘制, 截屏工具等)
+// -----------------------------------------------------------------------------------
+
 // MARK: - [✨新增] 屏幕精准坐标拾取器
 class PointPickerView: NSView {
     var completion: ((CGPoint) -> Void)?
@@ -1402,10 +1795,12 @@ class PointPickerView: NSView {
     
     override func mouseDown(with event: NSEvent) {
         // 获取全局的绝对物理坐标 (左上角原点，与 CGEvent 体系完美契合)
-        if let cgLoc = CGEvent(source: nil)?.location {
-            completion?(cgLoc)
-        } else {
-            completion?(.zero)
+        let cgLoc = CGEvent(source: nil)?.location ?? .zero
+        
+        // [✨核心修复] 必须异步派发！脱离当前 NSEvent 的事件循环周期。
+        // 否则如果在 mouseDown 瞬间销毁 window，会导致 AppKit 底层野指针崩溃
+        DispatchQueue.main.async {
+            self.completion?(cgLoc)
         }
     }
     
@@ -1439,6 +1834,9 @@ class ScreenPointPicker {
         win.hasShadow = false
         win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         
+        // [✨核心修复] 关闭自动释放，让 Swift 的 ARC 完全接管，防止 Window Double Free 崩溃
+        win.isReleasedWhenClosed = false
+        
         let view = PointPickerView()
         
         let cleanup = { [weak self] (point: CGPoint?) in
@@ -1469,6 +1867,304 @@ class ScreenPointPicker {
                 return nil
             }
             return event
+        }
+    }
+}
+
+// MARK: - 迷你桌面渲染器 (鼠标动作)
+/// 可视化指示鼠标将要在屏幕上执行的坐标动作
+struct MouseMiniDesktop: View {
+    @Binding var point1Str: String
+    @Binding var point2Str: String
+    var isDrag: Bool
+    var isRelative: Bool
+    
+    // [✨核心修复] 必须使用 screens.first (主屏幕)！因为 CGEvent 的 (0,0) 永远在主屏幕的左上角
+    let screen = NSScreen.screens.first?.frame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
+    
+    func getPoint(_ str: String, defaultPt: CGPoint) -> CGPoint {
+        let parts = str.split(separator: ",")
+        if parts.count == 2,
+           let x = Double(parts[0].trimmingCharacters(in: .whitespaces)),
+           let y = Double(parts[1].trimmingCharacters(in: .whitespaces)) {
+            return CGPoint(x: x, y: y)
+        }
+        return defaultPt
+    }
+    
+    var body: some View {
+        GeometryReader { geo in
+            let scaleX = geo.size.width / screen.width
+            let scaleY = geo.size.height / screen.height
+            
+            ZStack(alignment: .topLeading) {
+                RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.8))
+                RoundedRectangle(cornerRadius: 6).stroke(Color.gray, lineWidth: 2)
+                
+                let center = CGPoint(x: geo.size.width / 2, y: geo.size.height / 2)
+                
+                if isRelative {
+                    Path { p in
+                        p.move(to: CGPoint(x: center.x, y: 0))
+                        p.addLine(to: CGPoint(x: center.x, y: geo.size.height))
+                        p.move(to: CGPoint(x: 0, y: center.y))
+                        p.addLine(to: CGPoint(x: geo.size.width, y: center.y))
+                    }.stroke(Color.white.opacity(0.2), lineWidth: 1)
+                }
+                
+                let p1 = getPoint(point1Str, defaultPt: isRelative ? .zero : CGPoint(x: screen.width/2, y: screen.height/2))
+                let vP1 = isRelative ? CGPoint(x: center.x + p1.x * scaleX, y: center.y + p1.y * scaleY) : CGPoint(x: p1.x * scaleX, y: p1.y * scaleY)
+                
+                if isDrag {
+                    let p2 = getPoint(point2Str, defaultPt: isRelative ? .zero : CGPoint(x: screen.width/2 + 50, y: screen.height/2 + 50))
+                    let vP2 = isRelative ? CGPoint(x: vP1.x + p2.x * scaleX, y: vP1.y + p2.y * scaleY) : CGPoint(x: p2.x * scaleX, y: p2.y * scaleY)
+                    
+                    Path { p in
+                        p.move(to: vP1)
+                        p.addLine(to: vP2)
+                    }.stroke(Color.blue, style: StrokeStyle(lineWidth: 2, dash: [4, 4]))
+                    
+                    Circle()
+                        .fill(Color.red)
+                        .frame(width: 14, height: 14)
+                        .position(vP2)
+                        .overlay(Text("终").font(.system(size: 9)).position(vP2).foregroundColor(.white))
+                        .gesture(
+                            // [✨核心修复] minimumDistance: 0 配合 val.location，摒弃 translation 累积误差
+                            DragGesture(minimumDistance: 0)
+                                .onChanged { val in
+                                    if isRelative {
+                                        let rawX = (val.location.x - vP1.x) / scaleX
+                                        let rawY = (val.location.y - vP1.y) / scaleY
+                                        point2Str = "\(Int(rawX)), \(Int(rawY))"
+                                    } else {
+                                        // 绝对坐标系：直接将手势所在画布的绝对位置换算为屏幕真实坐标
+                                        let rawX = val.location.x / scaleX
+                                        let rawY = val.location.y / scaleY
+                                        let clampedX = max(0, min(screen.width, rawX))
+                                        let clampedY = max(0, min(screen.height, rawY))
+                                        point2Str = "\(Int(clampedX)), \(Int(clampedY))"
+                                    }
+                                }
+                        )
+                }
+                
+                Circle()
+                    .fill(Color.green)
+                    .frame(width: 14, height: 14)
+                    .position(vP1)
+                    .overlay(Text(isDrag ? "起" : "点").font(.system(size: 9)).position(vP1).foregroundColor(.white))
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { val in
+                                if isRelative {
+                                    let rawX = (val.location.x - center.x) / scaleX
+                                    let rawY = (val.location.y - center.y) / scaleY
+                                    point1Str = "\(Int(rawX)), \(Int(rawY))"
+                                } else {
+                                    let rawX = val.location.x / scaleX
+                                    let rawY = val.location.y / scaleY
+                                    let clampedX = max(0, min(screen.width, rawX))
+                                    let clampedY = max(0, min(screen.height, rawY))
+                                    point1Str = "\(Int(clampedX)), \(Int(clampedY))"
+                                }
+                            }
+                    )
+            }
+        }
+        .aspectRatio(screen.width / screen.height, contentMode: .fit)
+        .frame(height: 120)
+    }
+}
+
+// MARK: - OCR区域截取迷你桌面
+/// 用于展示和微调视觉搜索区域的缩略图组件
+struct OCRMiniDesktop: View {
+    @Binding var regionStr: String
+    @Binding var offsetX: Double
+    @Binding var offsetY: Double
+    
+    // [✨核心修复] 同样使用第一主屏幕
+    let screen = NSScreen.screens.first?.frame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
+    @State private var dragStartRegion: CGRect? = nil
+    
+    var currentRegion: CGRect {
+        let parts = regionStr.split(separator: ",")
+        if parts.count == 4,
+           let x = Double(parts[0].trimmingCharacters(in: .whitespaces)),
+           let y = Double(parts[1].trimmingCharacters(in: .whitespaces)),
+           let w = Double(parts[2].trimmingCharacters(in: .whitespaces)),
+           let h = Double(parts[3].trimmingCharacters(in: .whitespaces)) {
+            return CGRect(x: x, y: y, width: w, height: h)
+        }
+        return CGRect(x: 0, y: 0, width: screen.width, height: screen.height)
+    }
+    
+    var body: some View {
+        GeometryReader { geo in
+            let scaleX = geo.size.width / screen.width
+            let scaleY = geo.size.height / screen.height
+            
+            ZStack(alignment: .topLeading) {
+                RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.8))
+                RoundedRectangle(cornerRadius: 6).stroke(Color.gray, lineWidth: 2)
+                
+                let r = currentRegion
+                let viewRect = CGRect(x: r.minX * scaleX, y: r.minY * scaleY, width: r.width * scaleX, height: r.height * scaleY)
+                
+                Rectangle()
+                    .fill(Color.blue.opacity(0.3))
+                    .border(Color.blue, width: 1)
+                    .frame(width: max(viewRect.width, 10), height: max(viewRect.height, 10))
+                    .offset(x: viewRect.minX, y: viewRect.minY)
+                    .gesture(
+                        DragGesture()
+                            .onChanged { val in
+                                if dragStartRegion == nil { dragStartRegion = r }
+                                if let start = dragStartRegion {
+                                    let newX = max(0, min(screen.width - start.width, start.minX + val.translation.width / scaleX))
+                                    let newY = max(0, min(screen.height - start.height, start.minY + val.translation.height / scaleY))
+                                    regionStr = "\(Int(newX)), \(Int(newY)), \(Int(start.width)), \(Int(start.height))"
+                                }
+                            }
+                            .onEnded { _ in dragStartRegion = nil }
+                    )
+                
+                let center = CGPoint(x: viewRect.midX, y: viewRect.midY)
+                let absoluteCenter = CGPoint(x: r.midX, y: r.midY)
+                
+                let offsetViewX = offsetX * scaleX
+                let offsetViewY = offsetY * scaleY
+                let targetViewPt = CGPoint(x: center.x + offsetViewX, y: center.y + offsetViewY)
+                
+                Path { p in
+                    p.move(to: center)
+                    p.addLine(to: targetViewPt)
+                }.stroke(Color.red, style: StrokeStyle(lineWidth: 1, dash: [2,2]))
+                
+                Circle().fill(Color.green).frame(width: 6, height: 6).position(center)
+                
+                Circle()
+                    .fill(Color.red)
+                    .frame(width: 14, height: 14)
+                    .position(targetViewPt)
+                    .overlay(Text("点").font(.system(size: 9)).position(targetViewPt).foregroundColor(.white))
+                    .gesture(
+                        // [✨核心修复] 使用画布绝对位置直接反推 Offset
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { val in
+                                let absoluteX = val.location.x / scaleX
+                                let absoluteY = val.location.y / scaleY
+                                
+                                let clampedAbsX = max(0, min(screen.width, absoluteX))
+                                let clampedAbsY = max(0, min(screen.height, absoluteY))
+                                
+                                offsetX = clampedAbsX - absoluteCenter.x
+                                offsetY = clampedAbsY - absoluteCenter.y
+                            }
+                    )
+            }
+        }
+        .aspectRatio(screen.width / screen.height, contentMode: .fit)
+        .frame(height: 120)
+    }
+}
+
+// MARK: - [AI与视觉] OCR 结构化全文提取编辑器
+struct OCRExtractEditor: View {
+    @Binding var action: RPAAction
+    @State private var isPickingRegion = false
+    
+    var body: some View {
+        // 参数格式: regionStr | targetApp | outputFormat | languages | level | variableName
+        let parts = action.parameter.components(separatedBy: "|")
+        let regionStr = parts.count > 0 ? parts[0] : ""
+        let targetApp = parts.count > 1 ? parts[1] : ""
+        let outputFormat = parts.count > 2 ? parts[2] : "json"
+        let languages = parts.count > 3 ? parts[3] : "zh-Hans,en-US"
+        let level = parts.count > 4 ? parts[4] : "accurate"
+        let variableName = parts.count > 5 ? parts[5] : "ocr_data"
+        
+        let updateParam = { (r: String, app: String, fmt: String, lang: String, lvl: String, vName: String) in
+            action.parameter = "\(r)|\(app)|\(fmt)|\(lang)|\(lvl)|\(vName)"
+        }
+        
+        VStack(alignment: .leading, spacing: 14) {
+            
+            // 1. 范围设定
+            GroupBox("🔍 扫描范围") {
+                VStack(spacing: 10) {
+                    HStack {
+                        Text("限定应用:").font(.caption).foregroundColor(.secondary).frame(width: 60, alignment: .leading)
+                        TextField("留空为扫描整个屏幕", text: Binding(get: { targetApp }, set: { updateParam(regionStr, $0, outputFormat, languages, level, variableName) }))
+                        
+                        Menu {
+                            Button("🌐 内置开发者浏览器") { updateParam(regionStr, "InternalBrowser", outputFormat, languages, level, variableName) }
+                            Divider()
+                            let runningApps = NSWorkspace.shared.runningApplications
+                                .filter { $0.activationPolicy == .regular }.compactMap { $0.localizedName }.sorted()
+                            ForEach(runningApps, id: \.self) { appName in
+                                Button(appName) { updateParam(regionStr, appName, outputFormat, languages, level, variableName) }
+                            }
+                        } label: { Image(systemName: "app.dashed") }.fixedSize()
+                    }
+                    
+                    HStack {
+                        Text("限定区域:").font(.caption).foregroundColor(.secondary).frame(width: 60, alignment: .leading)
+                        TextField("X, Y, 宽, 高 (留空为全视窗)", text: Binding(get: { regionStr }, set: { updateParam($0, targetApp, outputFormat, languages, level, variableName) }))
+                        Button(action: {
+                            isPickingRegion = true
+                            ScreenRegionPicker.shared.pickRegion { rect in
+                                if let r = rect { updateParam("\(Int(r.minX)), \(Int(r.minY)), \(Int(r.width)), \(Int(r.height))", targetApp, outputFormat, languages, level, variableName) }
+                                isPickingRegion = false
+                            }
+                        }) { Label("拾取", systemImage: "viewfinder") }
+                    }
+                }
+                .textFieldStyle(.roundedBorder)
+            }
+            
+            // 2. 引擎参数
+            HStack(spacing: 16) {
+                HStack {
+                    Text("识别语言:").font(.caption)
+                    Picker("", selection: Binding(get: { languages }, set: { updateParam(regionStr, targetApp, outputFormat, $0, level, variableName) })) {
+                        Text("中文+英文").tag("zh-Hans,en-US")
+                        Text("繁体中文").tag("zh-Hant,en-US")
+                        Text("纯英文").tag("en-US")
+                        Text("日文").tag("ja,en-US")
+                        Text("韩文").tag("ko,en-US")
+                    }.labelsHidden().frame(width: 100)
+                }
+                
+                HStack {
+                    Text("性能模式:").font(.caption)
+                    Picker("", selection: Binding(get: { level }, set: { updateParam(regionStr, targetApp, outputFormat, languages, $0, variableName) })) {
+                        Text("🎯 精准 (慢)").tag("accurate")
+                        Text("⚡️ 极速 (快)").tag("fast")
+                    }.labelsHidden().frame(width: 100)
+                }
+            }
+            
+            Divider()
+            
+            // 3. 输出设定
+            HStack {
+                Text("数据格式:").font(.caption)
+                Picker("", selection: Binding(get: { outputFormat }, set: { updateParam(regionStr, targetApp, $0, languages, level, variableName) })) {
+                    Text("结构化 JSON (带坐标宽高)").tag("json")
+                    Text("纯文本合并 (按行)").tag("text")
+                }.labelsHidden().frame(width: 180)
+            }
+            
+            HStack {
+                Image(systemName: "tray.and.arrow.down").foregroundColor(.orange)
+                Text("保存至变量:").font(.caption).foregroundColor(.secondary)
+                TextField("例如: ocr_data", text: Binding(get: { variableName }, set: { updateParam(regionStr, targetApp, outputFormat, languages, level, $0) }))
+                    .textFieldStyle(.roundedBorder)
+            }
+            Text(outputFormat == "json" ? "💡 提示：JSON 格式将返回包含 text, x, y, width, height 的数组，其坐标可直接传给鼠标节点使用。" : "💡 提示：纯文本格式适合直接传给大模型进行阅读理解或摘要提取。")
+                .font(.caption2).foregroundColor(.blue)
         }
     }
 }

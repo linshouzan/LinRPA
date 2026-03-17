@@ -291,7 +291,7 @@ class WorkflowEngine {
         var param = ""
         if type == .aiVision { param = "提取屏幕上的主要内容：" }
         if type == .condition { param = "{{clipboard}}|contains|成功" }
-        if type == .showNotification { param = "banner|RPA 提醒|工作流执行到了这里" }
+        if type == .showNotification { param = "banner|RPA 提醒|我是消息内容" }
         if type == .setVariable { param = "myVar|测试数据" }
         if type == .httpRequest { param = "https://api.github.com|GET" }
         if type == .uiInteraction { param = "Safari|||click" }

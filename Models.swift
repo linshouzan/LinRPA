@@ -28,22 +28,30 @@ enum ActionType: String, CaseIterable, Codable {
     case writeClipboard = "写入剪贴板"
     case ocrText = "识别屏幕文字"
     case aiVision = "AI屏幕视觉分析"
-    case webAgent = "Web智能体自主操作" // [✨新增] Web Agent 3.0
+    case webAgent = "Web智能体自主操作"
     case condition = "条件判断分支"
     case wait = "等待延时"
+    case askUserInput = "人工介入与提问"
     case runShell = "执行Shell脚本"
     case runAppleScript = "执行AppleScript"
     case setVariable = "设置全局变量"
     case httpRequest = "发送HTTP请求"
     case uiInteraction = "原生UI元素交互"
     case callWorkflow = "调用子工作流"
+    case fileOperation = "文件与目录操作"
+    case dataExtraction = "数据清洗与提取"
+    case windowOperation = "窗口控制"
+    case loopItems = "遍历数据(循环)"
+    case ocrExtract = "OCR结构化全文提取"
+    case aiVisionLocator = "AI 视觉元素定位"
+    case aiDataParse = "AI 智能数据结构化"
     
     var category: ActionCategory {
         switch self {
-        case .openApp, .openURL, .showNotification, .uiInteraction: return .system
+        case .openApp, .openURL, .showNotification, .askUserInput, .uiInteraction, .windowOperation: return .system
         case .typeText, .mouseOperation, .readClipboard, .writeClipboard: return .mouseKeyboard
-        case .ocrText, .aiVision, .webAgent: return .aiVision
-        case .condition, .wait, .runShell, .runAppleScript, .setVariable, .httpRequest, .callWorkflow: return .logicData
+        case .ocrText, .ocrExtract, .webAgent, .aiVision, .aiVisionLocator, .aiDataParse: return .aiVision
+        case .condition, .wait, .runShell, .runAppleScript, .setVariable, .httpRequest, .callWorkflow, .fileOperation, .dataExtraction, .loopItems: return .logicData
         }
     }
     
@@ -61,12 +69,20 @@ enum ActionType: String, CaseIterable, Codable {
         case .condition: return "arrow.triangle.branch"
         case .showNotification: return "bell.badge.fill"
         case .wait: return "timer"
+        case .askUserInput: return "person.crop.circle.badge.questionmark"
         case .aiVision: return "brain.head.profile"
-        case .webAgent: return "globe.badge.chevron.backward" // 专属图标
+        case .webAgent: return "globe.badge.chevron.backward"
         case .setVariable: return "tray.full.fill"
         case .httpRequest: return "network"
         case .uiInteraction: return "macwindow.on.rectangle"
         case .callWorkflow: return "arrow.triangle.merge"
+        case .fileOperation: return "doc.text.fill"
+        case .dataExtraction: return "text.magnifyingglass"
+        case .windowOperation: return "uiwindow.split.2x1"
+        case .loopItems: return "repeat.circle"
+        case .ocrExtract: return "doc.text.viewfinder"
+        case .aiVisionLocator: return "scope"
+        case .aiDataParse: return "wand.and.stars"
         }
     }
 }
@@ -149,6 +165,32 @@ struct RPAAction: Identifiable, Codable, Equatable, Hashable {
             let titleStr = parts.count > 2 ? parts[2] : ""
             let prefix = matchMode == "contains" ? "包含" : (matchMode == "regex" ? "正则匹配" : "")
             return appName.isEmpty ? type.rawValue : "\(actionStr): \(appName) \(prefix) [\(titleStr.isEmpty ? "元素" : titleStr)]"
+        case .fileOperation:
+            let parts = parameter.components(separatedBy: "|")
+            let opType = parts.count > 0 ? parts[0] : ""
+            let path = parts.count > 1 ? parts[1].components(separatedBy: "/").last ?? "" : ""
+            let opName = opType == "read" ? "读取" : (opType == "write" ? "写入" : (opType == "append" ? "追加" : "操作"))
+            return "\(opName)文件: \(path)"
+        case .dataExtraction:
+            let parts = parameter.components(separatedBy: "|")
+            let extType = parts.count > 1 ? parts[1] : ""
+            let varName = parts.count > 3 ? parts[3] : ""
+            return "提取 \(extType == "json" ? "JSON" : "正则") -> \(varName)"
+        case .windowOperation:
+            let parts = parameter.components(separatedBy: "|")
+            let app = parts.count > 0 ? parts[0] : ""
+            let op = parts.count > 1 ? parts[1] : ""
+            let opName = op == "maximize" ? "最大化" : (op == "minimize" ? "最小化" : (op == "close" ? "关闭" : "调整"))
+            return app.isEmpty ? type.rawValue : "窗口: \(app) [\(opName)]"
+        case .loopItems:
+            let parts = parameter.components(separatedBy: "|")
+            let source = parts.count > 0 ? parts[0] : ""
+            return source.isEmpty ? type.rawValue : "循环遍历: \(source)"
+        case .ocrExtract:
+            let parts = parameter.components(separatedBy: "|")
+            let varName = parts.count > 5 ? parts[5] : "ocr_data"
+            let fmt = parts.count > 2 ? (parts[2] == "json" ? "JSON" : "纯文本") : "数据"
+            return "提取屏幕全文 -> [\(fmt)] {{\(varName)}}"
         default: return type.rawValue
         }
     }
