@@ -4,6 +4,7 @@
 // 功能说明：已深度适配 RPA WebAgent 3.0，支持引擎底层无缝接管与异步 DOM 通信
 // 修复说明：默认关闭置顶和控制台；引入共享 ProcessPool 修复 Session 缓存；增强 URL 持久化
 // API 升级：支持标准的 OpenAI 兼容流式输出 (/v1/chat/completions)
+// 进阶升级：[✨新增] 深度融合本地 AI 动态 RAG 语料录制体系 (Teacher-Student Pipeline)
 // 代码要求：请保证代码的逻辑和完整性，保留代码中的所有注释内容
 //////////////////////////////////////////////////////////////////
 
@@ -12,34 +13,153 @@ import WebKit
 import Combine
 import AppKit
 
-// MARK: - Constants & Defaults
-
-/// 存储默认脚本常量
-enum DefaultScripts {
-    static let aiExtraction = """
-    (function() {
-        // 回调
-        window.onAiResponse = function(aiResponseText) {
-            console.log(aiResponseText);
+// MARK: - [✨终极修复] 网页语料录制 JS 探针 (带卸载与视觉高亮徽标)
+let corpusRecorderJS = """
+(function() {
+    if (window._rpaCorpusInjected) return;
+    window._rpaCorpusInjected = true;
+    window._rpaEventBuffer = [];
+    
+    // [✨新增] 元素闪烁及 Target ID 徽标视觉反馈
+    function flashElement(el, textMark) {
+        if (!el) return;
+        let oldOutline = el.style.outline;
+        let oldTransition = el.style.transition;
+        el.style.transition = 'outline 0.3s ease-in-out';
+        el.style.outline = '3px solid #ff2d55';
+        
+        let badge = document.createElement('div');
+        if (textMark) {
+            badge.innerText = 'ID: ' + textMark;
+            badge.style.position = 'absolute';
+            badge.style.background = '#ff2d55';
+            badge.style.color = 'white';
+            badge.style.fontSize = '12px';
+            badge.style.fontWeight = 'bold';
+            badge.style.padding = '2px 6px';
+            badge.style.borderRadius = '4px';
+            badge.style.zIndex = '2147483647';
+            badge.style.pointerEvents = 'none';
+            let rect = el.getBoundingClientRect();
+            badge.style.left = (rect.left + window.scrollX) + 'px';
+            badge.style.top = (rect.top + window.scrollY - 22) + 'px';
+            document.body.appendChild(badge);
         }
-        // 输入
-        const aiask = "你是我的流程审批助手，请根据以下提供的表单，给出30个字左右的内容，并且给出是否审批建议，结果以json格式输出：{'content': '总结内容', 'approve': '审批建议true同意，false不同意'}。表单json内容如下：\\n";
-        const widgets = document.querySelectorAll('[id^="widget_"]');
-        const weFormSdk = window.WeFormSDK ? window.WeFormSDK.getWeFormInstance() : null;
-        var fields = [];
-        var tables = [];
-        
-        // 简单提取页面上所有输入框的示例
-        document.querySelectorAll('input, textarea').forEach(el => {
-            if (el.value.trim() !== '') {
-                fields.push({ tag: el.tagName, value: el.value });
+
+        setTimeout(() => {
+            el.style.outline = oldOutline;
+            el.style.transition = oldTransition;
+            if (badge && badge.parentNode) badge.parentNode.removeChild(badge);
+        }, 1200);
+    }
+
+    // 暴露给外部调用：根据 targetId 在网页中滚到该元素并高亮
+    window.playRPAAction = function(targetId) {
+        let el = document.querySelector('[data-rpa-id="' + targetId + '"]');
+        if (el) {
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            setTimeout(() => flashElement(el, targetId), 300);
+            return "SUCCESS";
+        }
+        return "NOT_FOUND";
+    };
+
+    function captureDOMSnapshot(interactiveEl) {
+        try {
+            let summary = []; let index = 0; let targetId = '';
+            let interactiveTags = ['button', 'input', 'select', 'textarea', 'a'];
+            let root = document.body || document.documentElement;
+            if (!root) return { summary: '', targetId: '' };
+            
+            let elements = Array.from(root.querySelectorAll('*')).filter(el => {
+                if (!el || !el.tagName) return false;
+                if (el === interactiveEl) return true;
+                let tag = el.tagName.toLowerCase(); 
+                let role = el.getAttribute('role') || '';
+                let style = window.getComputedStyle(el);
+                let isPointer = style ? (style.cursor === 'pointer') : false;
+                return interactiveTags.includes(tag) || ['button', 'link', 'tab', 'menuitem'].includes(role) || el.hasAttribute('onclick') || isPointer;
+            });
+            
+            for(let i=0; i<elements.length; i++) {
+                let el = elements[i]; let isTarget = (el === interactiveEl);
+                let rect = el.getBoundingClientRect(); let style = window.getComputedStyle(el);
+                if(isTarget || (rect.width > 5 && rect.height > 5 && style && style.display !== 'none' && style.visibility !== 'hidden')) {
+                    let rawText = el.innerText || el.value || el.getAttribute('placeholder') || el.getAttribute('aria-label') || '';
+                    let cleanText = String(rawText).trim().replace(/\\s+/g, ' ').substring(0, 15);
+                    if (!isTarget && cleanText === '' && !['input', 'textarea', 'select'].includes(el.tagName.toLowerCase())) continue;
+                    
+                    el.setAttribute('data-rpa-id', index.toString());
+                    if (isTarget) targetId = index.toString();
+                    
+                    if (summary.length < 80 || isTarget) {
+                        summary.push(`[${index}] ${cleanText || (isTarget ? '交互元素' : '')}`);
+                    }
+                    index++;
+                }
             }
-        });
-        
-        return aiask + JSON.stringify(fields, null, 2);
-    })();
-    """
-}
+            return { summary: summary.join('\\n'), targetId: targetId };
+        } catch (err) { return { summary: 'JS_ERROR: ' + err.toString(), targetId: '' }; }
+    }
+
+    function sendEvent(type, target, extra = {}) {
+        let text = target.innerText || target.value || target.getAttribute('placeholder') || target.getAttribute('aria-label') || '';
+        let snapshot = captureDOMSnapshot(target);
+        flashElement(target, snapshot.targetId); 
+        let ev = { event: type, element_text: text.trim().substring(0, 30), dom_summary: snapshot.summary, target_id: snapshot.targetId };
+        Object.assign(ev, extra);
+        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.corpusHandler) {
+            window.webkit.messageHandlers.corpusHandler.postMessage(ev);
+        } else {
+            window._rpaEventBuffer.push(ev);
+        }
+    }
+
+    // [✨卸载机制] 将所有事件函数独立命名，以便之后可以被 removeEventListener 干净销毁
+    function rpaClickHandler(e) {
+        let interactive = e.target.closest('button, a, input, select, textarea, [role="button"], [role="link"], [onclick], [tabindex]') || e.target;
+        if(interactive) sendEvent('click', interactive);
+    }
+    function rpaChangeHandler(e) {
+        if (e.target && ['input', 'textarea'].includes(e.target.tagName.toLowerCase())) { sendEvent('input', e.target, { input_value: e.target.value }); }
+    }
+    
+    let hoverTimer = null; let lastHoverEl = null;
+    function rpaMouseoverHandler(e) {
+        let interactive = e.target.closest('button, a, [role="menuitem"], .dropdown, [onclick]') || e.target;
+        if (interactive === lastHoverEl) return;
+        lastHoverEl = interactive; clearTimeout(hoverTimer);
+        hoverTimer = setTimeout(() => { if (interactive && interactive.isConnected) sendEvent('hover', interactive); }, 800);
+    }
+    
+    let dragStartPos = null; let dragStartEl = null;
+    function rpaMousedownHandler(e) { dragStartPos = { x: e.clientX, y: e.clientY }; dragStartEl = e.target; }
+    function rpaMouseupHandler(e) {
+        if (!dragStartPos || !dragStartEl) return;
+        let dx = e.clientX - dragStartPos.x; let dy = e.clientY - dragStartPos.y; let distance = Math.sqrt(dx*dx + dy*dy);
+        if (distance > 40) { sendEvent('drag_drop', dragStartEl, { drag_offset: `${Math.round(dx)},${Math.round(dy)}` }); }
+        dragStartPos = null; dragStartEl = null;
+    }
+
+    // 绑定事件
+    document.addEventListener('click', rpaClickHandler, true);
+    document.addEventListener('change', rpaChangeHandler, true);
+    document.addEventListener('mouseover', rpaMouseoverHandler, true);
+    document.addEventListener('mousedown', rpaMousedownHandler, true);
+    document.addEventListener('mouseup', rpaMouseupHandler, true);
+
+    // [✨核心] 注入给苹果系统调用的销毁函数，当停止录制时会执行这个以清除污染
+    window._rpaCorpusStop = function() {
+        document.removeEventListener('click', rpaClickHandler, true);
+        document.removeEventListener('change', rpaChangeHandler, true);
+        document.removeEventListener('mouseover', rpaMouseoverHandler, true);
+        document.removeEventListener('mousedown', rpaMousedownHandler, true);
+        document.removeEventListener('mouseup', rpaMouseupHandler, true);
+        window._rpaCorpusInjected = false;
+        console.log("RPA 网页探针已成功卸载。");
+    };
+})();
+"""
 
 // MARK: - String Extension (基础代码格式化)
 
@@ -175,12 +295,18 @@ class BrowserTab: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         
         let script = WKUserScript(source: consoleJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
         contentController.addUserScript(script)
+        
+        let corpusScript = WKUserScript(source: corpusRecorderJS, injectionTime: .atDocumentEnd, forMainFrameOnly: false)
+        contentController.addUserScript(corpusScript)
+        
         config.userContentController = contentController
         
         self.webView = WKWebView(frame: .zero, configuration: config)
         super.init()
         
         contentController.add(WeakScriptMessageHandler(self), name: "consoleHandler")
+        contentController.add(WeakScriptMessageHandler(self), name: "corpusHandler") // 👈 注册录制回调
+        
         self.webView.navigationDelegate = self
         self.webView.uiDelegate = self
         self.setupObservers()
@@ -188,6 +314,7 @@ class BrowserTab: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     
     deinit {
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "consoleHandler")
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: "corpusHandler")
     }
     
     private func setupObservers() {
@@ -204,7 +331,6 @@ class BrowserTab: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
             .receive(on: DispatchQueue.main)
             .sink { [weak self] newURL in
                 self?.urlString = newURL
-                // [✨修复] 结合底层 UserDefaults 强制落地地址
                 if !newURL.isEmpty && newURL != "about:blank" {
                     UserDefaults.standard.set(newURL, forKey: "DevBrowserLastURL")
                 }
@@ -223,7 +349,6 @@ class BrowserTab: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         }
     }
     
-    // MARK: - RPA 引擎底层异步 JS 执行通道
     @MainActor
     func evaluateJSAsync(_ script: String) async throws -> String {
         return try await withCheckedThrowingContinuation { continuation in
@@ -278,12 +403,48 @@ class BrowserTab: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         }
     }
     
+    // MARK: - [✨核心] 处理网页发回的回调消息
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard let dict = message.body as? [String: String],
-              let levelStr = dict["level"],
-              let msg = dict["message"],
-              let level = ConsoleMessage.LogLevel(rawValue: levelStr) else { return }
-        addLog(level, message: msg)
+        
+        // 1. 处理 AI 语料录制消息
+        if message.name == "corpusHandler" {
+            if let dict = message.body as? [String: Any],
+               let eventType = dict["event"] as? String {
+                
+                let inputValue = dict["input_value"] as? String
+                let elementText = dict["element_text"] as? String ?? ""
+                
+                let domSummary = dict["dom_summary"] as? String ?? ""
+                let targetId = dict["target_id"] as? String ?? ""
+                
+                if domSummary.starts(with: "JS_ERROR:") {
+                    print("❌ DOM获取脚本内部发生错误: \(domSummary)")
+                    return
+                }
+                
+                Task {
+                    await WebCorpusManager.shared.handleWebEvent(
+                        browser: "InternalBrowser",
+                        eventType: eventType,
+                        value: inputValue,
+                        elementText: elementText,
+                        domSummary: domSummary,
+                        targetId: targetId
+                    )
+                }
+            }
+            return
+        }
+        
+        // 2. 网页 Console 日志拦截逻辑
+        if message.name == "consoleHandler" {
+            guard let dict = message.body as? [String: String],
+                  let levelStr = dict["level"],
+                  let msg = dict["message"],
+                  let level = ConsoleMessage.LogLevel(rawValue: levelStr) else { return }
+            
+            addLog(level, message: msg)
+        }
     }
     
     @discardableResult
@@ -321,13 +482,11 @@ class BrowserViewModel: NSObject, ObservableObject, WKHTTPCookieStoreObserver {
     
     static let shared = BrowserViewModel()
     
-    // [✨修复] 共享进程池，提供原生的 SessionStorage 支持
     static let sharedProcessPool = WKProcessPool()
     
     @Published var tabs: [BrowserTab] = []
     @Published var activeTabId: UUID?
     
-    // 默认关闭置顶
     @Published var isAlwaysOnTop: Bool = false {
         didSet { updateWindowLevel() }
     }
@@ -368,11 +527,9 @@ class BrowserViewModel: NSObject, ObservableObject, WKHTTPCookieStoreObserver {
         }
     }
     
-    // MARK: - [✨API核心升级] 动态读取全局模型配置的流式请求解析
     func callAi(htmlString: String, isStreaming: Bool = true, onProgress: ((String, String) -> Void)? = nil) async -> String {
         let prompt = String(htmlString.prefix(30000))
         
-        // 获取当前激活的模型配置
         let provider = AIConfigManager.shared.activeProvider
         
         guard let url = URL(string: provider.host) else {
@@ -390,7 +547,6 @@ class BrowserViewModel: NSObject, ObservableObject, WKHTTPCookieStoreObserver {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        // [✨核心修复] 必须加上 Authorization 才能兼容云端大厂 API
         request.setValue("Bearer \(provider.apiKey)", forHTTPHeaderField: "Authorization")
         request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
         
@@ -416,7 +572,6 @@ class BrowserViewModel: NSObject, ObservableObject, WKHTTPCookieStoreObserver {
                        let choices = json["choices"] as? [[String: Any]],
                        let delta = choices.first?["delta"] as? [String: Any] {
                         
-                        // 兼容推理模型的思考字段
                         let dynamicReasoning = (delta["reasoning_content"] as? String) ?? (delta["reasoning"] as? String)
                         if let r = dynamicReasoning {
                             thinkContent += r
@@ -440,7 +595,6 @@ class BrowserViewModel: NSObject, ObservableObject, WKHTTPCookieStoreObserver {
                 return "❌ 流式请求发生错误: \(error.localizedDescription)"
             }
         } else {
-            // 非流式兜底处理 (省略...)
             do {
                 let (data, _) = try await URLSession.shared.data(for: request)
                 if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -488,7 +642,6 @@ class BrowserViewModel: NSObject, ObservableObject, WKHTTPCookieStoreObserver {
             Task {
                 var hasReceivedFirstChunk = false
                 
-                // 启动流式请求
                 let aiResult = await self.callAi(htmlString: jsonString, isStreaming: true) { partialResult, thinkResult in
                     if !hasReceivedFirstChunk {
                         hasReceivedFirstChunk = true
@@ -544,7 +697,6 @@ class BrowserViewModel: NSObject, ObservableObject, WKHTTPCookieStoreObserver {
         }
     }
     
-    // 监听 Cookie 变化并持久化，保障登录状态
     func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
         cookieStore.getAllCookies { cookies in
             let properties = cookies.compactMap { $0.properties }
@@ -558,7 +710,6 @@ class BrowserViewModel: NSObject, ObservableObject, WKHTTPCookieStoreObserver {
     }
     
     func restoreCookiesAndLoad() {
-        // [✨修复] 直接从底层 UserDefaults 获取最终准确地址
         let lastURL = UserDefaults.standard.string(forKey: "DevBrowserLastURL") ?? "https://www.bing.com"
         
         let cookieStore = WKWebsiteDataStore.default().httpCookieStore
@@ -589,7 +740,6 @@ struct MacWebView: NSViewRepresentable {
     func updateNSView(_ nsView: WKWebView, context: Context) {}
 }
 
-///原生 JS 语法高亮代码编辑器
 struct MacJSCodeEditor: NSViewRepresentable {
     @Binding var text: String
     var onSubmit: () -> Void
@@ -689,7 +839,6 @@ struct MacJSCodeEditor: NSViewRepresentable {
     }
 }
 
-/// 开发者控制台视图
 struct DevConsoleView: View {
     @ObservedObject var tab: BrowserTab
     @State private var scriptInput: String = ""
@@ -775,7 +924,6 @@ struct DevConsoleView: View {
     }
 }
 
-/// 脚本编辑器弹窗视图
 struct ScriptEditorView: View {
     @Binding var script: String
     @Binding var isPresented: Bool
@@ -787,9 +935,6 @@ struct ScriptEditorView: View {
                 Label("编辑提取脚本", systemImage: "curlybraces")
                     .font(.headline)
                 Spacer()
-                Button("重置为默认") { script = DefaultScripts.aiExtraction }
-                    .buttonStyle(.link)
-                    .font(.system(size: 12))
             }
             .padding()
             .background(Color(NSColor.windowBackgroundColor))
@@ -828,7 +973,6 @@ struct ScriptEditorView: View {
     }
 }
 
-/// 顶部工具栏 (绑定至活动的 Tab 状态)
 struct BrowserToolbar: View {
     @ObservedObject var tab: BrowserTab
     @ObservedObject var viewModel: BrowserViewModel
@@ -836,6 +980,7 @@ struct BrowserToolbar: View {
     @Binding var showScriptEditor: Bool
     
     @State private var addressInput: String = ""
+    @ObservedObject var corpusManager = WebCorpusManager.shared
     
     var body: some View {
         HStack(spacing: 14) {
@@ -867,6 +1012,13 @@ struct BrowserToolbar: View {
                 .buttonStyle(.plain)
                 .help(viewModel.isAlwaysOnTop ? "取消置顶" : "置顶窗口")
 
+                Button(action: { CorpusHUDManager.shared.toggleHUD() }) {
+                    Image(systemName: corpusManager.isRecordingMode ? "record.circle" : "graduationcap.fill")
+                        .foregroundColor(corpusManager.isRecordingMode ? .red : .purple)
+                }
+                .buttonStyle(.plain)
+                .help("开启/关闭 AI 带教悬浮录制窗")
+                
                 Button(action: { showScriptEditor = true }) {
                     Image(systemName: "play.fill").foregroundColor(.green)
                 }
@@ -885,14 +1037,12 @@ struct BrowserToolbar: View {
     }
 }
 
-/// 浏览器主视图
 public struct BrowserView: View {
     @StateObject private var viewModel = BrowserViewModel.shared
     @State private var showConsole: Bool = false
     @State private var showScriptEditor: Bool = false
     
-    // [✨修复] 彻底告别 AppStorage，改为 State 配合 UserDefaults 强制固化存取
-    @State private var aiExtractionScript: String = UserDefaults.standard.string(forKey: "aiExtractionScript") ?? DefaultScripts.aiExtraction
+    @StateObject private var corpusManager = WebCorpusManager.shared
     
     public init() {}
     
@@ -953,22 +1103,9 @@ public struct BrowserView: View {
         .onAppear {
             if viewModel.tabs.isEmpty { viewModel.restoreCookiesAndLoad() }
         }
-        .sheet(isPresented: $showScriptEditor) {
-            ScriptEditorView(
-                script: $aiExtractionScript,
-                isPresented: $showScriptEditor,
-                onExecute: {
-                    withAnimation { showConsole = true }
-                    // [✨持久化] 在弹窗关闭执行时，强行将脚本保存到本地硬盘
-                    UserDefaults.standard.set(aiExtractionScript, forKey: "aiExtractionScript")
-                    viewModel.summarizePageWithAI(script: aiExtractionScript)
-                }
-            )
-        }
     }
 }
 
-/// 标签项 UI 组件
 struct BrowserTabItemView: View {
     let title: String
     let isActive: Bool
@@ -994,8 +1131,6 @@ struct BrowserTabItemView: View {
     }
 }
 
-// MARK: - BrowserWindowController
-
 class BrowserWindowController: NSWindowController, NSWindowDelegate {
     static var sharedController: BrowserWindowController?
     
@@ -1005,21 +1140,16 @@ class BrowserWindowController: NSWindowController, NSWindowDelegate {
             sharedController = BrowserWindowController()
         }
         
-        // [✨修复] 强制渲染与唤醒防线
         if let window = sharedController?.window {
-            // 1. 如果窗口被最小化到了程序坞，强制恢复
             if window.isMiniaturized {
                 window.deminiaturize(nil)
             }
-            // 2. 如果窗口被关闭/隐藏，强制显示
             if !window.isVisible {
                 sharedController?.showWindow(nil)
             }
-            // 3. 强制提到最前并获取焦点
             window.makeKeyAndOrderFront(nil)
         }
         
-        // 激活当前 App 忽略其他遮挡应用
         NSApp.activate(ignoringOtherApps: true)
     }
     
@@ -1032,7 +1162,6 @@ class BrowserWindowController: NSWindowController, NSWindowDelegate {
         newWindow.setFrameAutosaveName("DevBrowserMainFrame")
         newWindow.center()
         newWindow.contentViewController = hostingController
-        // [✨关键] 保证关闭时不释放内存，仅隐藏，以便下次秒开并保留状态
         newWindow.isReleasedWhenClosed = false
         self.init(window: newWindow)
         newWindow.delegate = self

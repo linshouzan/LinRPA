@@ -464,6 +464,7 @@ struct WebAgentEditor: View {
                     Picker("目标浏览器:", selection: paramsBinding.browser) {
                         Text("内置开发者浏览器").tag("InternalBrowser")
                         Text("Safari (AppleScript)").tag("Safari")
+                        Text("Google Chrome").tag("Google Chrome")
                     }.frame(width: 200)
 
                     Picker("视觉范围:", selection: paramsBinding.captureMode) {
@@ -1725,7 +1726,6 @@ struct AITextParseEditor: View {
     @Binding var action: RPAAction
     
     var body: some View {
-        // 参数格式: 数据源 | 提取指令 | 输出变量 | JSON模板
         let parts = action.parameter.components(separatedBy: "|")
         let sourceVar = parts.count > 0 ? parts[0] : "{{clipboard}}"
         let instruction = parts.count > 1 ? parts[1] : ""
@@ -1745,22 +1745,21 @@ struct AITextParseEditor: View {
             
             GroupBox("🧠 提取指令与结构要求") {
                 VStack(alignment: .leading, spacing: 8) {
-                    TextEditor(text: Binding(
+                    // [✨修复] 使用纯净编辑器替代 TextEditor
+                    PlainCodeEditor(text: Binding(
                         get: { instruction },
                         set: { updateParam(sourceVar, $0, targetVar, jsonTemplate) }
                     ))
-                    .font(.system(size: 12))
                     .frame(height: 50)
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
                     
                     Text("强制输出格式模板 (JSON Schema)：").font(.caption).foregroundColor(.secondary)
                     
-                    // [✨进阶能力] 强制模板约束输入框
-                    TextEditor(text: Binding(
+                    // [✨修复] 使用纯净编辑器，彻底告别中文引号
+                    PlainCodeEditor(text: Binding(
                         get: { jsonTemplate },
                         set: { updateParam(sourceVar, instruction, targetVar, $0) }
                     ))
-                    .font(.system(size: 11, design: .monospaced))
                     .frame(height: 60)
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.blue.opacity(0.3)))
                     
@@ -2165,6 +2164,53 @@ struct OCRExtractEditor: View {
             }
             Text(outputFormat == "json" ? "💡 提示：JSON 格式将返回包含 text, x, y, width, height 的数组，其坐标可直接传给鼠标节点使用。" : "💡 提示：纯文本格式适合直接传给大模型进行阅读理解或摘要提取。")
                 .font(.caption2).foregroundColor(.blue)
+        }
+    }
+}
+
+
+// MARK: - 公共的纯净代码编辑器 (禁用智能引号与拼写检查，专为 JSON 和脚本设计)
+struct PlainCodeEditor: NSViewRepresentable {
+    @Binding var text: String
+    var minHeight: CGFloat = 60
+    
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+    
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSTextView.scrollableTextView()
+        guard let textView = scrollView.documentView as? NSTextView else { return scrollView }
+        
+        textView.delegate = context.coordinator
+        textView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.backgroundColor = NSColor.textBackgroundColor
+        textView.textColor = NSColor.textColor
+        
+        // 核心修复：彻底关闭 macOS 的“智能替换”特性
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        //textView.isSmartInsertDeleteEnabled = false
+        textView.allowsUndo = true
+        
+        return scrollView
+    }
+    
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? NSTextView else { return }
+        if textView.string != text {
+            let selectedRange = textView.selectedRange()
+            textView.string = text
+            textView.setSelectedRange(selectedRange)
+        }
+    }
+    
+    class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: PlainCodeEditor
+        init(_ parent: PlainCodeEditor) { self.parent = parent }
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            parent.text = textView.string
         }
     }
 }

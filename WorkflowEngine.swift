@@ -834,11 +834,11 @@ class WorkflowEngine {
         }
     }
     
-    // MARK: - [✨3.0 双引擎底层支持] 内置 WKWebView & Safari 动态路由
+    // MARK: - [✨3.0 双引擎底层支持] 内置 WKWebView & 外部浏览器动态路由
         
     /// 统一的 JavaScript 执行路由
     @MainActor
-    private func executeJS(browser: String, script: String) async throws -> String {
+    func executeJS(browser: String, script: String) async throws -> String {
         if browser == "InternalBrowser" {
             // 路由 A：原生 WKWebView 极速执行
             guard let tab = BrowserViewModel.shared.activeTab else {
@@ -846,69 +846,74 @@ class WorkflowEngine {
             }
             return try await tab.evaluateJSAsync(script)
         } else {
-            // 路由 B：Safari AppleScript 桥接执行
             // 完美转义 JS 字符串以适应 AppleScript 的双引号环境
             let escapedScript = script.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-            let appleScript = """
-            tell application "Safari"
-                if not (exists document 1) then return "Error: No document open"
-                do JavaScript "\(escapedScript)" in front document
-            end tell
-            """
+            let appleScript: String
+            
+            if browser == "Safari" {
+                // 路由 B：Safari AppleScript 桥接执行
+                appleScript = """
+                tell application "Safari"
+                    if not (exists document 1) then return "Error: No document open"
+                    do JavaScript "\(escapedScript)" in front document
+                end tell
+                """
+            } else if browser == "Google Chrome" {
+                // [✨新增] 路由 C：Google Chrome AppleScript 桥接执行
+                appleScript = """
+                tell application "Google Chrome"
+                    if (count of windows) = 0 then return "Error: No document open"
+                    tell active tab of front window
+                        execute javascript "\(escapedScript)"
+                    end tell
+                end tell
+                """
+            } else {
+                throw NSError(domain: "RPA", code: 400, userInfo: [NSLocalizedDescriptionKey: "不支持的目标浏览器: \(browser)"])
+            }
+            
             var errorInfo: NSDictionary?
             if let scriptObj = NSAppleScript(source: appleScript) {
                 let output = scriptObj.executeAndReturnError(&errorInfo)
                 if errorInfo == nil { return output.stringValue ?? "" }
             }
-            throw NSError(domain: "RPA", code: 500, userInfo: [NSLocalizedDescriptionKey: "Safari 脚本执行失败"])
+            throw NSError(domain: "RPA", code: 500, userInfo: [NSLocalizedDescriptionKey: "\(browser) 脚本执行失败"])
         }
     }
     
-    // MARK: - [✨3.0 终极版] 穿透 Iframe/ShadowDOM + Set-of-Mark 坐标锚点绘制
+    // MARK: - [✨3.0 终极版] 穿透 DOM 提取器 (支持极限压缩与完整提取动态切换)
     @MainActor
-    func injectSoMAndGetDOM(browser: String) async -> String {
+    func injectSoMAndGetDOM(browser: String, isExtremeCompressed: Bool = true) async -> String {
         let script = """
         (function() {
+            let isExtreme = \(isExtremeCompressed ? "true" : "false");
             document.querySelectorAll('.rpa-som').forEach(e => e.remove());
             let summary = [];
             let index = 0;
             
-            // [✨ 深度获取] 递归遍历 DOM, ShadowDOM, 以及 Iframe，并携带坐标偏移量
             function getAllElements(root, offsetX = 0, offsetY = 0) {
                 let elements = [];
                 let walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null, false);
                 let node;
-                
                 while (node = walker.nextNode()) {
-                    // 记录元素的绝对坐标偏移
-                    node._rpaOffsetX = offsetX;
-                    node._rpaOffsetY = offsetY;
+                    node._rpaOffsetX = offsetX; node._rpaOffsetY = offsetY;
                     elements.push(node);
-                    
-                    // 1. 穿透 Shadow DOM
-                    if (node.shadowRoot) {
-                        elements = elements.concat(getAllElements(node.shadowRoot, offsetX, offsetY));
-                    }
-                    
-                    // 2. 穿透 同源 Iframe
+                    if (node.shadowRoot) elements = elements.concat(getAllElements(node.shadowRoot, offsetX, offsetY));
                     if (node.tagName.toLowerCase() === 'iframe') {
                         try {
                             let iframeDoc = node.contentDocument || node.contentWindow.document;
                             if (iframeDoc) {
                                 let rect = node.getBoundingClientRect();
-                                // 累加 iframe 在父级窗口中的坐标
                                 elements = elements.concat(getAllElements(iframeDoc.body, offsetX + rect.left, offsetY + rect.top));
                             }
-                        } catch(e) {
-                            // 跨域 iframe 会触发 DOMException，此处静默忽略
-                        }
+                        } catch(e) {}
                     }
                 }
                 return elements;
             }
             
             let allNodes = getAllElements(document.body);
-            let interactiveTags = ['button', 'input', 'a', 'select', 'textarea'];
+            let interactiveTags = ['button', 'input', 'select', 'textarea'];
             
             let elements = allNodes.filter(el => {
                 let tag = el.tagName.toLowerCase();
@@ -916,115 +921,65 @@ class WorkflowEngine {
                 let style = window.getComputedStyle(el);
                 let className = (el.className && typeof el.className === 'string') ? el.className.toLowerCase() : '';
                 
-                // [✨ 增强的感知雷达] 增加指针样式、事件、类名、多角色识别
-                return interactiveTags.includes(tag) || 
-                       ['button', 'link', 'tab', 'menuitem', 'switch', 'checkbox'].includes(role) || 
-                       el.hasAttribute('tabindex') || 
-                       el.hasAttribute('onclick') || 
-                       style.cursor === 'pointer' || 
-                       className.includes('btn') || 
-                       className.includes('button');
+                let isOATarget = className.includes('btn') || className.includes('tab') || className.includes('menu') || className.includes('item');
+                let isInteractive = interactiveTags.includes(tag) || 
+                                   ['button', 'link', 'tab', 'menuitem', 'checkbox', 'radio'].includes(role) || 
+                                   el.hasAttribute('onclick') || 
+                                   style.cursor === 'pointer';
+                                   
+                // 完整模式下放宽限制，抓取更多 a 标签等容易被漏掉的元素
+                if (!isExtreme) {
+                    isInteractive = isInteractive || tag === 'a' || role === 'link';
+                }
+                return isInteractive || isOATarget;
             });
             
+            // 极限压缩只拿 80 个，完整模式拿 300 个
+            let maxElements = isExtreme ? 80 : 300; 
+            let processedCount = 0;
+            
             for(let i=0; i<elements.length; i++) {
+                if (processedCount >= maxElements) break;
                 let el = elements[i];
                 let rect = el.getBoundingClientRect();
                 let style = window.getComputedStyle(el);
                 
-                // 排除不可见、被隐藏(aria-hidden)的元素
-                if(rect.width > 5 && rect.height > 5 && 
-                   style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' &&
-                   el.getAttribute('aria-hidden') !== 'true') {
-                    
-                    // 叠加由 iframe 传导下来的坐标偏移
+                if(rect.width > 5 && rect.height > 5 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0') {
                     let finalLeft = rect.left + window.scrollX + (el._rpaOffsetX || 0);
                     let finalTop = rect.top + window.scrollY + (el._rpaOffsetY || 0);
                     
-                    // [✨ 新增] 计算绝对中心坐标
-                    let centerX = Math.round(finalLeft + rect.width / 2);
-                    let centerY = Math.round(finalTop + rect.height / 2);
+                    let text = el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || el.title || '';
+                    
+                    // 极限截断 15 字，完整截断 40 字
+                    let textLimit = isExtreme ? 15 : 40;
+                    let cleanText = text.trim().replace(/\\s+/g, ' ').substring(0, textLimit);
+                    
+                    let isInput = ['input', 'textarea', 'select'].includes(el.tagName.toLowerCase());
+                    if (cleanText === '' && !isInput && isExtreme) continue; 
                     
                     el.setAttribute('data-rpa-id', index.toString());
                     
-                    // ==========================================
-                    // 1. 绘制主体高亮边框
-                    // ==========================================
                     let marker = document.createElement('div');
                     marker.className = 'rpa-som';
-                    marker.style.position = 'absolute';
-                    marker.style.left = finalLeft + 'px';
-                    marker.style.top = finalTop + 'px';
-                    marker.style.width = rect.width + 'px';
-                    marker.style.height = rect.height + 'px';
-                    marker.style.border = '2px solid rgba(255, 0, 0, 0.6)';
-                    marker.style.boxSizing = 'border-box';
-                    marker.style.zIndex = '2147483647';
-                    marker.style.pointerEvents = 'none'; 
+                    marker.style.position = 'absolute'; marker.style.left = finalLeft + 'px'; marker.style.top = finalTop + 'px';
+                    marker.style.width = rect.width + 'px'; marker.style.height = rect.height + 'px';
+                    marker.style.border = '2px solid rgba(255, 0, 0, 0.6)'; marker.style.boxSizing = 'border-box';
+                    marker.style.zIndex = '2147483647'; marker.style.pointerEvents = 'none'; 
                     
-                    // 左上角数字 ID 标签
                     let label = document.createElement('div');
-                    label.innerText = index;
-                    label.style.position = 'absolute';
-                    label.style.top = '-16px'; label.style.left = '-2px';
-                    label.style.background = 'rgba(255,0,0,0.9)'; label.style.color = 'white';
-                    label.style.padding = '1px 5px'; label.style.fontSize = '12px'; label.style.fontWeight = 'bold';
-                    label.style.borderRadius = '3px';
-                    label.style.boxShadow = '0 1px 3px rgba(0,0,0,0.3)';
-                    marker.appendChild(label);
+                    label.innerText = index; label.style.position = 'absolute'; label.style.top = '-16px'; label.style.left = '-2px';
+                    label.style.background = 'rgba(255,0,0,0.9)'; label.style.color = 'white'; label.style.padding = '1px 5px'; label.style.fontSize = '12px'; label.style.fontWeight = 'bold';
+                    marker.appendChild(label); document.body.appendChild(marker);
                     
-                    // ==========================================
-                    // 2. [✨ 融合] 绘制中心坐标圆点 (瞄准点)
-                    // ==========================================
-                    let centerDot = document.createElement('div');
-                    centerDot.style.position = 'absolute';
-                    centerDot.style.left = 'calc(50% - 3px)';
-                    centerDot.style.top = 'calc(50% - 3px)';
-                    centerDot.style.width = '6px';
-                    centerDot.style.height = '6px';
-                    centerDot.style.background = 'blue';
-                    centerDot.style.borderRadius = '50%';
-                    centerDot.style.boxShadow = '0 0 2px white';
-                    marker.appendChild(centerDot);
-                    
-                    // ==========================================
-                    // 3. [✨ 融合] 绘制右下角坐标文本 (供大模型读取)
-                    // ==========================================
-                    let coordLabel = document.createElement('div');
-                    coordLabel.innerText = '(' + centerX + ', ' + centerY + ')';
-                    coordLabel.style.position = 'absolute';
-                    coordLabel.style.bottom = '-12px'; 
-                    coordLabel.style.right = '-2px';
-                    coordLabel.style.background = 'rgba(0, 0, 255, 0.8)'; 
-                    coordLabel.style.color = 'white';
-                    coordLabel.style.padding = '1px 3px'; 
-                    coordLabel.style.fontSize = '9px';
-                    coordLabel.style.fontFamily = 'monospace';
-                    coordLabel.style.borderRadius = '2px';
-                    marker.appendChild(coordLabel);
-
-                    document.body.appendChild(marker);
-                    
-                    // ==========================================
-                    // 4. [✨ 融合] 提取携带状态和坐标的 DOM 上下文
-                    // ==========================================
-                    let text = el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '';
-                    let state = el.disabled ? " [Disabled]" : "";
-                    let isChecked = el.checked ? " [Checked]" : "";
-                    let typeInfo = el.type ? `(${el.type})` : "";
-                    let cleanText = text.trim().replace(/\\n/g, ' ').substring(0, 40);
-                    
-                    summary.push(`[${index}] ${el.tagName.toLowerCase()}${typeInfo} | Coord: (${centerX}, ${centerY}) | Text: ${cleanText}${state}${isChecked}`);
-                    index++;
+                    summary.push(`[${index}] ${cleanText} ${el.disabled ? "[禁]" : ""} ${el.checked ? "[选]" : ""}`);
+                    index++; processedCount++;
                 }
             }
             return summary.join('\\n');
         })();
         """
-        do {
-            return try await executeJS(browser: browser, script: script)
-        } catch {
-            return "Error: \(error.localizedDescription)"
-        }
+        do { return try await executeJS(browser: browser, script: script) }
+        catch { return "Error: \(error.localizedDescription)" }
     }
     
     @MainActor
@@ -1053,27 +1008,53 @@ class WorkflowEngine {
         else if action == "scroll_up" {
             jsCommand = "(function() {window.scrollBy({top: -window.innerHeight * 0.8, behavior: 'smooth'}); return 'Scrolled Up';})();"
         }
+        else if action == "click" {
+            jsCommand = """
+            (function() {
+                let el = document.querySelector('[data-rpa-id="\(targetId)"]');
+                if (!el) return '❌ Element Not Found: \(targetId)';
+                
+                // 1. 元素聚焦与基础点击
+                el.focus();
+                el.click();
+                
+                // 2. 构造完整的鼠标事件链，欺骗 React/Vue 合成事件网
+                const events = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+                events.forEach(evType => {
+                    let ev = new MouseEvent(evType, {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window,
+                        buttons: 1
+                    });
+                    el.dispatchEvent(ev);
+                });
+                
+                // 如果是 a 标签，有时候需要强制跳转
+                if (el.tagName.toLowerCase() === 'a' && el.href) {
+                    // window.location.href = el.href; // 视情况开启
+                }
+                
+                return '✅ Click Injected on \(targetId)';
+            })();
+            """
+        }
         else if action == "hover" {
             jsCommand = """
             (function() {
                 let el = document.querySelector('[data-rpa-id="\(targetId)"]');
-                if (!el) return 'Element Not Found';
-                let eventParams = { bubbles: true, cancelable: true, view: window };
-                el.dispatchEvent(new MouseEvent('mouseover', eventParams));
-                el.dispatchEvent(new MouseEvent('mouseenter', eventParams));
-                el.dispatchEvent(new MouseEvent('mousemove', eventParams));
-                return 'Hover Triggered';
-            })();
-            """
-        }
-        else if action == "click" {
-            jsCommand = """
-            (function() {
-                let el = document.querySelector('[data-rpa-id="\(targetId)"]'); 
-                if(!el) return 'Element Not Found';
-                el.focus(); 
-                el.click();
-                return 'Clicked';
+                if (!el) return '❌ Element Not Found: \(targetId)';
+                
+                const events = ['mouseenter', 'mouseover', 'mousemove'];
+                events.forEach(evType => {
+                    let ev = new MouseEvent(evType, {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window
+                    });
+                    el.dispatchEvent(ev);
+                });
+                return '✅ Hover Injected on \(targetId)';
             })();
             """
         }
@@ -1082,27 +1063,72 @@ class WorkflowEngine {
             jsCommand = """
             (function() {
                 let el = document.querySelector('[data-rpa-id="\(targetId)"]');
-                if (!el) return 'Element Not Found';
+                if (!el) return '❌ Element Not Found: \(targetId)';
                 
-                el.focus();
-                
-                let nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-                if (el.tagName.toLowerCase() === 'textarea') {
-                    nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+                // 🌟 终极防线1 升级版：【影子节点穿透与焦点劫持】
+                if (el.tagName.toLowerCase() !== 'input' && el.tagName.toLowerCase() !== 'textarea' && !el.isContentEditable) {
+                    let innerInput = el.querySelector('input, textarea');
+                    
+                    // 策略A: 穿透 Shadow DOM (Web Components 隔离墙)
+                    if (!innerInput && el.shadowRoot) {
+                        innerInput = el.shadowRoot.querySelector('input, textarea');
+                    }
+                    
+                    // 策略B: 向上拉伸搜索范围 (破解兄弟节点分离)
+                    if (!innerInput && el.parentElement) {
+                        innerInput = el.parentElement.querySelector('input, textarea');
+                    }
+                    
+                    // 策略C: 焦点劫持 (破解“点击后才渲染”的幽灵输入框)
+                    if (!innerInput) {
+                        el.click(); // 强行触发物理点击
+                        
+                        // 如果框架通过点击，瞬间生成了输入框并自动转移了焦点，我们就劫持它！
+                        if (document.activeElement && (document.activeElement.tagName.toLowerCase() === 'input' || document.activeElement.tagName.toLowerCase() === 'textarea')) {
+                            innerInput = document.activeElement;
+                        }
+                    }
+                    
+                    if (innerInput) {
+                        el = innerInput; // 成功转移目标到真实输入框！
+                    } else {
+                        // 如果依然找不到，主动向大模型抛出报错，让大模型知道已经点过了
+                        return '❌ 底层输入框被彻底隐藏或隔离。已尝试物理点击唤醒，请由 Agent 重新观察页面状态。';
+                    }
                 }
                 
-                if (nativeSetter) {
-                    nativeSetter.call(el, "\(safeValue)");
-                } else {
-                    el.value = "\(safeValue)";
+                // 确保元素真正获得了焦点
+                el.focus({preventScroll: false});
+                let tag = el.tagName.toLowerCase();
+                
+                // 🌟 终极防线2：【黑客级破解 React ValueTracker】
+                let lastValue = el.value;
+                el.value = "\(safeValue)";
+                let tracker = el._valueTracker;
+                if (tracker) { tracker.setValue(lastValue); }
+                
+                // 🌟 终极防线3：【绕过前端拦截，强拉原生 setter】
+                if (tag === 'input' || tag === 'textarea') {
+                    let proto = Object.getPrototypeOf(el);
+                    let nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                    if (nativeSetter) nativeSetter.call(el, "\(safeValue)");
+                } else if (el.isContentEditable) {
+                    el.innerText = "\(safeValue)";
                 }
                 
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-                el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Enter', code: 'Enter' }));
-                el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Enter', code: 'Enter' }));
-                el.blur();
-                return 'Input Injected: \(safeValue)';
+                // 🌟 终极防线4：【全量事件风暴】
+                const eventOpts = { bubbles: true, composed: true, cancelable: true };
+                el.dispatchEvent(new MouseEvent('mousedown', eventOpts));
+                el.dispatchEvent(new MouseEvent('mouseup', eventOpts));
+                el.dispatchEvent(new MouseEvent('click', eventOpts));
+                
+                el.dispatchEvent(new KeyboardEvent('keydown', Object.assign({ key: 'Process', code: 'Process' }, eventOpts)));
+                el.dispatchEvent(new KeyboardEvent('keypress', eventOpts));
+                el.dispatchEvent(new Event('input', eventOpts));
+                el.dispatchEvent(new Event('change', eventOpts));
+                el.dispatchEvent(new KeyboardEvent('keyup', Object.assign({ key: 'Process', code: 'Process' }, eventOpts)));
+                
+                return '✅ Input Injected (Deep React Bypass): \(safeValue)';
             })();
             """
         }
@@ -1127,25 +1153,21 @@ class WorkflowEngine {
     @MainActor
     func activateBrowser(_ browser: String) async {
         if browser == "InternalBrowser" {
-            // 召唤我们自己开发的内置开发者浏览器
             BrowserWindowController.showSharedWindow()
-            
-            // 容错处理：如果浏览器打开了，但是里面一个 Tab 都没有，主动新建一个
             if BrowserViewModel.shared.tabs.isEmpty {
                 BrowserViewModel.shared.addNewTab()
             }
-            
-            // 给 UI 渲染和界面弹出留出极短的缓冲时间
             try? await Task.sleep(for: .milliseconds(500))
             
-        } else if browser == "Safari" {
-            // 使用 macOS 底层 API 唤醒 Safari 并强制将其拉到前台
-            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Safari") {
+        } else if browser == "Safari" || browser == "Google Chrome" {
+            // [✨修改] 支持通用外部浏览器的唤醒机制
+            let bundleId = browser == "Safari" ? "com.apple.Safari" : "com.google.Chrome"
+            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) {
                 let config = NSWorkspace.OpenConfiguration()
                 config.activates = true // 强制激活
                 try? await NSWorkspace.shared.openApplication(at: url, configuration: config)
                 
-                // 给 Safari 的冷启动或前置留出缓冲时间
+                // 给浏览器的冷启动或前置留出缓冲时间
                 try? await Task.sleep(for: .seconds(1))
             }
         }

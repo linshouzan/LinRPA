@@ -259,7 +259,7 @@ class AppSettings: ObservableObject {
     
     // WebAgent的AI提示词
     @AppStorage("webAgentPrompt") var webAgentPrompt: String = """
-    你是一个顶级 Web RPA 智能体。结合给定的【屏幕截图】和【DOM列表】，你需要规划接下来的一个或多个连续动作。
+    你是一个高效的网页自动化助手。请结合【截图】与【可见元素列表】，决定下一步一个或多个连续操作。
     注意：截图中可交互元素已被打上红色数字方框，请通过图片找到正确元素，并参考DOM列表提取目标ID。
     
     【任务目标】: {{TaskDesc}}
@@ -269,18 +269,17 @@ class AppSettings: ObservableObject {
     {{History}}
     
     ⚠️ 关键指令 ⚠️
-    1. 如果任务需要多步连贯操作（例如：先 hover，再 click，再 input），请在 steps 数组中一次性输出多个动作。
-    2. 如果历史记录中你刚执行过动作，但当前截图里没有任何变化，说明该ID可能无效。请重新寻找其他ID，或者换物理操作，如click换成native_click。
-    3. 如果屏幕上找不到需要的元素，请尝试输出 scroll_down。
-    
-    🔐 敏感信息输入规范 🔐
-    如果你判断当前是登录、密码输入等敏感输入框，**绝对不要尝试自己生成或捏造账号密码**。请在 `input_value` 中严格输出变量占位符！
-    例如输入账号时输出 `{{account}}`，输入密码时输出 `{{password}}`。系统底层会自动拦截并替换为真实的安全凭证。
+    1. 你的思考必须极其简短（限20字内）。
+    2. 不要一次性规划太多步骤，每次只输出 1 到 2 步当前最紧要的动作，一次没有变化换物理操作，如click换成native_click。。
+    3. 如果目标元素在截图中，但列表中没有ID，请使用 scroll_down 翻页。
+    4. 敏感信息输入必须使用占位符，例如账号填 `{{account}}`。
+    5. 降级机制：如果目标元素在截图中清晰可见，但【可见元素列表】中由于压缩原因没有它的ID，请立即输出获取完整DOM动作。
     
     【当前可见元素 (ID与截图对应)】:
     {{DOM}}
     
     【可选动作空间】 (请自由组合):
+    - request_full_dom: 获取完整DOM
     - hover / click / input: 默认的底层 JS 注入操作 (速度极快)
     - native_hover / native_click / native_input: 原生物理外设操作 (仅当普通操作失效，或遇到防爬检测时使用)
     - scroll_down / scroll_up: 页面滚动
@@ -288,7 +287,7 @@ class AppSettings: ObservableObject {
     
     严格输出如下 JSON 格式 (切勿输出其他废话):
     {
-      "thought": "分析图文与历史记录，规划接下来的连续动作步骤的思考过程",
+      "thought": "一句话理由",
       "steps": [
         {
           "action_type": "hover/click/input/native_click/scroll_down/finish/fail",
@@ -371,6 +370,15 @@ class AIConfigManager: ObservableObject {
     }
 }
 
+// MARK: - 知识库清洗对应的AI模型
+extension UserDefaults {
+    // 专门存储知识库清洗模型的 Provider ID
+    @objc var corpusCleanerProviderID: String? {
+        get { string(forKey: "corpusCleanerProviderID") }
+        set { set(newValue, forKey: "corpusCleanerProviderID") }
+    }
+}
+
 // MARK: - WebAgent 4.0 参数与 Prompt 配置模型
 public struct WebAgentParams: Codable, Equatable {
     var taskDesc: String
@@ -441,6 +449,18 @@ extension String {
     func extractJSON() -> String? {
         // Markdown 代码块的正则表达式（支持``` 或者 ~~~ 作为分隔符）
         let markdownPattern = "(?<=^|\\n)(```|~~~)\\s*(\\{(?:[^{}]|(?:\\{[^{}]*\\}))*\\})\\s*(?=\\1$)"
+        
+        // 废弃脆弱的正则表达式，直接使用暴力首尾括号截取法，无视 ```json 或任何前置/后置的废话
+        if let start = self.firstIndex(of: "{"), let end = self.lastIndex(of: "}") {
+            var cleanJSONStr = String(self[start...end])
+            
+            // 净化大模型容易生成的“幽灵不可见字符”(NBSP、零宽字符等)，确保 JSONSerialization 绝对安全
+            cleanJSONStr = cleanJSONStr.replacingOccurrences(of: "\u{00A0}", with: " ")
+                                       .replacingOccurrences(of: "\u{200B}", with: "")
+                                       .replacingOccurrences(of: "\t", with: " ")
+            
+            return cleanJSONStr.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         
         if let regex = try? NSRegularExpression(pattern: markdownPattern, options: [.dotMatchesLineSeparators]) {
             let nsString = self as NSString

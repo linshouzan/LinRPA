@@ -159,7 +159,6 @@ struct ContentView: View {
                 Button("取消", role: .cancel) { }
                 Button("确定") { engine.renameFolder(oldName: targetFolderToRename, newName: tempFolderName) }
             }
-            // [✨修改] 移除了原有的 .toolbar 添加工作流+号，使其更加干净
             .navigationTitle("我的流程").navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 300)
         } content: {
             VStack(spacing: 0) {
@@ -278,6 +277,14 @@ struct ContentView: View {
                         GlobalSettingsPopoverView()
                     }
                     
+                    // [✨更改] 将语料库图标更换为书本
+                    Button(action: {
+                        openWindow(id: "corpus-manager")
+                    }) {
+                        Label("知识库", systemImage: "book.fill")
+                    }
+                    .help("打开AI语料管理库")
+                    
                     Button(action: { openWindow(id: "agentMonitor") }) {
                         Label("AI 监控", systemImage: "eye.square").foregroundColor(.cyan)
                     }
@@ -293,7 +300,6 @@ struct ContentView: View {
             isRecordingUI = false
             engine.log("⏹️ 录制结束，已在画板生成操作节点。")
             
-            // [✨修改] 仅当设置开启时，录制结束才干预恢复窗口
             if appSettings.minimizeOnRun {
                 if let mainWindow = NSApp.windows.first(where: { $0.className.contains("AppKitWindow") }) {
                     mainWindow.deminiaturize(nil)
@@ -308,7 +314,6 @@ struct ContentView: View {
                 isRecordingUI = true
                 engine.log("🔴 开始录制，请在系统内操作，完成后点击通知栏或回到应用停止录制...")
                 
-                // [✨修改] 根据用户设置决定是否自动最小化
                 if appSettings.minimizeOnRun {
                     await MainActor.run {
                         NSApp.windows.first(where: { $0.className.contains("AppKitWindow") })?.miniaturize(nil)
@@ -333,7 +338,6 @@ struct ContentView: View {
     private func handleConnectionDrop(dropLocation: CGPoint?, startID: UUID?, startPort: PortPosition?, workflow: Workflow) { guard let dropPoint = dropLocation, let sourceID = startID, let sPort = startPort else { return }; var closest: (nodeID: UUID, port: PortPosition, distance: CGFloat)? = nil; for targetNode in workflow.actions { if targetNode.id == sourceID { continue }; for port in PortPosition.allCases { let targetPortPos = getPortAbsolutePosition(nodeID: targetNode.id, port: port, in: workflow); let distance = hypot(targetPortPos.x - dropPoint.x, targetPortPos.y - dropPoint.y); if distance <= snapDistance { if closest == nil || distance < closest!.distance { closest = (targetNode.id, port, distance) } } } }; if let bestMatch = closest { let condition = guessConditionForNewConnection(startID: sourceID, startPort: sPort, in: workflow); engine.addConnection(source: sourceID, sourcePort: sPort, target: bestMatch.nodeID, targetPort: bestMatch.port, condition: condition) } }
 }
 
-// 替换原有的 CanvasNodeCardView
 struct CanvasNodeCardView: View {
     @Binding var action: RPAAction
     var isCurrent: Bool; var isStart: Bool; var isEnd: Bool; var isConnecting: Bool
@@ -343,7 +347,6 @@ struct CanvasNodeCardView: View {
     @State private var breathePhase: CGFloat = 0
 
     var themeColor: Color {
-        // 禁用状态统一降级为灰色系
         if action.isDisabled { return .gray }
         switch action.type {
         case .aiVision, .ocrText: return .purple
@@ -369,7 +372,6 @@ struct CanvasNodeCardView: View {
                     .textFieldStyle(.plain)
                     .lineLimit(1)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    // 可选：如果节点名称过长被挤压，可以提高它的布局优先级
                     .layoutPriority(1)
                     .disabled(isCurrent)
                 
@@ -385,7 +387,6 @@ struct CanvasNodeCardView: View {
             .shadow(color: isCurrent ? themeColor.opacity(0.5 - breathePhase * 0.2) : .black.opacity(0.05), radius: isCurrent ? (6 + breathePhase * 8) : 2, y: 2)
             .scaleEffect(isCurrent ? (1.02 + breathePhase * 0.02) : 1.0)
             .animation(.easeOut(duration: 0.2), value: isCurrent)
-            // [✨修改] 增加禁用选项以及视觉穿透力衰减
             .opacity(action.isDisabled ? 0.6 : 1.0)
             .contextMenu {
                 Button(action: { action.isDisabled.toggle() }) {
@@ -409,18 +410,15 @@ struct CanvasNodeCardView: View {
     private func getPortLocalOffset(port: PortPosition) -> CGSize { switch port { case .top: return CGSize(width: 0, height: -cardHeight / 2); case .bottom: return CGSize(width: 0, height: cardHeight / 2); case .left: return CGSize(width: -cardWidth / 2, height: 0); case .right: return CGSize(width: cardWidth / 2, height: 0) } }
 }
 
-// [✨性能核心优化] 重构控制台视图，解决 AI 打字机引发的 UI 假死与资源暴涨
-// MARK: - [✨新增] 日志解析节点模型
 struct ParsedLogNode: Identifiable {
     let id = UUID()
     var isThink: Bool
     var text: String
 }
 
-// MARK: - [✨新增] 单行日志渲染视图（支持深度思考折叠）
 struct LogRowView: View {
     let text: String
-    @State private var isThinkExpanded = false // 默认折叠
+    @State private var isThinkExpanded = false
     
     var body: some View {
         let nodes = parseLog(text)
@@ -447,7 +445,6 @@ struct LogRowView: View {
         }
     }
     
-    // 动态解析带有 <think> 标签的流式字符串
     private func parseLog(_ text: String) -> [ParsedLogNode] {
         var result: [ParsedLogNode] = []
         var currentText = text
@@ -457,12 +454,10 @@ struct LogRowView: View {
             
             let remaining = String(currentText[startRange.upperBound...])
             if let endRange = remaining.range(of: "</think>") {
-                // 已闭合的思考块
                 let thinkText = String(remaining[..<endRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
                 result.append(ParsedLogNode(isThink: true, text: thinkText))
                 currentText = String(remaining[endRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
             } else {
-                // 尚未闭合的思考块（正在流式输出中）
                 let streamingThink = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
                 result.append(ParsedLogNode(isThink: true, text: streamingThink + " ..."))
                 currentText = ""
@@ -476,16 +471,13 @@ struct LogRowView: View {
     }
 }
 
-// [✨性能与体验核心优化] 重构控制台视图
 struct LogConsoleView: View {
     var logs: [String]
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                // 必须使用 LazyVStack，保证性能
                 LazyVStack(alignment: .leading, spacing: 6) {
                     ForEach(logs.indices, id: \.self) { index in
-                        // 使用全新的折叠行视图
                         LogRowView(text: logs[index])
                             .id(index)
                     }
@@ -493,11 +485,10 @@ struct LogConsoleView: View {
                 .frame(maxWidth: .infinity, alignment: .leading).padding()
             }
             .frame(height: 120).background(Color(NSColor.windowBackgroundColor))
-            // 监听新增行数时平滑滚动
+            .textSelection(.enabled)
             .onChange(of: logs.count) { _, _ in
                 if !logs.isEmpty { withAnimation { proxy.scrollTo(logs.count - 1, anchor: .bottom) } }
             }
-            // 监听最后一行流式打字时的无动画极速滚动，降低渲染负担
             .onChange(of: logs.last) { _, _ in
                 if !logs.isEmpty { proxy.scrollTo(logs.count - 1, anchor: .bottom) }
             }
@@ -509,7 +500,6 @@ struct ConnectionLine: Shape { var start: CGPoint; var end: CGPoint; var startPo
 struct ConnectionArrowLine: View { var start: CGPoint; var end: CGPoint; var startPort: PortPosition; var endPort: PortPosition; var condition: ConnectionCondition; var body: some View { let c1 = CGPoint(x: start.x + startPort.controlOffset.width, y: start.y + startPort.controlOffset.height); let c2 = CGPoint(x: end.x + endPort.controlOffset.width, y: end.y + endPort.controlOffset.height); let t: CGFloat = 0.9; let mt: CGFloat = 1.0 - t; let arrowX = mt*mt*mt*start.x + 3.0*mt*mt*t*c1.x + 3.0*mt*t*t*c2.x + t*t*t*end.x; let arrowY = mt*mt*mt*start.y + 3.0*mt*mt*t*c1.y + 3.0*mt*t*t*c2.y + t*t*t*end.y; let dX = 3.0*mt*mt*(c1.x - start.x) + 6.0*mt*t*(c2.x - c1.x) + 3.0*t*t*(end.x - c2.x); let dY = 3.0*mt*mt*(c1.y - start.y) + 6.0*mt*t*(c2.y - c1.y) + 3.0*t*t*(end.y - c2.y); let angle = atan2(dY, dX); let strokeColor = condition == .success ? Color.green : (condition == .failure ? Color.red : Color.blue); ZStack { ConnectionLine(start: start, end: end, startPort: startPort, endPort: endPort).stroke(strokeColor.opacity(0.8), style: StrokeStyle(lineWidth: 2, dash: condition == .failure ? [4, 4] : [])); Image(systemName: "play.fill").font(.system(size: 12)).foregroundColor(strokeColor).rotationEffect(.radians(Double(angle))).position(x: arrowX, y: arrowY) } } }
 struct GridBackgroundView: View { let gridSize: CGFloat = 20; var offset: CGSize; var body: some View { GeometryReader { geometry in Path { path in let w = geometry.size.width; let h = geometry.size.height; let startX = offset.width.truncatingRemainder(dividingBy: gridSize); let startY = offset.height.truncatingRemainder(dividingBy: gridSize); for x in stride(from: startX - gridSize, through: w + gridSize, by: gridSize) { path.move(to: CGPoint(x: x, y: 0)); path.addLine(to: CGPoint(x: x, y: h)) }; for y in stride(from: startY - gridSize, through: h + gridSize, by: gridSize) { path.move(to: CGPoint(x: 0, y: y)); path.addLine(to: CGPoint(x: w, y: y)) } }.stroke(Color.gray.opacity(0.04), lineWidth: 1) }.background(Color(NSColor.textBackgroundColor)) } }
 
-// MARK: - [✨新增] 极客级全局设置面板
 struct GlobalSettingsPopoverView: View {
     @ObservedObject var settings = AppSettings.shared
     
@@ -521,9 +511,6 @@ struct GlobalSettingsPopoverView: View {
             }
             Divider()
             
-            // [✨修改] 完全移除了与 AIConfigManager 功能重复的基础配置界面
-            
-            // [✨新增] WebAgent 运行控制
             VStack(alignment: .leading, spacing: 12) {
                 Label("WebAgent 运行控制", systemImage: "globe").font(.subheadline).bold()
                 HStack {

@@ -8,6 +8,7 @@
 import Foundation
 import AppKit
 import Vision
+import Combine
 
 // MARK: - [稳定性基建] 节点智能重试装饰器机制
 extension RPAActionExecutor {
@@ -1042,6 +1043,7 @@ struct AIVisionExecutor: RPAActionExecutor {
 
 // MARK: - Web 智能体执行器
 /// WebAgent 4.0 的核心逻辑：循环获取结构、触发多模态模型、下发行为，最后通过双引擎断言验证
+/// [✨进阶整合版]：包含 RAG 语料经验注入、DOM 提取自主降级机制，以及【达尔文优胜劣汰自愈闭环】
 struct WebAgentExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         let params = WebAgentParams.parse(from: action.parameter)
@@ -1059,14 +1061,21 @@ struct WebAgentExecutor: RPAActionExecutor {
         var isTaskCompleted = false
         var actionHistory: [String] = []
         
+        // [✨新增] 极限压缩状态标识，默认开启以最大化提速
+        var useExtremeCompression = true
+        
+        // [✨新增] 记录本轮任务执行过程中，大模型参考过的所有语料经验 ID (用 Set 去重)
+        var usedCorpusRecordIDs: Set<UUID> = []
+        
         // ==========================================
         // 第一阶段：感知与决策执行循环
         // ==========================================
         while currentRound < maxRounds && !isTaskCompleted && context.isRunning {
             currentRound += 1
-            context.log("🔄 [WebAgent] 第 \(currentRound) 轮感知与决策...")
+            let modeName = useExtremeCompression ? "极限压缩模式" : "完整DOM模式"
+            context.log("🔄 [WebAgent] 第 \(currentRound) 轮感知与决策 (\(modeName))...")
             
-            let domContext = await context.injectSoMAndGetDOM(browser: params.browser)
+            let domContext = await context.injectSoMAndGetDOM(browser: params.browser, isExtremeCompressed: useExtremeCompression)
             if domContext.contains("Error") {
                 context.log("❌ [WebAgent] 获取网页结构失败: \(domContext)")
                 await MainActor.run { AgentMonitorManager.shared.isProcessing = false }
@@ -1088,15 +1097,35 @@ struct WebAgentExecutor: RPAActionExecutor {
             await MainActor.run { AgentMonitorManager.shared.currentVision = NSImage(cgImage: screenCGImage, size: .zero) }
             await context.cleanupSoM(browser: params.browser)
             
+            // ==========================================
+            // [✨智能动态 RAG 注入]：在思考前，引擎先去语料库查阅相关经验
+            // ==========================================
+            let relevantRecords = CorpusDatabase.shared.searchTopRelevantAdvanced(intent: params.taskDesc, topK: 2)
+            var dynamicManual = params.manualText
+            
+            if !relevantRecords.isEmpty {
+                dynamicManual += "\n\n【系统历史操作经验库匹配 (自动检索)】：\n"
+                for (idx, record) in relevantRecords.enumerated() {
+                    // [✨新增] 记录被大模型“翻阅”过的语料 ID，留待后续结算算分
+                    usedCorpusRecordIDs.insert(record.id)
+                    
+                    if let stepsJSON = record.synthesizedStepsJSON {
+                        dynamicManual += "案例\(idx + 1): 当用户要求[\(record.userIntent)]时，标准做法是输出以下JSON：\n\(stepsJSON)\n"
+                    }
+                }
+                context.log("🧠 [WebAgent] 已从本地知识库检索到 \(relevantRecords.count) 条相关经验，开始融合推理...")
+            }
+            
             let historyStr = actionHistory.isEmpty ? "无" : actionHistory.enumerated().map{ "\($0.offset+1). \($0.element)" }.joined(separator: "\n")
 
+            // 组装最终的 Prompt
             let prompt = AppSettings.shared.webAgentPrompt
                 .replacingOccurrences(of: "{{TaskDesc}}", with: params.taskDesc)
-                .replacingOccurrences(of: "{{SuccessAssertion}}", with: params.successAssertion.isEmpty ? "无 (自主判断)" : params.successAssertion)
-                .replacingOccurrences(of: "{{Manual}}", with: params.manualText.isEmpty ? "无" : params.manualText)
+                .replacingOccurrences(of: "{{SuccessAssertion}}", with: params.successAssertion.isEmpty ? "无" : params.successAssertion)
+                .replacingOccurrences(of: "{{Manual}}", with: dynamicManual.isEmpty ? "无" : dynamicManual)
                 .replacingOccurrences(of: "{{History}}", with: historyStr)
                 .replacingOccurrences(of: "{{DOM}}", with: domContext)
-            
+                
             context.log("🧠 [WebAgent] 大脑运转中 (图文多模态推理)...")
             context.log("🌊 正在思考: ")
             
@@ -1161,6 +1190,20 @@ struct WebAgentExecutor: RPAActionExecutor {
                     continue
                 }
                 
+                // 判定大模型是否发出了降级提取指令
+                if let firstStep = steps.first, let aType = firstStep["action_type"] as? String, aType == "request_full_dom" {
+                    if useExtremeCompression {
+                        context.log("⚠️ AI 未在极限压缩 DOM 中找到目标，自主要求降级使用【完整 DOM】重新提取...")
+                        useExtremeCompression = false
+                        currentRound -= 1
+                        continue
+                    } else {
+                        context.log("❌ 即使使用完整 DOM，AI 依然无法定位目标元素，判定当前页面无法操作。")
+                        await MainActor.run { AgentMonitorManager.shared.isProcessing = false }
+                        return .failure
+                    }
+                }
+                
                 await MainActor.run {
                     AgentMonitorManager.shared.plannedSteps = steps.enumerated().map { index, step in
                         let aType = step["action_type"] as? String ?? "未知"
@@ -1205,6 +1248,23 @@ struct WebAgentExecutor: RPAActionExecutor {
                     
                     let (injectedScript, scriptResult) = await context.injectActionJS(browser: params.browser, action: actionType, targetId: targetId, value: inputValue)
                     
+                    // 3. 打印底层 JS 的真实返回值（极其关键！）
+                    context.log("💻 JS底层返回: \(scriptResult.isEmpty ? "执行报错或无返回值" : scriptResult)")
+                    
+                    // 🔥 3. [核心修复 B] 给大模型加上“痛觉神经”！
+                    if scriptResult.contains("Not Found") || scriptResult.contains("Error") || scriptResult.isEmpty {
+                        context.log("⚠️ 网页发生重绘或元素改变 (\(scriptResult))，连续动作链已被阻断。强制进入下一轮感知...")
+                        
+                        // 记录失败教训，喂给下一轮的 AI
+                        actionHistory.append("[\(actionType)] 目标ID:\(targetId) 失败！底层报错: \(scriptResult)。页面DOM已发生改变或元素不存在，请重新观察当前画面并生成新的操作步骤。")
+                        
+                        // 【极其关键的 break】：遇到任何一个步骤失败，立刻终止后面的所有连贯动作（如点击登录），
+                        // 让最外层的 while 循环重新接管，AI 就会对着最新的网页重新分配正确的 data-rpa-id！
+                        break
+                    } else {
+                        actionHistory.append("[\(actionType)] 目标ID:\(targetId) 输入:\(displayValue)")
+                    }
+                    
                     let nodeName = action.displayTitle
                     let logMessage = """
                     ➤ 节点名称: \(nodeName)
@@ -1224,6 +1284,8 @@ struct WebAgentExecutor: RPAActionExecutor {
                     if !context.isRunning { break }
                 }
                 
+                useExtremeCompression = true
+                
             } catch {
                 context.log("❌ [WebAgent] 推理失败: \(error.localizedDescription)")
                 await MainActor.run { AgentMonitorManager.shared.isProcessing = false }
@@ -1232,17 +1294,15 @@ struct WebAgentExecutor: RPAActionExecutor {
         }
         
         // ==========================================
-        // 第二阶段：[✨升级] 支持双引擎的最终视觉断言阶段
+        // 第二阶段：支持双引擎的最终视觉断言阶段
         // ==========================================
         if !params.successAssertion.isEmpty {
             let modeStr = params.assertionType == "ocr" ? "极速 OCR 识字" : "AI 多模态裁判"
             context.log("🔍 [WebAgent] 开始最终独立视觉断言检查 (模式: \(modeStr))...")
             await MainActor.run { AgentMonitorManager.shared.llmThought = "正在执行最终视觉断言 (\(modeStr))..." }
             
-            // 1. 给页面的跳转、加载或动画留出充足的缓冲时间
             try? await Task.sleep(nanoseconds: 2_000_000_000)
             
-            // 2. 截取屏幕区域
             let targetCaptureApp: String? = (params.captureMode == "fullscreen") ? nil : (params.browser == "InternalBrowser" ? ProcessInfo.processInfo.processName : params.browser)
             let targetWindowTitle: String? = (params.captureMode == "fullscreen") ? nil : (params.browser == "InternalBrowser" ? "开发者浏览器" : nil)
             
@@ -1251,11 +1311,8 @@ struct WebAgentExecutor: RPAActionExecutor {
                 await MainActor.run { AgentMonitorManager.shared.currentVision = NSImage(cgImage: assertionImage, size: .zero) }
                 
                 if params.assertionType == "ocr" {
-                    // ------------------------------------------
-                    // 分支 A：本地 Vision OCR 极速断言
-                    // ------------------------------------------
+                    // OCR 断言
                     context.log("📸 [WebAgent] 正在限定视觉区域内扫描文本: '\(params.successAssertion)'")
-                    
                     let request = VNRecognizeTextRequest()
                     request.recognitionLanguages = ["zh-Hans", "en-US"]
                     request.usesLanguageCorrection = true
@@ -1263,33 +1320,27 @@ struct WebAgentExecutor: RPAActionExecutor {
                     do {
                         let handler = VNImageRequestHandler(cgImage: assertionImage, options: [:])
                         try handler.perform([request])
-                        
                         if let observations = request.results as? [VNRecognizedTextObservation] {
                             let isFound = observations.contains { obs in
                                 let text = obs.topCandidates(1).first?.string ?? ""
                                 return text.localizedCaseInsensitiveContains(params.successAssertion)
                             }
-                            
                             if isFound {
-                                context.log("✅ [OCR 断言通过]: 在视觉区域内成功匹配到目标文字 '\(params.successAssertion)'")
+                                context.log("✅ [OCR 断言通过]: 匹配到目标文字 '\(params.successAssertion)'")
                                 isTaskCompleted = true
                             } else {
-                                context.log("❌ [OCR 断言失败]: 视觉区域内未找到指定文字 '\(params.successAssertion)'")
+                                context.log("❌ [OCR 断言失败]: 未找到文字 '\(params.successAssertion)'")
                                 isTaskCompleted = false
                             }
                         } else {
-                            context.log("❌ [OCR 断言失败]: 屏幕内容无法被识别。")
                             isTaskCompleted = false
                         }
                     } catch {
-                        context.log("❌ [OCR 断言失败]: Vision 引擎执行异常: \(error.localizedDescription)")
                         isTaskCompleted = false
                     }
                     
                 } else {
-                    // ------------------------------------------
-                    // 分支 B：原生 AI 大模型推理断言
-                    // ------------------------------------------
+                    // AI 断言
                     let assertionPrompt = """
                     你是一个客观、严格的 RPA 视觉断言裁判。请观察截图，判断当前页面是否已经满足以下成功条件：
                     【断言条件】: \(params.successAssertion)
@@ -1300,7 +1351,6 @@ struct WebAgentExecutor: RPAActionExecutor {
                         "reason": "简短的判断理由"
                     }
                     """
-                    
                     let nsImage = NSImage(cgImage: assertionImage, size: .zero)
                     let message = LLMMessage(role: .user, text: assertionPrompt, images: [nsImage])
                     
@@ -1310,14 +1360,13 @@ struct WebAgentExecutor: RPAActionExecutor {
                        let jsonData = jsonStr.data(using: .utf8),
                        let resultDict = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
                        let isSuccess = resultDict["is_success"] as? Bool {
-                        
                         let reason = resultDict["reason"] as? String ?? "无"
                         if isSuccess {
                             context.log("✅ [AI 断言通过]: \(reason)")
                             isTaskCompleted = true
                         } else {
                             context.log("❌ [AI 断言失败]: \(reason)")
-                            isTaskCompleted = false // 强行扭转结果为失败
+                            isTaskCompleted = false
                         }
                     } else {
                         context.log("⚠️ 最终断言解析失败，降级依赖运行状态。")
@@ -1330,6 +1379,37 @@ struct WebAgentExecutor: RPAActionExecutor {
             context.log("🛑 [WebAgent] 已达到系统设置的最大允许轮数 (\(maxRounds) 轮)，强制中断。")
         }
         
+        // ==========================================
+        // [✨新增] 终极结算：执行达尔文优胜劣汰自愈反馈机制
+        // ==========================================
+        if !usedCorpusRecordIDs.isEmpty {
+            let finalSuccess = isTaskCompleted
+            
+            // 切换到主线程修改带有 @Published 的数据库对象
+            await MainActor.run {
+                let db = CorpusDatabase.shared
+                var isChanged = false
+                
+                for recordID in usedCorpusRecordIDs {
+                    if let idx = db.records.firstIndex(where: { $0.id == recordID }) {
+                        if finalSuccess {
+                            db.records[idx].successCount += 1
+                        } else {
+                            db.records[idx].failCount += 1
+                        }
+                        isChanged = true
+                    }
+                }
+                
+                if isChanged {
+                    db.objectWillChange.send()
+                    db.save()
+                    let resultText = finalSuccess ? "✅ 成功 (增加置信度)" : "❌ 失败 (降低置信度)"
+                    context.log("🧬 [达尔文机制结算] 任务结束，已将本轮参考过的 \(usedCorpusRecordIDs.count) 条语料经验标记为：\(resultText)")
+                }
+            }
+        }
+
         await MainActor.run { AgentMonitorManager.shared.isProcessing = false }
         return isTaskCompleted ? .success : .failure
     }

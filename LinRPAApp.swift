@@ -11,7 +11,14 @@ struct LinRPAApp: App {
             ContentView()
         }
         
-        // [✨ 新增 1] 注册独立的 Agent 监控窗口，赋予一个唯一 ID "agentMonitor"
+        // [✨关键] 注册知识库窗口，并指定 ID
+        WindowGroup(id: "corpus-manager") {
+            CorpusManagerView()
+        }
+        .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 800, height: 600)
+        
+        // [✨ 新增] 注册独立的 Agent 监控窗口，赋予一个唯一 ID "agentMonitor"
         Window("WebAgent 感知与决策监控", id: "agentMonitor") {
             AgentMonitorView()
                 // 强制应用暗色模式，让黑客/极客监控面板更有氛围感
