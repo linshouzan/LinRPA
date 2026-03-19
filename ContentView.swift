@@ -188,7 +188,10 @@ struct ContentView: View {
                     
                     if engine.hasUnsavedChanges { Button(action: { engine.saveChanges() }) { Label("保存", systemImage: "checkmark.circle.fill") }.buttonStyle(.borderedProminent).tint(.green); Divider().frame(height: 16).padding(.horizontal, 4) }
                     
-                    Button(action: toggleRecording) { Label(isRecordingUI ? "停止录制" : "动作录制", systemImage: isRecordingUI ? "stop.circle.fill" : "record.circle").foregroundColor(isRecordingUI ? .red : .primary) }.buttonStyle(.bordered).symbolEffect(.pulse, isActive: isRecordingUI)
+                    Button(action: {
+                        isRecordingUI ? CorpusHUDManager.shared.hideHUD() : { CorpusHUDManager.shared.showHUD(); if let mainWindow = NSApp.windows.first(where: { $0.title == "我的流程" || $0.className.contains("AppKitWindow"); }) { mainWindow.miniaturize(nil) } }()
+                        isRecordingUI.toggle()
+                    }) { Label(isRecordingUI ? "停止录制" : "动作录制", systemImage: isRecordingUI ? "stop.circle.fill" : "record.circle").foregroundColor(isRecordingUI ? .red : .primary) }.buttonStyle(.bordered).symbolEffect(.pulse, isActive: isRecordingUI)
                     Divider().frame(height: 16).padding(.horizontal, 4)
                     
                     if engine.isRunning { Button(action: { engine.isRunning = false }) { Label("紧急停止", systemImage: "stop.fill") }.buttonStyle(.borderedProminent).tint(.red) }

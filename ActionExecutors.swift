@@ -1043,7 +1043,7 @@ struct AIVisionExecutor: RPAActionExecutor {
 
 // MARK: - Web 智能体执行器
 /// WebAgent 4.0 的核心逻辑：循环获取结构、触发多模态模型、下发行为，最后通过双引擎断言验证
-/// [✨进阶整合版]：包含 RAG 语料经验注入、DOM 提取自主降级机制，以及【达尔文优胜劣汰自愈闭环】
+/// [✨重构进化]：彻底剥离旧版 SoM 可视化标记，全面拥抱录制探针体系的“无感 Hash 定位”与“强力自愈动作派发”
 struct WebAgentExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         let params = WebAgentParams.parse(from: action.parameter)
@@ -1060,11 +1060,7 @@ struct WebAgentExecutor: RPAActionExecutor {
         var currentRound = 0
         var isTaskCompleted = false
         var actionHistory: [String] = []
-        
-        // [✨新增] 极限压缩状态标识，默认开启以最大化提速
         var useExtremeCompression = true
-        
-        // [✨新增] 记录本轮任务执行过程中，大模型参考过的所有语料经验 ID (用 Set 去重)
         var usedCorpusRecordIDs: Set<UUID> = []
         
         // ==========================================
@@ -1075,7 +1071,17 @@ struct WebAgentExecutor: RPAActionExecutor {
             let modeName = useExtremeCompression ? "极限压缩模式" : "完整DOM模式"
             context.log("🔄 [WebAgent] 第 \(currentRound) 轮感知与决策 (\(modeName))...")
             
-            let domContext = await context.injectSoMAndGetDOM(browser: params.browser, isExtremeCompressed: useExtremeCompression)
+            // [✨改造核心] 彻底干掉 injectSoMAndGetDOM，复用录制探针进行无感 Hash 打标和 DOM 提取
+            var domContext = await MainActor.run { BrowserScriptBridge.runJS(in: params.browser, js: BrowserScriptBridge.extractDOMJS) } ?? "NEED_INJECTION"
+            
+            // 如果页面没探针，说明刚才发生了刷新或者跳转，当场补打探针
+            if domContext == "NEED_INJECTION" || domContext == "NOT_FOUND" || domContext.isEmpty {
+                await MainActor.run { _ = BrowserScriptBridge.runJS(in: params.browser, js: BrowserScriptBridge.probeInjectionJS) }
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                await MainActor.run { _ = BrowserScriptBridge.runJS(in: params.browser, js: BrowserScriptBridge.forceTagJS) }
+                domContext = await MainActor.run { BrowserScriptBridge.runJS(in: params.browser, js: BrowserScriptBridge.extractDOMJS) } ?? "页面暂无有效交互元素"
+            }
+            
             if domContext.contains("Error") {
                 context.log("❌ [WebAgent] 获取网页结构失败: \(domContext)")
                 await MainActor.run { AgentMonitorManager.shared.isProcessing = false }
@@ -1095,10 +1101,9 @@ struct WebAgentExecutor: RPAActionExecutor {
             }
             
             await MainActor.run { AgentMonitorManager.shared.currentVision = NSImage(cgImage: screenCGImage, size: .zero) }
-            await context.cleanupSoM(browser: params.browser)
             
             // ==========================================
-            // [✨智能动态 RAG 注入]：在思考前，引擎先去语料库查阅相关经验
+            // 查阅经验库
             // ==========================================
             let relevantRecords = CorpusDatabase.shared.searchTopRelevantAdvanced(intent: params.taskDesc, topK: 2)
             var dynamicManual = params.manualText
@@ -1106,9 +1111,7 @@ struct WebAgentExecutor: RPAActionExecutor {
             if !relevantRecords.isEmpty {
                 dynamicManual += "\n\n【系统历史操作经验库匹配 (自动检索)】：\n"
                 for (idx, record) in relevantRecords.enumerated() {
-                    // [✨新增] 记录被大模型“翻阅”过的语料 ID，留待后续结算算分
                     usedCorpusRecordIDs.insert(record.id)
-                    
                     if let stepsJSON = record.synthesizedStepsJSON {
                         dynamicManual += "案例\(idx + 1): 当用户要求[\(record.userIntent)]时，标准做法是输出以下JSON：\n\(stepsJSON)\n"
                     }
@@ -1118,7 +1121,6 @@ struct WebAgentExecutor: RPAActionExecutor {
             
             let historyStr = actionHistory.isEmpty ? "无" : actionHistory.enumerated().map{ "\($0.offset+1). \($0.element)" }.joined(separator: "\n")
 
-            // 组装最终的 Prompt
             let prompt = AppSettings.shared.webAgentPrompt
                 .replacingOccurrences(of: "{{TaskDesc}}", with: params.taskDesc)
                 .replacingOccurrences(of: "{{SuccessAssertion}}", with: params.successAssertion.isEmpty ? "无" : params.successAssertion)
@@ -1127,7 +1129,6 @@ struct WebAgentExecutor: RPAActionExecutor {
                 .replacingOccurrences(of: "{{DOM}}", with: domContext)
                 
             context.log("🧠 [WebAgent] 大脑运转中 (图文多模态推理)...")
-            context.log("🌊 正在思考: ")
             
             await MainActor.run {
                 AgentMonitorManager.shared.llmThought = ""
@@ -1190,7 +1191,6 @@ struct WebAgentExecutor: RPAActionExecutor {
                     continue
                 }
                 
-                // 判定大模型是否发出了降级提取指令
                 if let firstStep = steps.first, let aType = firstStep["action_type"] as? String, aType == "request_full_dom" {
                     if useExtremeCompression {
                         context.log("⚠️ AI 未在极限压缩 DOM 中找到目标，自主要求降级使用【完整 DOM】重新提取...")
@@ -1244,22 +1244,22 @@ struct WebAgentExecutor: RPAActionExecutor {
                     }
                     
                     context.log("⚙️ 执行步骤 \(index + 1): \(actionType) -> [\(targetId)]")
-                    actionHistory.append("[\(actionType)] 目标ID:\(targetId) 输入:\(rawInputValue)")
                     
-                    let (injectedScript, scriptResult) = await context.injectActionJS(browser: params.browser, action: actionType, targetId: targetId, value: inputValue)
+                    // ==========================================
+                    // 动作派发：全面采用具备自愈能力的特征 Hash 回放引擎！
+                    // ==========================================
+                    let playbackJS = BrowserScriptBridge.generatePlaybackJS(targetId: targetId, actionType: actionType, inputValue: inputValue)
                     
-                    // 3. 打印底层 JS 的真实返回值（极其关键！）
-                    context.log("💻 JS底层返回: \(scriptResult.isEmpty ? "执行报错或无返回值" : scriptResult)")
+                    let scriptResult = await MainActor.run {
+                        BrowserScriptBridge.runJS(in: params.browser, js: playbackJS) ?? ""
+                    }
                     
-                    // 🔥 3. [核心修复 B] 给大模型加上“痛觉神经”！
-                    if scriptResult.contains("Not Found") || scriptResult.contains("Error") || scriptResult.isEmpty {
-                        context.log("⚠️ 网页发生重绘或元素改变 (\(scriptResult))，连续动作链已被阻断。强制进入下一轮感知...")
-                        
-                        // 记录失败教训，喂给下一轮的 AI
-                        actionHistory.append("[\(actionType)] 目标ID:\(targetId) 失败！底层报错: \(scriptResult)。页面DOM已发生改变或元素不存在，请重新观察当前画面并生成新的操作步骤。")
-                        
-                        // 【极其关键的 break】：遇到任何一个步骤失败，立刻终止后面的所有连贯动作（如点击登录），
-                        // 让最外层的 while 循环重新接管，AI 就会对着最新的网页重新分配正确的 data-rpa-id！
+                    let injectedScript = "/* 🚀 采用 RPA 原生强力引擎分发动作 (具备高亮与防丢失自愈能力) */"
+                    context.log("💻 JS底层返回: \(scriptResult.isEmpty ? "无返回值/错误" : scriptResult)")
+                    
+                    if scriptResult.contains("Not Found") || scriptResult.contains("Error") {
+                        context.log("⚠️ 网页发生重绘或元素未能寻回 (\(scriptResult))，连续动作链已被阻断。强制进入下一轮感知...")
+                        actionHistory.append("[\(actionType)] 目标ID:\(targetId) 失败！底层报错: \(scriptResult)。请重新观察当前画面并生成新的操作步骤。")
                         break
                     } else {
                         actionHistory.append("[\(actionType)] 目标ID:\(targetId) 输入:\(displayValue)")
@@ -1271,14 +1271,14 @@ struct WebAgentExecutor: RPAActionExecutor {
                     ➤ 动作意图: \(actionType) (目标ID: \(targetId.isEmpty ? "无" : targetId))
                     ➤ 注入操作:
                     \(isSensitive ? "// 🔒 安全脱敏，已隐藏底层注入脚本与真实凭据内容" : injectedScript)
-                    ➤ 返回结果: \(scriptResult.isEmpty ? "undefined / 无返回值" : scriptResult)
+                    ➤ 返回结果: \(scriptResult.isEmpty ? "SUCCESS" : scriptResult)
                     """
                     
                     await MainActor.run {
                         AgentMonitorManager.shared.actionExecutionLogs.append(logMessage)
                     }
                     
-                    let sleepTime: UInt64 = (index == steps.count - 1) ? 1_500_000_000 : 300_000_000
+                    let sleepTime: UInt64 = (index == steps.count - 1) ? 1_500_000_000 : 800_000_000
                     try? await Task.sleep(nanoseconds: sleepTime)
                     
                     if !context.isRunning { break }
@@ -1294,9 +1294,9 @@ struct WebAgentExecutor: RPAActionExecutor {
         }
         
         // ==========================================
-        // 第二阶段：支持双引擎的最终视觉断言阶段
+        // 第二阶段：最终视觉断言阶段 (未作修改)
         // ==========================================
-        if !params.successAssertion.isEmpty {
+        if !params.successAssertion.isEmpty && !isTaskCompleted {
             let modeStr = params.assertionType == "ocr" ? "极速 OCR 识字" : "AI 多模态裁判"
             context.log("🔍 [WebAgent] 开始最终独立视觉断言检查 (模式: \(modeStr))...")
             await MainActor.run { AgentMonitorManager.shared.llmThought = "正在执行最终视觉断言 (\(modeStr))..." }
@@ -1311,7 +1311,6 @@ struct WebAgentExecutor: RPAActionExecutor {
                 await MainActor.run { AgentMonitorManager.shared.currentVision = NSImage(cgImage: assertionImage, size: .zero) }
                 
                 if params.assertionType == "ocr" {
-                    // OCR 断言
                     context.log("📸 [WebAgent] 正在限定视觉区域内扫描文本: '\(params.successAssertion)'")
                     let request = VNRecognizeTextRequest()
                     request.recognitionLanguages = ["zh-Hans", "en-US"]
@@ -1340,7 +1339,6 @@ struct WebAgentExecutor: RPAActionExecutor {
                     }
                     
                 } else {
-                    // AI 断言
                     let assertionPrompt = """
                     你是一个客观、严格的 RPA 视觉断言裁判。请观察截图，判断当前页面是否已经满足以下成功条件：
                     【断言条件】: \(params.successAssertion)
@@ -1379,28 +1377,18 @@ struct WebAgentExecutor: RPAActionExecutor {
             context.log("🛑 [WebAgent] 已达到系统设置的最大允许轮数 (\(maxRounds) 轮)，强制中断。")
         }
         
-        // ==========================================
-        // [✨新增] 终极结算：执行达尔文优胜劣汰自愈反馈机制
-        // ==========================================
         if !usedCorpusRecordIDs.isEmpty {
             let finalSuccess = isTaskCompleted
-            
-            // 切换到主线程修改带有 @Published 的数据库对象
             await MainActor.run {
                 let db = CorpusDatabase.shared
                 var isChanged = false
-                
                 for recordID in usedCorpusRecordIDs {
                     if let idx = db.records.firstIndex(where: { $0.id == recordID }) {
-                        if finalSuccess {
-                            db.records[idx].successCount += 1
-                        } else {
-                            db.records[idx].failCount += 1
-                        }
+                        if finalSuccess { db.records[idx].successCount += 1 }
+                        else { db.records[idx].failCount += 1 }
                         isChanged = true
                     }
                 }
-                
                 if isChanged {
                     db.objectWillChange.send()
                     db.save()

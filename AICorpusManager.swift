@@ -153,7 +153,7 @@ class WebCorpusManager: ObservableObject {
     static let shared = WebCorpusManager()
     
     private var pollTimer: Timer?
-    private var globalEventMonitor: Any? // [✨新增] 全局热键监听器
+    private var globalEventMonitor: Any? // 全局热键监听器
     
     @Published var isRecordingMode: Bool = false {
         didSet {
@@ -190,20 +190,18 @@ class WebCorpusManager: ObservableObject {
     }
     @Published var sessionEvents: [RawSessionEvent] = []
     
-    // [✨新增] 注册全局与本地热键 (Option + Command + R)
+    // MARK: - 热键与生命周期管理
     private func setupHotkeys() {
         let handler: (NSEvent) -> Void = { [weak self] event in
             if event.modifierFlags.contains([.command, .option]) && event.keyCode == 15 { // 15 是 'R' 键
                 DispatchQueue.main.async { self?.isPaused.toggle() }
             }
         }
-        // 监听其他 App 激活时的按键
         globalEventMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: handler)
-        // 本地 App 也可以使用 (非必需，但提升体验)
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             if event.modifierFlags.contains([.command, .option]) && event.keyCode == 15 {
                 DispatchQueue.main.async { self.isPaused.toggle() }
-                return nil // 拦截掉
+                return nil
             }
             return event
         }
@@ -217,8 +215,33 @@ class WebCorpusManager: ObservableObject {
     }
     
     func stopRecording() {
+        self.isRecordingMode = false // 触发 didSet 里的清理逻辑
+        AgentMonitorManager.shared.actionExecutionLogs.append("⏹ 已停止录制并向浏览器发送探针卸载指令。")
+    }
+    
+    // [✨修复 1] 完善停止录制与界面闭环，隐藏HUD并恢复系统焦点
+    func closeRecording() {
         self.isRecordingMode = false
         AgentMonitorManager.shared.actionExecutionLogs.append("⏹ 已停止录制并卸载网页探针。")
+        
+        DispatchQueue.main.async {
+            // 1. 关闭悬浮窗口
+            CorpusHUDManager.shared.hideHUD()
+            
+            // 2. 智能定位并唤起 RPA 相关的核心窗口（优先唤醒语料库，其次是主流程面板）
+            let windowsToActivate = NSApp.windows.filter {
+                $0.title == "AI 动作经验库 (本地 RAG)" ||
+                $0.title == "我的流程" ||
+                $0.className.contains("AppKitWindow")
+            }
+            
+            if let targetWindow = windowsToActivate.first(where: { $0.title == "AI 动作经验库 (本地 RAG)" }) ?? windowsToActivate.first {
+                targetWindow.makeKeyAndOrderFront(nil)
+            }
+            
+            // 3. 强行夺回系统级焦点
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
     
     @MainActor
@@ -228,6 +251,7 @@ class WebCorpusManager: ObservableObject {
         AgentMonitorManager.shared.actionExecutionLogs.append("⏳ 已在动作流中插入等待 \(seconds) 秒节点")
     }
     
+    // MARK: - 外部浏览器轮询机制
     private func startPollingExternalBrowsers() {
         pollTimer?.invalidate()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in
@@ -245,19 +269,22 @@ class WebCorpusManager: ObservableObject {
         let targetBrowser = getTargetBrowser()
         _ = BrowserScriptBridge.runJS(in: targetBrowser, js: BrowserScriptBridge.probeTeardownJS)
     }
-
+    
+    // [✨修复 3A] 防止录制回放时定位迷失，识别 RPA 自身的 InternalBrowser
     private func getTargetBrowser() -> String {
         guard let appName = NSWorkspace.shared.frontmostApplication?.localizedName else { return "Google Chrome" }
+        // 识别出当前应用正是此 RPA 程序自己时，返回内建浏览器标识
+        if appName == ProcessInfo.processInfo.processName { return "InternalBrowser" }
         return appName == "Safari" ? "Safari" : "Google Chrome"
     }
 
-    // [✨修复暂停缓存积压 Bug]
+    // [✨修复点2] 动态加入探针，并解决页面跳转刷新问题
     @MainActor
     private func pollActiveBrowser() async {
         guard isRecordingMode else { return }
         let targetBrowser = getTargetBrowser()
         
-        // 取出缓冲池并立刻清空 (JS IIFE 内部会自动置空)
+        // 【探测脚本】检查全局标志位，如果有数据就带出来，没有探针就返回特定标识
         let pullScript = """
         (function() {
             if(window._rpaCorpusInjected) { 
@@ -271,10 +298,13 @@ class WebCorpusManager: ObservableObject {
         let jsonString = BrowserScriptBridge.runJS(in: targetBrowser, js: pullScript)
         
         if jsonString == "NOT_INJECTED" {
+            // 如果返回 NOT_INJECTED，说明页面是新打开的、或者刚发生了跳转刷新，导致探针丢失
+            // 此时动态执行注入脚本
             _ = BrowserScriptBridge.runJS(in: targetBrowser, js: BrowserScriptBridge.probeInjectionJS)
+            AgentMonitorManager.shared.actionExecutionLogs.append("💉 检测到页面加载，已动态注入 RPA 探针")
+            
         } else if let jsonString = jsonString, jsonString != "[]" && jsonString != "NOT_FOUND" {
-            // [✨关键点]：无论是否暂停，都会把浏览器积压的动作“取出来”清空。如果是暂停状态，直接 return 丢弃，不再录入列表。
-            if isPaused { return }
+            if isPaused { return } // 暂停状态丢弃数据
             
             if let data = jsonString.data(using: .utf8), let events = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
                 for dict in events {
@@ -296,7 +326,25 @@ class WebCorpusManager: ObservableObject {
         }
     }
     
-    // [✨接入统一下发的 JS Bridge]
+    // MARK: - 🎯 核心通信：接收 BrowserView 内部浏览器事件回调
+    @MainActor
+    func handleWebEvent(browser: String, eventType: String, value: String? = nil, elementText: String = "", domSummary: String, targetId: String) async {
+        guard isRecordingMode, !isPaused else { return }
+        guard !targetId.isEmpty else { return }
+        
+        let newEvent = RawSessionEvent(
+            actionType: eventType,
+            targetId: targetId,
+            inputValue: value,
+            elementText: elementText.isEmpty ? "未知元素" : elementText,
+            domSummary: domSummary
+        )
+        
+        sessionEvents.append(newEvent)
+        AgentMonitorManager.shared.actionExecutionLogs.append("📸 内置捕捉: [\(eventType)] -> \(newEvent.elementText)")
+    }
+    
+    // MARK: - 动作回放与管理
     @MainActor
     func playbackAction(event: RawSessionEvent) async {
         if event.targetId.isEmpty { return }
@@ -343,6 +391,7 @@ class WebCorpusManager: ObservableObject {
         AgentMonitorManager.shared.actionExecutionLogs.append("🔄 已清空动作队列")
     }
     
+    // MARK: - 数据保存与 AI 合成
     @MainActor
     func saveSessionAndContinue() async {
         guard !sessionEvents.isEmpty else { return }
@@ -477,25 +526,6 @@ class WebCorpusManager: ObservableObject {
                 db.save()
             }
         }
-    }
-    
-    // [✨修复] 补充被误删的外部浏览器或内置 BrowserView 的事件接收接口
-    @MainActor
-    func handleWebEvent(browser: String, eventType: String, value: String? = nil, elementText: String = "", domSummary: String, targetId: String) async {
-        // 录制模式未开启，或者当前处于暂停状态时，直接丢弃事件，不录入列表
-        guard isRecordingMode, !isPaused else { return }
-        guard !targetId.isEmpty else { return }
-        
-        let newEvent = RawSessionEvent(
-            actionType: eventType,
-            targetId: targetId,
-            inputValue: value,
-            elementText: elementText.isEmpty ? "未知元素" : elementText,
-            domSummary: domSummary
-        )
-        
-        sessionEvents.append(newEvent)
-        AgentMonitorManager.shared.actionExecutionLogs.append("📸 已记录: [\(eventType)] -> \(newEvent.elementText)")
     }
 }
 
@@ -919,67 +949,95 @@ class CorpusManagerWindowController: NSWindowController {
     }
 }
 
-// MARK: - 悬浮窗 HUD 组件
-class HUDPanel: NSPanel {
+// MARK: - 悬浮窗 HUD 组件 (更换为普通 NSWindow)
+class HUDWindow: NSWindow {
+    // 允许普通 Window 获取焦点，保证内部的 TextField 可以正常输入
     override var canBecomeKey: Bool { return true }
     override var canBecomeMain: Bool { return false }
 }
 
 class CorpusHUDManager {
     static let shared = CorpusHUDManager()
-    private var panel: HUDPanel?
+    private var window: HUDWindow? // 从 panel 替换为 window
     
-    // [✨升级] 进一步扩大悬浮窗的高度，以容纳丰富的自动滚动列表与动作流面板
-    private let expandedSize = NSSize(width: 380, height: 520)
+    // 保持内外尺寸约束绝对一致，防止缩放产生的裁切发虚感
+    private let expandedSize = NSSize(width: 400, height: 520)
     private let collapsedSize = NSSize(width: 170, height: 42)
     
     func toggleHUD() {
-        if panel?.isVisible == true { hideHUD() } else { showHUD() }
+        if window?.isVisible == true { hideHUD() } else { showHUD() }
     }
     
     func showHUD() {
-        if panel == nil {
-            let newPanel = HUDPanel(contentRect: NSRect(origin: .zero, size: collapsedSize), styleMask: [.nonactivatingPanel, .borderless], backing: .buffered, defer: false)
-            newPanel.isFloatingPanel = true; newPanel.level = .floating; newPanel.backgroundColor = .clear; newPanel.isOpaque = false; newPanel.hasShadow = true; newPanel.isMovableByWindowBackground = true; newPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        if window == nil {
+            // 使用普通 NSWindow，仅保留 borderless 实现无边框 UI
+            let newWindow = HUDWindow(
+                contentRect: NSRect(origin: .zero, size: collapsedSize),
+                styleMask: [.borderless],
+                backing: .buffered,
+                defer: false
+            )
+            
+            newWindow.level = .floating // 依然保持悬浮在最顶层
+            newWindow.backgroundColor = .clear // 保持背景透明
+            newWindow.isOpaque = false
+            newWindow.hasShadow = true // 仅依赖系统级物理阴影，极其干净
+            newWindow.isMovableByWindowBackground = true // 允许拖拽背景移动
+            newWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            
             let host = NSHostingView(rootView: CorpusRecordingHUD())
-            host.wantsLayer = true; host.layer?.cornerRadius = 20; host.layer?.masksToBounds = true; host.layer?.backgroundColor = NSColor.clear.cgColor
-            newPanel.contentView = host; self.panel = newPanel
+            host.wantsLayer = true
+            host.layer?.backgroundColor = NSColor.clear.cgColor
+            
+            newWindow.contentView = host
+            self.window = newWindow
         }
-        updatePanelFrame(animate: false); panel?.orderFrontRegardless()
+        
+        WebCorpusManager.shared.isPaused = true
+        updatePanelFrame(animate: false)
+        window?.orderFrontRegardless()
     }
     
     func updatePanelFrame(animate: Bool = true) {
-        guard let panel = panel, let screen = NSScreen.main else { return }
-        let isRecording = WebCorpusManager.shared.isRecordingMode
-        let targetSize = isRecording ? expandedSize : collapsedSize
+        guard let window = window, let screen = NSScreen.main else { return }
+        
+        // 💡 完美读取静态状态：判断当前是收起还是展开
+        let isExpanded = WebCorpusManager.shared.isRecordingMode && !CorpusRecordingHUD.globalIsCollapsedOverride
+        let targetSize = isExpanded ? expandedSize : collapsedSize
         let screenFrame = screen.visibleFrame
+        
+        // 绝对右上角锚定
         let targetX = screenFrame.maxX - targetSize.width - 20
-        let targetY = screenFrame.maxY - targetSize.height - 10
+        let targetY = screenFrame.maxY - targetSize.height - 20
         let newFrame = NSRect(origin: CGPoint(x: targetX, y: targetY), size: targetSize)
         
         if animate {
             NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.5; context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                panel.animator().setFrame(newFrame, display: true)
+                // 🚀 使用最干净的系统 easeInEaseOut 代替贝塞尔弹簧效果，消灭卡顿和拖影
+                context.duration = 0.25
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                window.animator().setFrame(newFrame, display: true)
             }
         } else {
-            panel.setFrame(newFrame, display: true)
+            window.setFrame(newFrame, display: true)
         }
     }
     
     func hideHUD() {
         if WebCorpusManager.shared.isRecordingMode { WebCorpusManager.shared.isRecordingMode = false }
-        if let panel = panel {
+        if let window = window {
             NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.2; panel.animator().alphaValue = 0
+                context.duration = 0.25
+                window.animator().alphaValue = 0
             } completionHandler: {
-                self.panel?.orderOut(nil); self.panel?.alphaValue = 1.0
+                self.window?.orderOut(nil)
+                self.window?.alphaValue = 1.0
             }
         }
     }
 }
 
-// MARK: - [✨带教面板终极升级] (已修复编译器超时问题)
+// MARK: - [✨带教面板终极升级] (强制深色模式，绝佳高对比度护眼版 + 丝滑缩放动画)
 struct CorpusRecordingHUD: View {
     @ObservedObject var corpusManager = WebCorpusManager.shared
     @State private var pulseStage: CGFloat = 0.0
@@ -987,33 +1045,70 @@ struct CorpusRecordingHUD: View {
     @State private var lastActionLog: String = "快捷键 ⌥⌘R 启停"
     @State private var logHighlight: Bool = false
     @State private var selectedEventId: UUID? = nil
-    @State private var isCollapsedOverride: Bool = false // 允许在开启录制时手动收起
+    
+    // 供 Manager 计算 Frame 使用
+    @AppStorage("hudIsCollapsedOverride") static var globalIsCollapsedOverride: Bool = false
+    @State private var isCollapsedOverride: Bool = CorpusRecordingHUD.globalIsCollapsedOverride
+
+    // 1. 抽离状态灯的复杂三元运算推断
+    private var isPaused: Bool { corpusManager.isPaused }
+    private var indicatorColor: Color {
+        isPaused ? Color.orange : (pulseStage > 0.5 ? Color.red : Color.darkRed)
+    }
+    private var indicatorShadow: Color { isPaused ? .orange : .red }
+    private var indicatorText: String { isPaused ? "PAUSED" : "REC STEP" }
+    private var indicatorOpacity: Double { isPaused ? 1.0 : (0.7 + Double(pulseStage) * 0.3) }
+    private var indicatorBg: Color { isPaused ? Color.orange.opacity(0.8) : Color.red.opacity(0.8) }
+    
+    // 2. 抽离底部控制栏的复杂颜色推断
+    private var hasSteps: Bool { !corpusManager.sessionEvents.isEmpty }
+    private var playPauseBg: Color { isPaused ? Color.green.opacity(0.8) : Color.orange.opacity(0.8) }
+    private var playAllBg: Color { hasSteps ? Color.purple.opacity(0.8) : Color.white.opacity(0.1) }
+    private var playAllFg: Color { hasSteps ? .white : .white.opacity(0.4) }
+    private var clearBg: Color { hasSteps ? Color.red.opacity(0.8) : Color.white.opacity(0.1) }
+    private var clearFg: Color { hasSteps ? .white : .white.opacity(0.4) }
+    private var saveText: String { hasSteps ? "保存 (\(corpusManager.sessionEvents.count)步)" : "等待中" }
+    private var saveBg: Color { hasSteps ? Color.blue : Color.white.opacity(0.1) }
+    private var saveFg: Color { hasSteps ? .white : .white.opacity(0.4) }
+    private var saveShadow: Color { hasSteps ? Color.blue.opacity(0.4) : .clear }
 
     var body: some View {
         mainContent
             .background(backgroundEffectView)
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.white.opacity(0.15), lineWidth: 0.5))
-            .shadow(color: Color.black.opacity(0.25), radius: 12)
+            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.white.opacity(0.15), lineWidth: 1))
+            // 🚀 核心：彻底剥离 SwiftUI 内部的 `.shadow(...)`，交由 NSWindow 管理系统级物理阴影，解决变大变小时的残影问题
+            .environment(\.colorScheme, .dark)
             .onAppear(perform: setupAnimations)
             .onReceive(AgentMonitorManager.shared.$actionExecutionLogs, perform: handleNewLog)
             .onChange(of: corpusManager.isRecordingMode) { _ in CorpusHUDManager.shared.updatePanelFrame() }
-            .onChange(of: isCollapsedOverride) { _ in CorpusHUDManager.shared.updatePanelFrame(animate: true) }
+            .onChange(of: isCollapsedOverride) { _, newValue in
+                CorpusRecordingHUD.globalIsCollapsedOverride = newValue
+                CorpusHUDManager.shared.updatePanelFrame(animate: true)
+            }
     }
     
     @ViewBuilder private var mainContent: some View {
-        ZStack {
+        // 🚀 [核心优化] 统一改为透明度溶解，配合窗口边界伸缩，取消导致卡顿发虚的 scale
+        ZStack(alignment: .topTrailing) {
             if corpusManager.isRecordingMode && !isCollapsedOverride {
                 expandedRecordingView
+                    .transition(.opacity)
             } else {
                 collapsedView
+                    .transition(.opacity)
             }
         }
+        // 使用匹配 NSWindow 的过渡时间，最顺滑跟手
+        .animation(.easeInOut(duration: 0.25), value: isCollapsedOverride)
+        .animation(.easeInOut(duration: 0.25), value: corpusManager.isRecordingMode)
     }
     
     @ViewBuilder private var backgroundEffectView: some View {
         ZStack {
-            VisualEffectView(material: .hudWindow, blendingMode: .behindWindow)
+            // 采用高级 IDE 的深灰护眼色，彻底隔绝浅色网页底色干扰，文字对比度极高
+            Color(red: 0.12, green: 0.12, blue: 0.14)
+            
             if corpusManager.isRecordingMode && !corpusManager.isPaused {
                 RoundedRectangle(cornerRadius: 16)
                     .stroke(AngularGradient(colors: [.red, .orange, .clear, .orange, .red], center: .center, angle: .degrees(glowRotation)), lineWidth: 3)
@@ -1028,15 +1123,16 @@ struct CorpusRecordingHUD: View {
             TextField("在此备注当前操作意图...", text: $corpusManager.currentUserIntent)
                 .textFieldStyle(.plain)
                 .padding(9)
-                .background(Color.primary.opacity(0.08))
+                .background(Color.white.opacity(0.1)) // 使用微白勾勒输入框底色
                 .cornerRadius(8)
                 .font(.system(size: 12))
+                .foregroundColor(.white)
             
             HStack(spacing: 4) {
                 Image(systemName: corpusManager.isPaused ? "pause.circle.fill" : "bolt.horizontal.circle.fill")
-                    .foregroundColor(logHighlight ? .orange : .secondary)
+                    .foregroundColor(logHighlight ? .orange : .white.opacity(0.6))
                 Text(lastActionLog).font(.system(size: 10, design: .monospaced))
-                    .foregroundColor(logHighlight ? .orange : .secondary).lineLimit(1)
+                    .foregroundColor(logHighlight ? .orange : .white.opacity(0.7)).lineLimit(1)
             }.padding(.horizontal, 4).id(lastActionLog)
             
             eventsScrollView
@@ -1044,31 +1140,38 @@ struct CorpusRecordingHUD: View {
             bottomControlBar
         }
         .padding(14)
-        .frame(width: 400, height: 500)
+        .frame(width: 400, height: 520) // 完全对齐 HUDManager 中设定的物理尺寸
     }
     
     private var topBarView: some View {
         HStack {
             HStack(spacing: 6) {
-                Circle().fill(corpusManager.isPaused ? Color.orange : (pulseStage > 0.5 ? Color.red : Color.darkRed))
-                    .frame(width: 8, height: 8).shadow(color: corpusManager.isPaused ? .orange : .red, radius: pulseStage * 6)
-                Text(corpusManager.isPaused ? "PAUSED" : "REC STEP")
-                    .font(.system(size: 10, weight: .black)).foregroundColor(.white).opacity(corpusManager.isPaused ? 1.0 : (0.7 + pulseStage * 0.3))
-            }.padding(.horizontal, 10).padding(.vertical, 4).background(corpusManager.isPaused ? Color.orange.opacity(0.8) : Color.red.opacity(0.8)).clipShape(Capsule())
+                Circle()
+                    .fill(indicatorColor)
+                    .frame(width: 8, height: 8)
+                    .shadow(color: indicatorShadow, radius: pulseStage * 6)
+                
+                Text(indicatorText)
+                    .font(.system(size: 10, weight: .black))
+                    .foregroundColor(.white)
+                    .opacity(indicatorOpacity)
+            }
+            .padding(.horizontal, 10).padding(.vertical, 4)
+            .background(indicatorBg)
+            .clipShape(Capsule())
             
             Spacer()
-            // [✨新增] 展开窗体上的收起按钮
+            
             Button(action: { withAnimation { isCollapsedOverride = true } }) {
-                Image(systemName: "arrow.down.right.and.arrow.up.left").foregroundColor(.secondary).font(.system(size: 12))
+                Image(systemName: "arrow.down.right.and.arrow.up.left").foregroundColor(.white.opacity(0.8)).font(.system(size: 12, weight: .bold))
             }.buttonStyle(.plain).padding(.trailing, 6).help("缩小面板")
             
-            Button(action: { corpusManager.stopRecording() }) {
-                Image(systemName: "xmark.circle.fill").font(.system(size: 14))
-            }.buttonStyle(.plain).foregroundColor(.secondary)
+            Button(action: { corpusManager.closeRecording() }) {
+                Image(systemName: "xmark.circle.fill").foregroundColor(.white.opacity(0.8)).font(.system(size: 14))
+            }.buttonStyle(.plain)
         }
     }
     
-    // 3. 抽离复杂的滚动列表与 ScrollViewReader (调用新的回放 API)
     private var eventsScrollView: some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -1078,14 +1181,9 @@ struct CorpusRecordingHUD: View {
                             event: safeBinding(for: event),
                             isPlaying: corpusManager.playingEventId == event.id,
                             isSelected: selectedEventId == event.id,
-                            onPlay: {
-                                // [✨修改点] 传入 event 自身
-                                Task { await corpusManager.playbackAction(event: event) }
-                            },
+                            onPlay: { Task { await corpusManager.playbackAction(event: event) } },
                             onDelete: {
-                                if selectedEventId == event.id {
-                                    selectedEventId = nil
-                                }
+                                if selectedEventId == event.id { selectedEventId = nil }
                                 NSApp.keyWindow?.makeFirstResponder(nil)
                                 withAnimation { corpusManager.deleteAction(id: event.id) }
                             }
@@ -1097,8 +1195,8 @@ struct CorpusRecordingHUD: View {
                 .padding(.horizontal, 4)
                 .padding(.vertical, 4)
             }
-            .frame(maxHeight: 250)
-            .background(Color(NSColor.windowBackgroundColor).opacity(0.5))
+            .frame(maxHeight: 350)
+            .background(Color.black.opacity(0.3)) // 列表底槽加深，反衬出卡片
             .cornerRadius(8)
             .onChange(of: corpusManager.sessionEvents.count) { _, _ in
                 if let lastId = corpusManager.sessionEvents.last?.id {
@@ -1113,102 +1211,88 @@ struct CorpusRecordingHUD: View {
         }
     }
     
-    // 4. 抽离底部工具栏 (加回清空按钮)
     private var bottomControlBar: some View {
-        let hasSteps = !corpusManager.sessionEvents.isEmpty
-        return HStack(spacing: 8) {
-            // 暂停/继续录制
+        HStack(spacing: 8) {
             Button(action: { withAnimation(.easeInOut(duration: 0.2)) { corpusManager.isPaused.toggle() } }) {
-                HStack(spacing: 4) { Image(systemName: corpusManager.isPaused ? "play.fill" : "pause.fill") }
+                HStack(spacing: 4) { Image(systemName: isPaused ? "play.fill" : "pause.fill") }
                 .font(.system(size: 10, weight: .bold)).frame(width: 24, height: 24)
-                .background(corpusManager.isPaused ? Color.green.opacity(0.8) : Color.orange.opacity(0.8))
+                .background(playPauseBg)
                 .foregroundColor(.white).clipShape(Circle())
-            }.buttonStyle(.plain).help(corpusManager.isPaused ? "继续录制" : "暂停捕获")
+            }.buttonStyle(.plain).help(isPaused ? "继续录制" : "暂停捕获")
             
-            // 插入等待节点
             Button(action: { withAnimation { corpusManager.addWaitAction() } }) {
                 Image(systemName: "timer")
                 .font(.system(size: 11, weight: .bold)).frame(width: 24, height: 24)
                 .background(Color.cyan.opacity(0.8)).foregroundColor(.white).clipShape(Circle())
             }.buttonStyle(.plain).help("插入1秒等待节点")
             
-            // 回放全部
             Button(action: { Task { await corpusManager.playAllActions() } }) {
                 HStack(spacing: 4) { Image(systemName: "play.rectangle.fill"); Text("回放") }
                 .font(.system(size: 10, weight: .bold)).padding(.horizontal, 8).padding(.vertical, 5)
-                .background(hasSteps ? Color.purple.opacity(0.8) : Color.gray.opacity(0.3))
-                .foregroundColor(hasSteps ? .white : .gray).clipShape(Capsule())
+                .background(playAllBg)
+                .foregroundColor(playAllFg).clipShape(Capsule())
             }.buttonStyle(.plain).disabled(!hasSteps || corpusManager.playingEventId != nil).help("可视化按序回放所有动作")
             
-            // 停止录制 (退出带教模式)
             Button(action: { corpusManager.stopRecording() }) {
                 HStack(spacing: 4) { Image(systemName: "stop.fill") }
                 .font(.system(size: 10, weight: .bold)).padding(.horizontal, 6).padding(.vertical, 5)
-                .background(Color.gray.opacity(0.8)).foregroundColor(.white).clipShape(Circle())
+                .background(Color.white.opacity(0.15)).foregroundColor(.white).clipShape(Circle())
             }.buttonStyle(.plain).help("停止录制并关闭")
             
-            // [✨新增/保留] 清空按钮
             Button(action: { withAnimation { corpusManager.restartRecordingSession() } }) {
                 HStack(spacing: 4) { Image(systemName: "trash.fill") }
                 .font(.system(size: 10, weight: .bold)).padding(.horizontal, 6).padding(.vertical, 5)
-                .background(hasSteps ? Color.red.opacity(0.8) : Color.gray.opacity(0.3))
-                .foregroundColor(hasSteps ? .white : .gray).clipShape(Circle())
+                .background(clearBg)
+                .foregroundColor(clearFg).clipShape(Circle())
             }.buttonStyle(.plain).disabled(!hasSteps).help("清空当前已录制的动作流")
             
             Spacer()
             
-            // 保存
             Button(action: { Task { await corpusManager.saveSessionAndContinue() } }) {
-                Text(hasSteps ? "保存 (\(corpusManager.sessionEvents.count)步)" : "等待中")
+                Text(saveText)
                     .font(.system(size: 11, weight: .bold)).padding(.horizontal, 10).padding(.vertical, 6)
-                    .background(Capsule().fill(hasSteps ? Color.blue : Color.gray.opacity(0.5)))
-                    .foregroundColor(hasSteps ? .white : .gray)
-                    .shadow(color: (hasSteps ? Color.blue : Color.clear).opacity(0.4), radius: 4)
+                    .background(Capsule().fill(saveBg))
+                    .foregroundColor(saveFg)
+                    .shadow(color: saveShadow, radius: 4)
             }.buttonStyle(.plain).disabled(!hasSteps)
         }
     }
     
-    // [✨核心防崩补丁] 手动安全构建 Binding，完美拦截数组删除时的越界崩溃
     private func safeBinding(for event: WebCorpusManager.RawSessionEvent) -> Binding<WebCorpusManager.RawSessionEvent> {
         Binding(
             get: {
-                if let index = corpusManager.sessionEvents.firstIndex(where: { $0.id == event.id }) {
-                    return corpusManager.sessionEvents[index]
-                }
-                return event // 如果元素已被删除，返回传入的快照进行兜底渲染，阻止 Crash
+                if let index = corpusManager.sessionEvents.firstIndex(where: { $0.id == event.id }) { return corpusManager.sessionEvents[index] }
+                return event
             },
             set: { newValue in
-                if let index = corpusManager.sessionEvents.firstIndex(where: { $0.id == event.id }) {
-                    corpusManager.sessionEvents[index] = newValue
-                }
+                if let index = corpusManager.sessionEvents.firstIndex(where: { $0.id == event.id }) { corpusManager.sessionEvents[index] = newValue }
             }
         )
     }
     
-    // [✨修改] 小窗体去掉文字，纯粹的操作栏
     private var collapsedView: some View {
         HStack(spacing: 12) {
-            // 开始/暂停按钮
             Button(action: { withAnimation { corpusManager.isPaused.toggle() } }) {
-                Circle().fill(corpusManager.isPaused ? Color.green : Color.orange)
-                    .frame(width: 16, height: 16).overlay(Image(systemName: corpusManager.isPaused ? "play.fill" : "pause.fill").font(.system(size: 8, weight: .bold)).foregroundColor(.white))
+                Circle().fill(isPaused ? Color.green : Color.orange)
+                    .frame(width: 16, height: 16).overlay(Image(systemName: isPaused ? "play.fill" : "pause.fill").font(.system(size: 8, weight: .bold)).foregroundColor(.white))
             }.buttonStyle(.plain)
             
             Spacer()
             
-            // 展开按钮
             Button(action: {
                 if !corpusManager.isRecordingMode { corpusManager.isRecordingMode = true }
                 withAnimation { isCollapsedOverride = false }
             }) {
-                Image(systemName: "arrow.up.left.and.arrow.down.right").foregroundColor(.blue).font(.system(size: 12, weight: .bold))
+                // 蓝绿色在暗色底上可见度最高
+                Image(systemName: "arrow.up.left.and.arrow.down.right").foregroundColor(.cyan).font(.system(size: 12, weight: .bold))
             }.buttonStyle(.plain)
             
-            // 关闭/停止录制按钮
-            Button(action: { corpusManager.stopRecording() }) {
-                Image(systemName: "xmark.circle.fill").foregroundColor(.red).font(.system(size: 14))
+            Button(action: { corpusManager.closeRecording() }) {
+                Image(systemName: "xmark.circle.fill").foregroundColor(.red.opacity(0.9)).font(.system(size: 14))
             }.buttonStyle(.plain)
-        }.padding(.horizontal, 12).frame(width: 140, height: 38)
+        }
+        .padding(.horizontal, 12)
+        .frame(width: 170, height: 42) // 完全对齐 HUDManager 物理尺寸
     }
     
     private func setupAnimations() {
@@ -1225,7 +1309,7 @@ struct CorpusRecordingHUD: View {
     }
 }
 
-// 5. [✨关键提取] 单行组件 (支持 TargetID 与描述的完全编辑)
+// MARK: - 单行组件 (全面适配深色高对比度)
 struct CorpusEventRowView: View {
     @Binding var event: WebCorpusManager.RawSessionEvent
     var isPlaying: Bool
@@ -1233,34 +1317,38 @@ struct CorpusEventRowView: View {
     var onPlay: () -> Void
     var onDelete: () -> Void
     
+    // 💡 全部替换为基于白色的高透明度背景，确保在深灰底色上轮廓分明
+    private var rowBgColor: Color {
+        if isPlaying { return Color.green.opacity(0.25) }
+        if isSelected { return Color.blue.opacity(0.25) }
+        return Color.white.opacity(0.08)
+    }
+    
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
-                // 1. 动作列 (定宽，对齐)
                 Text("[\(event.actionType)]")
                     .font(.system(size: 10, weight: .bold))
-                    .foregroundColor(.blue)
+                    .foregroundColor(.cyan) // 暗色模式下 Cyan 比 Blue 更亮眼
                     .frame(width: 60, alignment: .leading)
                 
-                // 2. ID 列 (自适应缩小，但有一个固定最小宽度确保整体对齐)
                 HStack(spacing: 2) {
                     Text("ID:")
                         .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(.white)
+                        .foregroundColor(.white.opacity(0.7))
                     TextField("空", text: $event.targetId)
                         .font(.system(size: 9, weight: .bold))
                         .foregroundColor(.white)
                         .textFieldStyle(.plain)
                 }
                 .padding(.horizontal, 4).padding(.vertical, 1)
-                .frame(width: 80, alignment: .leading) // 锁定 ID 区块宽度
-                .background(Color.red.opacity(0.8))
+                .frame(width: 80, alignment: .leading)
+                .background(Color.white.opacity(0.15)) // ID 框高亮提底
                 .cornerRadius(4)
                 
-                // 3. 内容列 (占据剩余空间)
                 TextField("元素描述", text: $event.elementText)
                     .font(.system(size: 11))
-                    .foregroundColor(.primary)
+                    .foregroundColor(.white) // 绝对强制白色，覆盖系统的 primary 黑色
                     .textFieldStyle(.plain)
                 
                 Spacer()
@@ -1268,29 +1356,29 @@ struct CorpusEventRowView: View {
                 if isPlaying {
                     Image(systemName: "play.circle.fill").foregroundColor(.green)
                 } else {
-                    Button(action: onPlay) { Image(systemName: "play.fill").font(.system(size: 10)).foregroundColor(.secondary) }.buttonStyle(.plain)
+                    Button(action: onPlay) { Image(systemName: "play.fill").font(.system(size: 10)).foregroundColor(.white.opacity(0.6)) }.buttonStyle(.plain)
                 }
-                Button(action: onDelete) { Image(systemName: "trash").font(.system(size: 10)).foregroundColor(.red.opacity(0.7)) }.buttonStyle(.plain).padding(.leading, 4)
+                Button(action: onDelete) { Image(systemName: "trash").font(.system(size: 10)).foregroundColor(.red.opacity(0.8)) }.buttonStyle(.plain).padding(.leading, 4)
             }
             
             if event.actionType == "input" || event.actionType == "wait" {
                 HStack {
-                    Image(systemName: "arrow.turn.down.right").foregroundColor(.secondary).font(.system(size: 10)).frame(width: 60, alignment: .trailing)
-                    // ... 你的输入框逻辑体保持不变 ...
+                    Image(systemName: "arrow.turn.down.right").foregroundColor(.white.opacity(0.5)).font(.system(size: 10)).frame(width: 60, alignment: .trailing)
+                    TextField("输入值/时间", text: Binding(
+                        get: { event.inputValue ?? "" },
+                        set: { event.inputValue = $0 }
+                    ))
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.orange)
+                    .textFieldStyle(.plain)
                 }
             }
         }
         .padding(.horizontal, 8).padding(.vertical, 6)
-        .background(RoundedRectangle(cornerRadius: 6).fill(isPlaying ? Color.green.opacity(0.2) : (isSelected ? Color.blue.opacity(0.2) : Color.black.opacity(0.05))))
+        .background(RoundedRectangle(cornerRadius: 6).fill(rowBgColor))
     }
 }
 
 extension Color {
     static let darkRed = Color(red: 0.5, green: 0, blue: 0)
-}
-
-struct VisualEffectView: NSViewRepresentable {
-    var material: NSVisualEffectView.Material; var blendingMode: NSVisualEffectView.BlendingMode
-    func makeNSView(context: Context) -> NSVisualEffectView { let view = NSVisualEffectView(); view.material = material; view.blendingMode = blendingMode; view.state = .active; return view }
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
