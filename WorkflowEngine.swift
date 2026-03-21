@@ -117,6 +117,8 @@ class WorkflowEngine {
     @ObservationIgnored private var globalKeyMonitor: Any?
     @ObservationIgnored private var localKeyMonitor: Any?
     
+    @ObservationIgnored private var windowObservers: [Any] = []
+    
     init() {
         isLoading = true; workflows = StorageManager.shared.load(); selectedWorkflowId = workflows.first?.id; isLoading = false
         hasUnsavedChanges = false; checkPermissions(); setupHotkeys()
@@ -126,8 +128,54 @@ class WorkflowEngine {
         }
         if !self.folders.contains("默认文件夹") { self.folders.insert("默认文件夹", at: 0) }
         
-        // 绑定录制器回调
-        MacroRecorder.shared.onActionRecorded = { [weak self] action in self?.addRecordedAction(action) }
+        setupWindowObservers()
+    }
+    
+    deinit {
+        if let monitor = globalKeyMonitor { NSEvent.removeMonitor(monitor) }
+        if let monitor = localKeyMonitor { NSEvent.removeMonitor(monitor) }
+        
+        // 释放通知监听
+        windowObservers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
+    
+    // [✨修改] 监听主界面的显示、最小化与关闭事件
+    private func setupWindowObservers() {
+        // 1. 监听主窗口变成活动窗口 (完美解决：主窗体被激活显示时，自动隐藏悬浮窗)
+        let becomeKeyObserver = NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { notification in
+            guard let window = notification.object as? NSWindow else { return }
+            
+            // 🛑 核心修复：过滤 SwiftUI 内部生成的临时窗口（如右键菜单、Popover、Alert 等）
+            // 只有真正的主窗口才予以放行响应
+            guard window.className.contains("AppKitWindow") || window.title == "我的流程" else { return }
+            
+            ExecutionToolbarManager.shared.hide()
+        }
+        
+        // 2. 监听主窗口最小化 (触发显示悬浮窗)
+        let minObserver = NotificationCenter.default.addObserver(forName: NSWindow.didMiniaturizeNotification, object: nil, queue: .main) { [weak self] notification in
+            guard let self = self, let window = notification.object as? NSWindow else { return }
+            
+            // 🛑 核心修复：精准阻断非主窗体
+            guard window.className.contains("AppKitWindow") || window.title == "我的流程" else { return }
+            
+            ExecutionToolbarManager.shared.show(engine: self)
+        }
+        
+        // 3. 监听主窗口关闭 (触发显示悬浮窗)
+        let closeObserver = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { [weak self] notification in
+            guard let self = self, let window = notification.object as? NSWindow else { return }
+            
+            // 🛑 核心修复：防止右键菜单或气泡关闭时，错误触发悬浮窗弹出的 Bug
+            guard window.className.contains("AppKitWindow") || window.title == "我的流程" else { return }
+            
+            // [✨终极黑魔法] 赶在系统把主窗口释放掉之前，强行阻断销毁流程，让其处于“隐藏”而非“死亡”状态
+            window.isReleasedWhenClosed = false
+            
+            ExecutionToolbarManager.shared.show(engine: self)
+        }
+        
+        windowObservers = [becomeKeyObserver, minObserver, closeObserver]
     }
     
     // 【✨新增】文件夹 CRUD 方法
@@ -169,11 +217,6 @@ class WorkflowEngine {
         }
         globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: handler)
         localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in handler(event); return event }
-    }
-    
-    deinit {
-        if let monitor = globalKeyMonitor { NSEvent.removeMonitor(monitor) }
-        if let monitor = localKeyMonitor { NSEvent.removeMonitor(monitor) }
     }
     
     func saveChanges() { StorageManager.shared.save(workflows: workflows); hasUnsavedChanges = false; log("💾 流程及配置已保存") }
@@ -390,15 +433,16 @@ class WorkflowEngine {
         isRunning = true; logs.removeAll(); variables.removeAll()
         if !AXIsProcessTrusted() { log("❌ 致命错误：未获得辅助功能权限！"); isRunning = false; return }
         
-        // [✨修改] 如果设置允许，自动最小化主窗口，并呼出右上角悬浮工具栏
-        if AppSettings.shared.minimizeOnRun {
-            await MainActor.run {
+        // [✨修复点4] 修正 HUD 的弹出逻辑
+        await MainActor.run {
+            // 如果允许最小化，则隐藏主窗口
+            if AppSettings.shared.minimizeOnRun {
                 if let mainWindow = NSApp.windows.first(where: { $0.className.contains("AppKitWindow") }) {
                     mainWindow.miniaturize(nil)
                 }
-                // 呼出正在执行的悬浮监控面板
-                ExecutionToolbarManager.shared.show(engine: self)
             }
+            // 无论是否最小化，监控悬浮面板都必须展示！
+            ExecutionToolbarManager.shared.show(engine: self)
         }
         
         log("⏱️ 准备执行，倒计时 3 秒...")
@@ -406,7 +450,7 @@ class WorkflowEngine {
 
         guard isRunning else {
             // 倒计时期间如果被紧急中止，也要收回工具栏
-            await MainActor.run { ExecutionToolbarManager.shared.hide() }
+            //await MainActor.run { ExecutionToolbarManager.shared.hide() }
             return
         }
         
@@ -444,7 +488,7 @@ class WorkflowEngine {
         
         // [✨修改] 执行结束或中途被中止时，回收悬浮面板
         await MainActor.run {
-            ExecutionToolbarManager.shared.hide()
+            //ExecutionToolbarManager.shared.hide()
         }
     }
     
@@ -779,20 +823,6 @@ class WorkflowEngine {
         }
     }
     
-    func simulateKeyboardInput(input: String) async {
-        let eventSource = CGEventSource(stateID: .hidSystemState); var i = input.startIndex
-        while i < input.endIndex {
-            let remainder = String(input[i...])
-            if let matchRange = remainder.range(of: #"^\[(?:CMD|SHIFT|OPT|CTRL|\+)+(?:[a-zA-Z0-9]|UP|DOWN|LEFT|RIGHT|ENTER|TAB|SPACE|ESC|DEL|BACKSPACE|HOME|END|F\d{1,2})\]"#, options: [.regularExpression, .caseInsensitive]) {
-                let comboStr = String(remainder[matchRange]); await executeHotkey(comboStr, source: eventSource); i = input.index(i, offsetBy: comboStr.count); continue
-            }
-            if let specialRange = remainder.range(of: #"^\[(ENTER|TAB|SPACE|ESC|UP|DOWN|LEFT|RIGHT|DEL|BACKSPACE|HOME|END|F\d{1,2})\]"#, options: [.regularExpression, .caseInsensitive]) {
-                let specialStr = String(remainder[specialRange]); if let key = checkSpecialKey(specialStr) { postKeyEvent(key: key, source: eventSource) }; i = input.index(i, offsetBy: specialStr.count); continue
-            }
-            let char = input[i]; postCharacterEvent(char, source: eventSource); try? await Task.sleep(for: .milliseconds(Int.random(in: 30...80))); i = input.index(after: i)
-        }
-    }
-    
     func postCharacterEvent(_ char: Character, source: CGEventSource?) {
         let utf16 = Array(String(char).utf16)
         if let eventDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true) { eventDown.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16); eventDown.post(tap: .cghidEventTap) }
@@ -834,313 +864,6 @@ class WorkflowEngine {
         }
     }
     
-    // MARK: - [✨3.0 双引擎底层支持] 内置 WKWebView & 外部浏览器动态路由
-        
-    /// 统一的 JavaScript 执行路由
-    @MainActor
-    func executeJS(browser: String, script: String) async throws -> String {
-        if browser == "InternalBrowser" {
-            // 路由 A：原生 WKWebView 极速执行
-            guard let tab = BrowserViewModel.shared.activeTab else {
-                throw NSError(domain: "RPA", code: 404, userInfo: [NSLocalizedDescriptionKey: "内置浏览器未打开或无活跃标签页"])
-            }
-            return try await tab.evaluateJSAsync(script)
-        } else {
-            // 完美转义 JS 字符串以适应 AppleScript 的双引号环境
-            let escapedScript = script.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-            let appleScript: String
-            
-            if browser == "Safari" {
-                // 路由 B：Safari AppleScript 桥接执行
-                appleScript = """
-                tell application "Safari"
-                    if not (exists document 1) then return "Error: No document open"
-                    do JavaScript "\(escapedScript)" in front document
-                end tell
-                """
-            } else if browser == "Google Chrome" {
-                // [✨新增] 路由 C：Google Chrome AppleScript 桥接执行
-                appleScript = """
-                tell application "Google Chrome"
-                    if (count of windows) = 0 then return "Error: No document open"
-                    tell active tab of front window
-                        execute javascript "\(escapedScript)"
-                    end tell
-                end tell
-                """
-            } else {
-                throw NSError(domain: "RPA", code: 400, userInfo: [NSLocalizedDescriptionKey: "不支持的目标浏览器: \(browser)"])
-            }
-            
-            var errorInfo: NSDictionary?
-            if let scriptObj = NSAppleScript(source: appleScript) {
-                let output = scriptObj.executeAndReturnError(&errorInfo)
-                if errorInfo == nil { return output.stringValue ?? "" }
-            }
-            throw NSError(domain: "RPA", code: 500, userInfo: [NSLocalizedDescriptionKey: "\(browser) 脚本执行失败"])
-        }
-    }
-    
-    // MARK: - [✨3.0 终极版] 穿透 DOM 提取器 (支持极限压缩与完整提取动态切换)
-    @MainActor
-    func injectSoMAndGetDOM(browser: String, isExtremeCompressed: Bool = true) async -> String {
-        let script = """
-        (function() {
-            let isExtreme = \(isExtremeCompressed ? "true" : "false");
-            document.querySelectorAll('.rpa-som').forEach(e => e.remove());
-            let summary = [];
-            let index = 0;
-            
-            function getAllElements(root, offsetX = 0, offsetY = 0) {
-                let elements = [];
-                let walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null, false);
-                let node;
-                while (node = walker.nextNode()) {
-                    node._rpaOffsetX = offsetX; node._rpaOffsetY = offsetY;
-                    elements.push(node);
-                    if (node.shadowRoot) elements = elements.concat(getAllElements(node.shadowRoot, offsetX, offsetY));
-                    if (node.tagName.toLowerCase() === 'iframe') {
-                        try {
-                            let iframeDoc = node.contentDocument || node.contentWindow.document;
-                            if (iframeDoc) {
-                                let rect = node.getBoundingClientRect();
-                                elements = elements.concat(getAllElements(iframeDoc.body, offsetX + rect.left, offsetY + rect.top));
-                            }
-                        } catch(e) {}
-                    }
-                }
-                return elements;
-            }
-            
-            let allNodes = getAllElements(document.body);
-            let interactiveTags = ['button', 'input', 'select', 'textarea'];
-            
-            let elements = allNodes.filter(el => {
-                let tag = el.tagName.toLowerCase();
-                let role = el.getAttribute('role');
-                let style = window.getComputedStyle(el);
-                let className = (el.className && typeof el.className === 'string') ? el.className.toLowerCase() : '';
-                
-                let isOATarget = className.includes('btn') || className.includes('tab') || className.includes('menu') || className.includes('item');
-                let isInteractive = interactiveTags.includes(tag) || 
-                                   ['button', 'link', 'tab', 'menuitem', 'checkbox', 'radio'].includes(role) || 
-                                   el.hasAttribute('onclick') || 
-                                   style.cursor === 'pointer';
-                                   
-                // 完整模式下放宽限制，抓取更多 a 标签等容易被漏掉的元素
-                if (!isExtreme) {
-                    isInteractive = isInteractive || tag === 'a' || role === 'link';
-                }
-                return isInteractive || isOATarget;
-            });
-            
-            // 极限压缩只拿 80 个，完整模式拿 300 个
-            let maxElements = isExtreme ? 80 : 300; 
-            let processedCount = 0;
-            
-            for(let i=0; i<elements.length; i++) {
-                if (processedCount >= maxElements) break;
-                let el = elements[i];
-                let rect = el.getBoundingClientRect();
-                let style = window.getComputedStyle(el);
-                
-                if(rect.width > 5 && rect.height > 5 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0') {
-                    let finalLeft = rect.left + window.scrollX + (el._rpaOffsetX || 0);
-                    let finalTop = rect.top + window.scrollY + (el._rpaOffsetY || 0);
-                    
-                    let text = el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || el.title || '';
-                    
-                    // 极限截断 15 字，完整截断 40 字
-                    let textLimit = isExtreme ? 15 : 40;
-                    let cleanText = text.trim().replace(/\\s+/g, ' ').substring(0, textLimit);
-                    
-                    let isInput = ['input', 'textarea', 'select'].includes(el.tagName.toLowerCase());
-                    if (cleanText === '' && !isInput && isExtreme) continue; 
-                    
-                    el.setAttribute('data-rpa-id', index.toString());
-                    
-                    let marker = document.createElement('div');
-                    marker.className = 'rpa-som';
-                    marker.style.position = 'absolute'; marker.style.left = finalLeft + 'px'; marker.style.top = finalTop + 'px';
-                    marker.style.width = rect.width + 'px'; marker.style.height = rect.height + 'px';
-                    marker.style.border = '2px solid rgba(255, 0, 0, 0.6)'; marker.style.boxSizing = 'border-box';
-                    marker.style.zIndex = '2147483647'; marker.style.pointerEvents = 'none'; 
-                    
-                    let label = document.createElement('div');
-                    label.innerText = index; label.style.position = 'absolute'; label.style.top = '-16px'; label.style.left = '-2px';
-                    label.style.background = 'rgba(255,0,0,0.9)'; label.style.color = 'white'; label.style.padding = '1px 5px'; label.style.fontSize = '12px'; label.style.fontWeight = 'bold';
-                    marker.appendChild(label); document.body.appendChild(marker);
-                    
-                    summary.push(`[${index}] ${cleanText} ${el.disabled ? "[禁]" : ""} ${el.checked ? "[选]" : ""}`);
-                    index++; processedCount++;
-                }
-            }
-            return summary.join('\\n');
-        })();
-        """
-        do { return try await executeJS(browser: browser, script: script) }
-        catch { return "Error: \(error.localizedDescription)" }
-    }
-    
-    @MainActor
-    func cleanupSoM(browser: String) async {
-        let script = "document.querySelectorAll('.rpa-som').forEach(e => e.remove());"
-        _ = try? await executeJS(browser: browser, script: script)
-    }
-    
-    @MainActor
-    func waitForPageToStabilize(browser: String) async {
-        for _ in 0..<10 {
-            try? await Task.sleep(for: .milliseconds(500))
-            if let state = try? await executeJS(browser: browser, script: "document.readyState"), state == "complete" {
-                break
-            }
-        }
-    }
-    
-    // [✨修改] 返回生成的脚本和执行的真实结果，而不是内部消化掉
-    @MainActor
-    func injectActionJS(browser: String, action: String, targetId: String, value: String) async -> (script: String, result: String) {
-        var jsCommand = ""
-        if action == "scroll_down" {
-            jsCommand = "(function() {window.scrollBy({top: window.innerHeight * 0.8, behavior: 'smooth'}); return 'Scrolled Down';})();"
-        }
-        else if action == "scroll_up" {
-            jsCommand = "(function() {window.scrollBy({top: -window.innerHeight * 0.8, behavior: 'smooth'}); return 'Scrolled Up';})();"
-        }
-        else if action == "click" {
-            jsCommand = """
-            (function() {
-                let el = document.querySelector('[data-rpa-id="\(targetId)"]');
-                if (!el) return '❌ Element Not Found: \(targetId)';
-                
-                // 1. 元素聚焦与基础点击
-                el.focus();
-                el.click();
-                
-                // 2. 构造完整的鼠标事件链，欺骗 React/Vue 合成事件网
-                const events = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
-                events.forEach(evType => {
-                    let ev = new MouseEvent(evType, {
-                        bubbles: true,
-                        cancelable: true,
-                        view: window,
-                        buttons: 1
-                    });
-                    el.dispatchEvent(ev);
-                });
-                
-                // 如果是 a 标签，有时候需要强制跳转
-                if (el.tagName.toLowerCase() === 'a' && el.href) {
-                    // window.location.href = el.href; // 视情况开启
-                }
-                
-                return '✅ Click Injected on \(targetId)';
-            })();
-            """
-        }
-        else if action == "hover" {
-            jsCommand = """
-            (function() {
-                let el = document.querySelector('[data-rpa-id="\(targetId)"]');
-                if (!el) return '❌ Element Not Found: \(targetId)';
-                
-                const events = ['mouseenter', 'mouseover', 'mousemove'];
-                events.forEach(evType => {
-                    let ev = new MouseEvent(evType, {
-                        bubbles: true,
-                        cancelable: true,
-                        view: window
-                    });
-                    el.dispatchEvent(ev);
-                });
-                return '✅ Hover Injected on \(targetId)';
-            })();
-            """
-        }
-        else if action == "input" {
-            let safeValue = value.replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(of: "\n", with: "")
-            jsCommand = """
-            (function() {
-                let el = document.querySelector('[data-rpa-id="\(targetId)"]');
-                if (!el) return '❌ Element Not Found: \(targetId)';
-                
-                // 🌟 终极防线1 升级版：【影子节点穿透与焦点劫持】
-                if (el.tagName.toLowerCase() !== 'input' && el.tagName.toLowerCase() !== 'textarea' && !el.isContentEditable) {
-                    let innerInput = el.querySelector('input, textarea');
-                    
-                    // 策略A: 穿透 Shadow DOM (Web Components 隔离墙)
-                    if (!innerInput && el.shadowRoot) {
-                        innerInput = el.shadowRoot.querySelector('input, textarea');
-                    }
-                    
-                    // 策略B: 向上拉伸搜索范围 (破解兄弟节点分离)
-                    if (!innerInput && el.parentElement) {
-                        innerInput = el.parentElement.querySelector('input, textarea');
-                    }
-                    
-                    // 策略C: 焦点劫持 (破解“点击后才渲染”的幽灵输入框)
-                    if (!innerInput) {
-                        el.click(); // 强行触发物理点击
-                        
-                        // 如果框架通过点击，瞬间生成了输入框并自动转移了焦点，我们就劫持它！
-                        if (document.activeElement && (document.activeElement.tagName.toLowerCase() === 'input' || document.activeElement.tagName.toLowerCase() === 'textarea')) {
-                            innerInput = document.activeElement;
-                        }
-                    }
-                    
-                    if (innerInput) {
-                        el = innerInput; // 成功转移目标到真实输入框！
-                    } else {
-                        // 如果依然找不到，主动向大模型抛出报错，让大模型知道已经点过了
-                        return '❌ 底层输入框被彻底隐藏或隔离。已尝试物理点击唤醒，请由 Agent 重新观察页面状态。';
-                    }
-                }
-                
-                // 确保元素真正获得了焦点
-                el.focus({preventScroll: false});
-                let tag = el.tagName.toLowerCase();
-                
-                // 🌟 终极防线2：【黑客级破解 React ValueTracker】
-                let lastValue = el.value;
-                el.value = "\(safeValue)";
-                let tracker = el._valueTracker;
-                if (tracker) { tracker.setValue(lastValue); }
-                
-                // 🌟 终极防线3：【绕过前端拦截，强拉原生 setter】
-                if (tag === 'input' || tag === 'textarea') {
-                    let proto = Object.getPrototypeOf(el);
-                    let nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-                    if (nativeSetter) nativeSetter.call(el, "\(safeValue)");
-                } else if (el.isContentEditable) {
-                    el.innerText = "\(safeValue)";
-                }
-                
-                // 🌟 终极防线4：【全量事件风暴】
-                const eventOpts = { bubbles: true, composed: true, cancelable: true };
-                el.dispatchEvent(new MouseEvent('mousedown', eventOpts));
-                el.dispatchEvent(new MouseEvent('mouseup', eventOpts));
-                el.dispatchEvent(new MouseEvent('click', eventOpts));
-                
-                el.dispatchEvent(new KeyboardEvent('keydown', Object.assign({ key: 'Process', code: 'Process' }, eventOpts)));
-                el.dispatchEvent(new KeyboardEvent('keypress', eventOpts));
-                el.dispatchEvent(new Event('input', eventOpts));
-                el.dispatchEvent(new Event('change', eventOpts));
-                el.dispatchEvent(new KeyboardEvent('keyup', Object.assign({ key: 'Process', code: 'Process' }, eventOpts)));
-                
-                return '✅ Input Injected (Deep React Bypass): \(safeValue)';
-            })();
-            """
-        }
-        
-        do {
-            let res = try await executeJS(browser: browser, script: jsCommand)
-            return (jsCommand, res)
-        } catch {
-            return (jsCommand, "执行抛出异常: \(error.localizedDescription)")
-        }
-    }
-    
     @MainActor
     func requestUserConfirmation(title: String, message: String) -> Bool {
         let alert = NSAlert(); alert.messageText = title; alert.informativeText = message; alert.alertStyle = .warning
@@ -1171,67 +894,6 @@ class WorkflowEngine {
                 try? await Task.sleep(for: .seconds(1))
             }
         }
-    }
-    
-    // MARK: - WebAgent 辅助：获取页面可见文本用于断言
-    @MainActor
-    func getPageText(browser: String) async -> String {
-        // 使用 innerText 可以过滤掉隐藏元素，完美模拟用户的“视觉可见文本”
-        let script = "document.body.innerText"
-        return (try? await executeJS(browser: browser, script: script)) ?? ""
-    }
-    
-    // MARK: - [✨ 原生引擎桥梁] 获取元素在屏幕上的物理绝对坐标
-    @MainActor
-    func getElementScreenCoordinates(browser: String, targetId: String) async -> CGPoint? {
-        let script = """
-        (function() {
-            let el = document.querySelector('[data-rpa-id="\(targetId)"]');
-            if (!el) return null;
-            let rect = el.getBoundingClientRect();
-            
-            // 计算浏览器 UI 栏(如顶部的地址栏、书签栏)的高度补偿
-            let toolbarHeight = window.outerHeight - window.innerHeight;
-            let sidebarWidth = window.outerWidth - window.innerWidth;
-            
-            // 换算为操作系统的全局绝对坐标 (获取元素的中心点)
-            let screenX = window.screenX + (sidebarWidth > 0 ? sidebarWidth / 2 : 0) + rect.left + (rect.width / 2);
-            let screenY = window.screenY + toolbarHeight + rect.top + (rect.height / 2);
-            
-            return screenX + "," + screenY;
-        })();
-        """
-        
-        if let result = try? await executeJS(browser: browser, script: script),
-           let coords = result as? String, coords.contains(",") {
-            let parts = coords.split(separator: ",")
-            if parts.count == 2, let x = Double(parts[0]), let y = Double(parts[1]) {
-                return CGPoint(x: x, y: y)
-            }
-        }
-        return nil
-    }
-    
-    // MARK: - [✨ 原生引擎桥梁] 执行物理动作
-    @MainActor
-    func executeNativeAction(browser: String, action: String, targetId: String, value: String) async -> Bool {
-        // 1. 获取物理坐标
-        guard let point = await getElementScreenCoordinates(browser: browser, targetId: targetId) else {
-            return false
-        }
-        
-        // 2. 根据动作指令调用物理外设
-        if action == "native_hover" {
-            NativeInputManager.shared.hover(at: point)
-        } else if action == "native_click" {
-            NativeInputManager.shared.click(at: point)
-        } else if action == "native_input" {
-            // 输入动作：物理鼠标先点过去激活光标，然后再进行物理键盘敲击
-            NativeInputManager.shared.click(at: point)
-            try? await Task.sleep(nanoseconds: 300_000_000) // 等待0.3秒聚焦和动画完成
-            NativeInputManager.shared.typeText(value)
-        }
-        return true
     }
 }
 
@@ -1283,5 +945,274 @@ class NativeInputManager {
         if let appleScript = NSAppleScript(source: script) {
             appleScript.executeAndReturnError(&error)
         }
+    }
+}
+
+
+//////////////////////////////////////////////////////////////////
+// 功能说明：RPA 运行时悬浮监控面板 (HUD)
+//////////////////////////////////////////////////////////////////
+
+// MARK: - 悬浮窗管理器
+@MainActor
+class ExecutionToolbarManager {
+    static let shared = ExecutionToolbarManager()
+    private var panel: NSPanel?
+    private var cachedMainWindow: NSWindow?
+    
+    func show(engine: WorkflowEngine) {
+        if cachedMainWindow == nil {
+            if let mw = NSApp.windows.first(where: { !($0 is NSPanel) && String(describing: type(of: $0)).contains("Window") }) {
+                mw.isReleasedWhenClosed = false
+                cachedMainWindow = mw
+            }
+        }
+        
+        if panel == nil {
+            let p = NSPanel(
+                contentRect: NSRect(x: 0, y: 0, width: 126, height: 52), // 默认收缩尺寸
+                styleMask: [.borderless, .nonactivatingPanel, .hudWindow],
+                backing: .buffered, defer: false
+            )
+            p.level = .floating
+            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            p.backgroundColor = .clear
+            p.hasShadow = true
+            p.isOpaque = false
+            p.isMovableByWindowBackground = true
+            p.becomesKeyOnlyIfNeeded = true
+            p.contentView = NSHostingView(rootView: ExecutionToolbarView(engine: engine))
+            
+            if let frame = NSScreen.main?.visibleFrame {
+                p.setFrameTopLeftPoint(NSPoint(x: frame.maxX - 260, y: frame.maxY - 60))
+            } else { p.center() }
+            panel = p
+        }
+        
+        if let panel = panel, !panel.isVisible { panel.orderFront(nil) }
+    }
+    
+    func hide() { panel?.orderOut(nil) }
+    
+    // [✨协程重构] 精简的两段式动画执行器，锚定物理右上角
+    func updatePanelSizeAsync(to size: CGSize, duration: TimeInterval = 0.15) async {
+        guard let panel = panel else { return }
+        await withCheckedContinuation { continuation in
+            var frame = panel.frame
+            let (topY, rightX) = (frame.maxY, frame.maxX) // 锁定右上角
+            frame.size = size
+            frame.origin = CGPoint(x: rightX - size.width, y: topY - size.height)
+            
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = duration
+                context.allowsImplicitAnimation = true
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                panel.animator().setFrame(frame, display: true)
+            }, completionHandler: { continuation.resume() })
+        }
+    }
+    
+    func restoreMainWindow() {
+        let targetWindow = cachedMainWindow ?? NSApp.windows.first(where: { !($0 is NSPanel) && String(describing: type(of: $0)).contains("Window") })
+        if let mw = targetWindow {
+            if mw.isMiniaturized { mw.deminiaturize(nil) }
+            mw.makeKeyAndOrderFront(nil)
+        } else {
+            let config = NSWorkspace.OpenConfiguration(); config.activates = true
+            NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: config) { _, _ in }
+        }
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+// MARK: - SwiftUI 监控面板视图
+struct ExecutionToolbarView: View {
+    @Environment(\.openWindow) private var openWindow
+    var engine: WorkflowEngine
+    
+    @State private var isExpanded: Bool = false
+    @State private var showContent: Bool = false
+    @State private var isAnimating: Bool = false
+    
+    private let expandedSize = CGSize(width: 340, height: 210)
+    private let collapsedSize = CGSize(width: 126, height: 52)
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            headerView.frame(height: 24).padding(.bottom, showContent ? 10 : 0)
+            
+            if showContent {
+                contentView.transition(.opacity.combined(with: .move(edge: .top)))
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+        .background(VisualEffectBackground().clipShape(RoundedRectangle(cornerRadius: 16)))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.white.opacity(0.15), lineWidth: 1))
+        .onChange(of: engine.isRunning) { _, isRunning in
+            if isRunning && !isExpanded { toggleExpansion(targetExpanded: true) }
+        }
+    }
+    
+    // MARK: - 核心两段式动画调度
+    private func toggleExpansion(targetExpanded: Bool) {
+        guard !isAnimating, isExpanded != targetExpanded else { return }
+        isAnimating = true
+        
+        Task { @MainActor in
+            if !targetExpanded {
+                withAnimation(.easeOut(duration: 0.15)) { showContent = false }
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                
+                await ExecutionToolbarManager.shared.updatePanelSizeAsync(to: CGSize(width: expandedSize.width, height: collapsedSize.height))
+                await ExecutionToolbarManager.shared.updatePanelSizeAsync(to: collapsedSize)
+                
+                isExpanded = false; isAnimating = false
+            } else {
+                isExpanded = true
+                await ExecutionToolbarManager.shared.updatePanelSizeAsync(to: CGSize(width: expandedSize.width, height: collapsedSize.height))
+                await ExecutionToolbarManager.shared.updatePanelSizeAsync(to: expandedSize)
+                
+                withAnimation(.easeIn(duration: 0.2)) { showContent = true }
+                isAnimating = false
+            }
+        }
+    }
+    
+    // MARK: - 子组件抽取 (更简洁)
+    private var headerView: some View {
+        HStack(spacing: 8) {
+            if showContent {
+                ExecutionBreatheLight(isRunning: engine.isRunning)
+                
+                let wfName = engine.currentWorkflowIndex != nil ? engine.workflows[engine.currentWorkflowIndex!].name : "工作流执行监控"
+                Text(wfName).font(.system(size: 13, weight: .bold)).foregroundColor(.primary.opacity(0.8)).lineLimit(1).transition(.opacity)
+                
+                // [✨修改] 更多菜单接入真实窗口路由
+                Menu {
+                    Button {
+                        engine.log("🌐 唤起内置浏览器")
+                        BrowserWindowController.showSharedWindow()
+                    } label: { Label("内置浏览器", systemImage: "safari") }
+                    
+                    Button {
+                        engine.log("📚 唤起语料库")
+                        // TODO: 替换为你实际的语料库窗体调度器
+                        openWindow(id: "corpus-manager")
+                    } label: { Label("语料库管理", systemImage: "text.book.closed") }
+                    
+                    Button {
+                        engine.log("🤖 唤起 WebAgent")
+                        // TODO: 替换为你实际的 WebAgent 窗体调度器
+                        openWindow(id: "agentMonitor")
+                    } label: { Label("WebAgent 监控", systemImage: "network") }
+                } label: {
+                    Image(systemName: "ellipsis").font(.system(size: 14, weight: .bold)).foregroundColor(.primary.opacity(0.7)).frame(width: 24, height: 24).contentShape(Rectangle())
+                }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 24).transition(.opacity)
+
+                Spacer(minLength: 0)
+            }
+                        
+            // 按钮群组
+            Group {
+                // 启停控制
+                Button(action: {
+                    if engine.isRunning {
+                        engine.isRunning = false
+                    } else {
+                        Task { await engine.runCurrentWorkflow() }
+                    }
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: engine.isRunning ? "stop.circle.fill" : "play.circle.fill")
+                        if showContent { Text(engine.isRunning ? "终止" : "运行").transition(.opacity) }
+                    }
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(engine.isRunning ? Color.red.opacity(0.8) : Color.green.opacity(0.8))
+                    .cornerRadius(12)
+                }
+                
+                // 展开/收缩
+                Button(action: { toggleExpansion(targetExpanded: !isExpanded) }) {
+                    Image(systemName: isExpanded ? "arrow.up.right.and.arrow.down.left" : "arrow.down.left.and.arrow.up.right")
+                        .font(.system(size: 12, weight: .bold)).foregroundColor(.primary.opacity(0.7)).frame(width: 24, height: 24)
+                        .background(Color.primary.opacity(0.05)).clipShape(Circle())
+                }
+                
+                // 关闭
+                Button(action: { ExecutionToolbarManager.shared.hide(); ExecutionToolbarManager.shared.restoreMainWindow() }) {
+                    Image(systemName: "xmark").font(.system(size: 12, weight: .bold)).foregroundColor(.primary.opacity(0.7))
+                        .frame(width: 24, height: 24).background(Color.primary.opacity(0.1)).clipShape(Circle())
+                }.opacity(engine.isRunning ? 0.6 : 1.0)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+    
+    private var contentView: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Divider().opacity(0.5)
+            actionStatusView
+            recentLogsView
+        }
+    }
+    
+    private var actionStatusView: some View {
+        Group {
+            if let id = engine.currentActionId, let idx = engine.currentWorkflowIndex, let action = engine.workflows[idx].actions.first(where: { $0.id == id }) {
+                HStack(spacing: 8) {
+                    Image(systemName: action.type.icon).font(.system(size: 14)).foregroundColor(.blue)
+                    Text(action.customName.isEmpty ? action.displayTitle : action.customName).font(.system(size: 13, weight: .medium)).lineLimit(1)
+                    Spacer()
+                    ProgressView().controlSize(.small)
+                }
+                .padding(8).background(Color.blue.opacity(0.1)).cornerRadius(6).animation(.easeInOut, value: action.id)
+            } else {
+                HStack {
+                    Image(systemName: "hourglass").foregroundColor(.gray)
+                    Text(engine.isRunning ? "引擎就绪，等待节点..." : "执行已结束").font(.system(size: 13)).foregroundColor(engine.isRunning ? .gray : .green)
+                    Spacer()
+                }.padding(8).background(Color.gray.opacity(0.05)).cornerRadius(6)
+            }
+        }
+    }
+    
+    private var recentLogsView: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            let recentLogs = Array(engine.logs.suffix(5))
+            if recentLogs.isEmpty {
+                Text("暂无日志输出...").font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
+            } else {
+                ForEach(recentLogs.indices, id: \.self) { i in
+                    Text(recentLogs[i]).font(.system(size: 11, design: .monospaced)).foregroundColor(recentLogs[i].contains("❌") ? .red : .secondary).lineLimit(1).truncationMode(.tail)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading).frame(height: 90, alignment: .top).padding(.top, 2)
+    }
+}
+
+// MARK: - macOS 毛玻璃与特效件
+struct VisualEffectBackground: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView(); view.material = .hudWindow; view.blendingMode = .behindWindow; view.state = .active; return view
+    }
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
+}
+
+struct ExecutionBreatheLight: View {
+    var isRunning: Bool
+    @State private var breathePhase: CGFloat = 0.0
+    var body: some View {
+        Circle().fill(Color.green).frame(width: 10, height: 10)
+            .opacity(isRunning ? (0.4 + breathePhase * 0.6) : 0.2)
+            .shadow(color: .green, radius: isRunning ? (2 + breathePhase * 3) : 0)
+            .onAppear { withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) { breathePhase = 1.0 } }
     }
 }

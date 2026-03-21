@@ -53,6 +53,8 @@ struct ActionSettingsPopoverView: View {
         case .ocrExtract:       OCRExtractEditor(action: $action)
         case .aiVisionLocator:  AIVisionLocatorEditor(action: $action)
         case .aiDataParse:      AITextParseEditor(action: $action)
+        case .runWebJS:         WebScriptEditor(action: $action)
+        case .aiChat:           AIChatEditor(action: $action)
         default:
             TextField("参数设置", text: $action.parameter).textFieldStyle(.roundedBorder)
         }
@@ -428,7 +430,6 @@ struct WebAgentEditor: View {
                         Text("🔍 OCR 识字").tag("ocr")
                     }
                     .pickerStyle(.segmented)
-                    .frame(width: 160)
                 }
                 
                 if paramsBinding.assertionType.wrappedValue == "ocr" {
@@ -1405,13 +1406,13 @@ class UIElementOverlayView: NSView {
 }
 
 // MARK: - [逻辑与数据] 文件操作编辑器
-/// 提供对本地纯文本、CSV 等格式文件的读、写、追加操作
+/// 提供对本地纯文本、CSV 等格式文件的读、写、追加操作，以及 [✨新增] 新建空文件
 struct FileOperationEditor: View {
     @Binding var action: RPAAction
     
     var body: some View {
         let parts = action.parameter.components(separatedBy: "|")
-        let opType = parts.count > 0 ? parts[0] : "read"
+        let opType = (parts.count > 0 && !parts[0].isEmpty) ? parts[0] : "read"
         let filePath = parts.count > 1 ? parts[1] : ""
         let contentOrVar = parts.count > 2 ? parts[2] : ""
         
@@ -1423,24 +1424,35 @@ struct FileOperationEditor: View {
             HStack {
                 Text("操作类型:").font(.caption)
                 Picker("", selection: Binding(get: { opType }, set: { updateParam($0, filePath, contentOrVar) })) {
+                    Text("📄 新建空文件").tag("create") // [✨新增]
                     Text("📖 读取文件至变量").tag("read")
                     Text("✍️ 覆写内容至文件").tag("write")
                     Text("➕ 追加内容至文件").tag("append")
-                    Text("🔍 检测文件是否存在").tag("exists")
+                    Text("🔍 检测文件/目录是否存在").tag("exists")
                 }.labelsHidden().frame(width: 180)
             }
             
             HStack {
-                TextField("文件绝对路径 (支持 {{变量}})", text: Binding(get: { filePath }, set: { updateParam(opType, $0, contentOrVar) }))
+                TextField("文件/目录绝对路径 (支持 {{变量}})", text: Binding(get: { filePath }, set: { updateParam(opType, $0, contentOrVar) }))
                     .textFieldStyle(.roundedBorder)
                 
                 Button(action: {
-                    let panel = NSOpenPanel()
-                    panel.canChooseFiles = true
-                    panel.canChooseDirectories = false
-                    panel.allowsMultipleSelection = false
-                    if panel.runModal() == .OK, let url = panel.url {
-                        updateParam(opType, url.path, contentOrVar)
+                    // [✨核心优化] 根据操作类型智能提供原生的拾取器面板
+                    if opType == "create" {
+                        let panel = NSSavePanel()
+                        panel.title = "选择新建文件的保存位置"
+                        panel.nameFieldStringValue = "新建文本.txt"
+                        if panel.runModal() == .OK, let url = panel.url {
+                            DispatchQueue.main.async { updateParam(opType, url.path, contentOrVar) }
+                        }
+                    } else {
+                        let panel = NSOpenPanel()
+                        panel.canChooseFiles = true
+                        panel.canChooseDirectories = true
+                        panel.allowsMultipleSelection = false
+                        if panel.runModal() == .OK, let url = panel.url {
+                            DispatchQueue.main.async { updateParam(opType, url.path, contentOrVar) }
+                        }
                     }
                 }) { Image(systemName: "folder") }
             }
@@ -1454,7 +1466,7 @@ struct FileOperationEditor: View {
                     TextField("例如: fileData", text: Binding(get: { contentOrVar }, set: { updateParam(opType, filePath, $0) }))
                         .textFieldStyle(.roundedBorder)
                 }
-            } else {
+            } else if opType == "write" || opType == "append" {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("写入的内容 (支持 {{变量}}):").font(.caption).foregroundColor(.secondary)
                     TextEditor(text: Binding(get: { contentOrVar }, set: { updateParam(opType, filePath, $0) }))
@@ -1462,6 +1474,10 @@ struct FileOperationEditor: View {
                         .frame(height: 80)
                         .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
                 }
+            } else if opType == "create" {
+                // 新建文件时的专属提示语
+                Text("💡 提示：如果设定的父级目录不存在，引擎会自动为您级联创建。若文件已存在，则自动跳过以防止数据被覆盖。")
+                    .font(.caption2).foregroundColor(.blue)
             }
         }
     }
@@ -1571,7 +1587,7 @@ struct LoopItemsEditor: View {
     
     var body: some View {
         let parts = action.parameter.components(separatedBy: "|")
-        let sourceArray = parts.count > 0 ? parts[0] : "{{json_array}}"
+        let sourceArray = parts.count > 0 ? parts[0] : "{{list_data}}" // [✨修改] 默认提示变量名更通用
         let itemVarName = parts.count > 1 ? parts[1] : "item"
         let targetWorkflowId = parts.count > 2 ? parts[2] : ""
         
@@ -1581,7 +1597,8 @@ struct LoopItemsEditor: View {
         
         VStack(alignment: .leading, spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("数据源 (JSON 数组):").font(.caption).foregroundColor(.secondary)
+                // [✨修改] 更新文案提示，支持多行文本与逗号分隔
+                Text("数据源 (JSON数组 / 多行文本 / 逗号分隔):").font(.caption).foregroundColor(.secondary)
                 TextField("支持 {{变量}}", text: Binding(get: { sourceArray }, set: { updateParam($0, itemVarName, targetWorkflowId) }))
                     .textFieldStyle(.roundedBorder)
             }
@@ -1612,7 +1629,9 @@ struct LoopItemsEditor: View {
                 .labelsHidden()
             }
             
-            Text("💡 提示：此节点会解析数组，对于数组中的每一个元素，都会将该元素存入变量池中，然后同步调用一次选中的子工作流。").font(.caption2).foregroundColor(.blue)
+            // [✨修改] 更新底部说明文案
+            Text("💡 提示：支持标准 JSON 数组。若为普通文本，引擎将智能尝试按【换行符】或【逗号】进行分割。每次循环会将当前元素压入变量池，同步调用所选子流程。")
+                .font(.caption2).foregroundColor(.blue)
         }
     }
 }
@@ -1746,7 +1765,7 @@ struct AITextParseEditor: View {
             GroupBox("🧠 提取指令与结构要求") {
                 VStack(alignment: .leading, spacing: 8) {
                     // [✨修复] 使用纯净编辑器替代 TextEditor
-                    PlainCodeEditor(text: Binding(
+                    JSCodeEditor(text: Binding(
                         get: { instruction },
                         set: { updateParam(sourceVar, $0, targetVar, jsonTemplate) }
                     ))
@@ -1756,7 +1775,7 @@ struct AITextParseEditor: View {
                     Text("强制输出格式模板 (JSON Schema)：").font(.caption).foregroundColor(.secondary)
                     
                     // [✨修复] 使用纯净编辑器，彻底告别中文引号
-                    PlainCodeEditor(text: Binding(
+                    JSCodeEditor(text: Binding(
                         get: { jsonTemplate },
                         set: { updateParam(sourceVar, instruction, targetVar, $0) }
                     ))
@@ -1778,6 +1797,122 @@ struct AITextParseEditor: View {
     }
 }
 
+// MARK: - [系统与应用] Web JS 注入与控制编辑器 (进阶高亮美化版)
+struct WebScriptEditor: View {
+    @Binding var action: RPAAction
+    
+    var body: some View {
+        let parts = action.parameter.split(separator: "|", maxSplits: 3, omittingEmptySubsequences: false).map(String.init)
+        let browser = parts.count > 0 ? parts[0] : "InternalBrowser"
+        let targetVar = parts.count > 1 ? parts[1] : "js_result"
+        let timeoutStr = parts.count > 2 ? parts[2] : "10"
+        let jsCode = parts.count > 3 ? parts[3] : "return document.title;"
+        
+        let updateParam = { (b: String, v: String, t: String, c: String) in
+            action.parameter = "\(b)|\(v)|\(t)|\(c)"
+        }
+        
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("目标浏览器:").font(.caption).foregroundColor(.secondary).frame(width: 70, alignment: .trailing)
+                Picker("", selection: Binding(get: { browser }, set: { updateParam($0, targetVar, timeoutStr, jsCode) })) {
+                    Text("🚀 内置开发者浏览器").tag("InternalBrowser")
+                    Text("Safari").tag("Safari")
+                    Text("Google Chrome").tag("Google Chrome")
+                    Text("Microsoft Edge").tag("Microsoft Edge")
+                }.labelsHidden().frame(width: 180)
+                
+                Spacer()
+                
+                Text("⏳ 超时:").font(.caption).foregroundColor(.secondary)
+                TextField("10", text: Binding(get: { timeoutStr }, set: { updateParam(browser, targetVar, $0, jsCode) }))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 40)
+                Text("秒").font(.caption).foregroundColor(.secondary)
+            }
+            
+            HStack {
+                Image(systemName: "tray.and.arrow.down").foregroundColor(.orange).frame(width: 16)
+                Text("结果存入变量:").font(.caption).foregroundColor(.secondary).frame(width: 70, alignment: .trailing)
+                TextField("为空则不保存，如: js_result", text: Binding(get: { targetVar }, set: { updateParam(browser, $0, timeoutStr, jsCode) }))
+                    .textFieldStyle(.roundedBorder)
+            }
+            
+            GroupBox {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("🧠 异步 JavaScript 代码体").font(.subheadline).bold()
+                        Spacer()
+                        Button(action: {
+                            let formattedCode = formatJavaScript(jsCode)
+                            updateParam(browser, targetVar, timeoutStr, formattedCode)
+                        }) {
+                            Label("美化代码", systemImage: "wand.and.stars")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(.blue)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.blue.opacity(0.1))
+                        .cornerRadius(4)
+                    }
+                    
+                    JSCodeEditor(text: Binding(get: { jsCode }, set: { updateParam(browser, targetVar, timeoutStr, $0) }))
+                        .frame(height: 160)
+                        .padding(4)
+                        .background(Color(NSColor.textBackgroundColor))
+                        .cornerRadius(6)
+                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
+                    
+                    // [✨新增/修改] 提示文案升级，传授更高级的安全变量调用方式
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("💡 支持顶级 `await`。全局变量已自动安全注入为 `RPA` 顶层对象。")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        Text("示范: `let usr = RPA.username;` (极力推荐) 或 `let usr = '{{username}}';`")
+                            .font(.caption2)
+                            .foregroundColor(.blue)
+                    }
+                }
+                .padding(4)
+            }
+        }
+    }
+    
+    // MARK: - 原生 JS 智能代码美化算法
+    private func formatJavaScript(_ code: String) -> String {
+        var formatted = ""
+        var indentLevel = 0
+        let lines = code.components(separatedBy: .newlines)
+        
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty { continue }
+            
+            if trimmed.hasPrefix("}") || trimmed.hasPrefix("]") {
+                indentLevel = max(0, indentLevel - 1)
+            }
+            
+            let indentString = String(repeating: "    ", count: indentLevel)
+            formatted += indentString + trimmed + "\n"
+            
+            let openBraces = trimmed.filter { $0 == "{" || $0 == "[" }.count
+            let closeBraces = trimmed.filter { $0 == "}" || $0 == "]" }.count
+            
+            if trimmed.hasPrefix("}") || trimmed.hasPrefix("]") {
+                indentLevel += openBraces
+                indentLevel -= max(0, closeBraces - 1)
+            } else {
+                indentLevel += (openBraces - closeBraces)
+            }
+            
+            indentLevel = max(0, indentLevel)
+        }
+        
+        return formatted.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
 
 // -----------------------------------------------------------------------------------
 // 💡极客级辅助视图代码 (MiniDesktop, OCRMiniDesktop, 连接线绘制, 截屏工具等)
@@ -2168,11 +2303,72 @@ struct OCRExtractEditor: View {
     }
 }
 
+// MARK: - [AI与视觉] AI 智能对话编辑器
+/// 提供独立大模型对话能力，支持角色扮演与文本推理，并将结果持久化至变量
+struct AIChatEditor: View {
+    @Binding var action: RPAAction
+    
+    var body: some View {
+        // 参数格式约定: systemPrompt | targetVar | userPrompt
+        // 使用 maxSplits: 2 保护 userPrompt 中的特殊字符（如 Markdown 的表格线 |）不被错误切分
+        let parts = action.parameter.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+        let systemPrompt = parts.count > 0 ? parts[0] : ""
+        let targetVar = parts.count > 1 ? parts[1] : "ai_result"
+        let userPrompt = parts.count > 2 ? parts[2] : ""
+        
+        let updateParam = { (sys: String, tar: String, usr: String) in
+            action.parameter = "\(sys)|\(tar)|\(usr)"
+        }
+        
+        VStack(alignment: .leading, spacing: 14) {
+            GroupBox("🧠 系统设定 (System Prompt) - 可选") {
+                VStack(alignment: .leading, spacing: 4) {
+                    TextEditor(text: Binding(
+                        get: { systemPrompt },
+                        set: { updateParam($0, targetVar, userPrompt) }
+                    ))
+                    .font(.system(size: 12))
+                    .frame(height: 50)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
+                    
+                    Text("例如：你是一名资深的翻译官，请将收到的文本翻译为英文。").font(.caption2).foregroundColor(.secondary)
+                }
+                .padding(4)
+            }
+            
+            GroupBox("🗣️ 用户提示词 (User Prompt) - 支持 {{变量}}") {
+                VStack(alignment: .leading, spacing: 4) {
+                    TextEditor(text: Binding(
+                        get: { userPrompt },
+                        set: { updateParam(systemPrompt, targetVar, $0) }
+                    ))
+                    .font(.system(size: 12))
+                    .frame(height: 80)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
+                    
+                    Text("例如：请帮我总结以下从网页抓取的内容：{{clipboard}}").font(.caption2).foregroundColor(.blue)
+                }
+                .padding(4)
+            }
+            
+            HStack {
+                Image(systemName: "tray.and.arrow.down").foregroundColor(.orange)
+                Text("AI 结果存入变量:").font(.caption).foregroundColor(.secondary)
+                TextField("例如: ai_result", text: Binding(
+                    get: { targetVar },
+                    set: { updateParam(systemPrompt, $0, userPrompt) }
+                ))
+                .textFieldStyle(.roundedBorder)
+            }
+        }
+    }
+}
 
-// MARK: - 公共的纯净代码编辑器 (禁用智能引号与拼写检查，专为 JSON 和脚本设计)
-struct PlainCodeEditor: NSViewRepresentable {
+
+
+// MARK: - 原生轻量级 JavaScript 语法高亮与代码编辑器
+struct JSCodeEditor: NSViewRepresentable {
     @Binding var text: String
-    var minHeight: CGFloat = 60
     
     func makeCoordinator() -> Coordinator { Coordinator(self) }
     
@@ -2181,17 +2377,21 @@ struct PlainCodeEditor: NSViewRepresentable {
         guard let textView = scrollView.documentView as? NSTextView else { return scrollView }
         
         textView.delegate = context.coordinator
-        textView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         textView.backgroundColor = NSColor.textBackgroundColor
         textView.textColor = NSColor.textColor
         
-        // 核心修复：彻底关闭 macOS 的“智能替换”特性
+        // 彻底关闭 macOS 烦人的智能替换
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticSpellingCorrectionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
-        //textView.isSmartInsertDeleteEnabled = false
         textView.allowsUndo = true
+        
+        // 设置行高，提升代码阅读体验
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.lineSpacing = 4
+        textView.defaultParagraphStyle = paragraphStyle
         
         return scrollView
     }
@@ -2201,16 +2401,64 @@ struct PlainCodeEditor: NSViewRepresentable {
         if textView.string != text {
             let selectedRange = textView.selectedRange()
             textView.string = text
+            context.coordinator.highlight(textView)
             textView.setSelectedRange(selectedRange)
         }
     }
     
     class Coordinator: NSObject, NSTextViewDelegate {
-        var parent: PlainCodeEditor
-        init(_ parent: PlainCodeEditor) { self.parent = parent }
+        var parent: JSCodeEditor
+        var isHighlighting = false // 防重入锁，避免高亮引起的无限循环
+        
+        init(_ parent: JSCodeEditor) { self.parent = parent }
+        
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
             parent.text = textView.string
+            highlight(textView)
+        }
+        
+        // 核心：基于 NSRegularExpression 的极速语法高亮
+        func highlight(_ textView: NSTextView) {
+            guard !isHighlighting else { return }
+            isHighlighting = true
+            
+            let text = textView.string
+            let textStorage = textView.textStorage
+            let fullRange = NSRange(location: 0, length: text.utf16.count)
+            
+            textStorage?.beginEditing()
+            
+            // 1. 重置基础样式
+            textStorage?.addAttribute(.foregroundColor, value: NSColor.textColor, range: fullRange)
+            textStorage?.addAttribute(.font, value: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular), range: fullRange)
+            
+            // 2. 预设高亮规则与颜色
+            let rules: [(pattern: String, color: NSColor)] = [
+                // 关键字 (紫色)
+                ("\\b(var|let|const|function|return|if|else|for|while|await|async|try|catch|class|new|true|false|null|undefined|import|export)\\b", NSColor.systemPurple),
+                // 内置对象 (系统蓝)
+                ("\\b(document|window|console|Math|JSON|Promise|String|Array|Object)\\b", NSColor.systemBlue),
+                // 数字 (橙色)
+                ("\\b\\d+(?:\\.\\d+)?\\b", NSColor.systemOrange),
+                // 字符串 (单引号/双引号/反引号) (红色)
+                ("(\"(?:\\\\.|[^\"])*\")|('(?:\\\\.|[^'])*')|(`(?:\\\\.|[^`])*`)", NSColor.systemRed),
+                // 注释 (单行 // 和 多行 /* */) (绿色)
+                ("(//.*)|(/\\*[\\s\\S]*?\\*/)", NSColor.systemGreen)
+            ]
+            
+            // 3. 执行正则匹配并涂色
+            for rule in rules {
+                if let regex = try? NSRegularExpression(pattern: rule.pattern, options: []) {
+                    let matches = regex.matches(in: text, options: [], range: fullRange)
+                    for match in matches {
+                        textStorage?.addAttribute(.foregroundColor, value: rule.color, range: match.range)
+                    }
+                }
+            }
+            
+            textStorage?.endEditing()
+            isHighlighting = false
         }
     }
 }

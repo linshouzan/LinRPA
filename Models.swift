@@ -9,12 +9,14 @@ import SwiftUI
 import Combine
 import Foundation
 import AppKit
+import CryptoKit
 
 // MARK: - 动作分类与定义
 enum ActionCategory: String, CaseIterable, Codable {
     case system = "系统与应用"
     case mouseKeyboard = "鼠标与键盘"
     case aiVision = "AI 与视觉"
+    case agent = "智能体"
     case logicData = "逻辑与数据"
 }
 
@@ -27,13 +29,19 @@ enum ActionType: String, CaseIterable, Codable {
     case readClipboard = "读取剪贴板"
     case writeClipboard = "写入剪贴板"
     case ocrText = "识别屏幕文字"
+    case ocrExtract = "OCR结构化全文提取"
     case aiVision = "AI屏幕视觉分析"
+    case aiVisionLocator = "AI 视觉元素定位"
+    case aiDataParse = "AI 智能数据结构化"
+    case aiChat = "AI 智能对话"
     case webAgent = "Web智能体自主操作"
     case condition = "条件判断分支"
+    case loopItems = "遍历数据(循环)"
     case wait = "等待延时"
     case askUserInput = "人工介入与提问"
     case runShell = "执行Shell脚本"
     case runAppleScript = "执行AppleScript"
+    case runWebJS = "执行网页JS脚本"
     case setVariable = "设置全局变量"
     case httpRequest = "发送HTTP请求"
     case uiInteraction = "原生UI元素交互"
@@ -41,16 +49,13 @@ enum ActionType: String, CaseIterable, Codable {
     case fileOperation = "文件与目录操作"
     case dataExtraction = "数据清洗与提取"
     case windowOperation = "窗口控制"
-    case loopItems = "遍历数据(循环)"
-    case ocrExtract = "OCR结构化全文提取"
-    case aiVisionLocator = "AI 视觉元素定位"
-    case aiDataParse = "AI 智能数据结构化"
     
     var category: ActionCategory {
         switch self {
-        case .openApp, .openURL, .showNotification, .askUserInput, .uiInteraction, .windowOperation: return .system
+        case .openApp, .openURL, .showNotification, .askUserInput, .uiInteraction, .windowOperation, .runWebJS: return .system
         case .typeText, .mouseOperation, .readClipboard, .writeClipboard: return .mouseKeyboard
-        case .ocrText, .ocrExtract, .webAgent, .aiVision, .aiVisionLocator, .aiDataParse: return .aiVision
+        case .ocrText, .ocrExtract, .aiVision, .aiVisionLocator, .aiDataParse, .aiChat: return .aiVision
+        case .webAgent: return .agent
         case .condition, .wait, .runShell, .runAppleScript, .setVariable, .httpRequest, .callWorkflow, .fileOperation, .dataExtraction, .loopItems: return .logicData
         }
     }
@@ -61,16 +66,21 @@ enum ActionType: String, CaseIterable, Codable {
         case .openURL: return "safari"
         case .typeText: return "keyboard"
         case .mouseOperation: return "magicmouse"
-        case .ocrText: return "text.viewfinder"
         case .readClipboard: return "doc.on.clipboard"
         case .writeClipboard: return "clipboard"
         case .runShell: return "terminal"
         case .runAppleScript: return "applescript.fill"
+        case .runWebJS: return "chevron.left.forwardslash.chevron.right"
         case .condition: return "arrow.triangle.branch"
         case .showNotification: return "bell.badge.fill"
         case .wait: return "timer"
         case .askUserInput: return "person.crop.circle.badge.questionmark"
+        case .ocrText: return "text.viewfinder"
+        case .ocrExtract: return "doc.text.viewfinder"
         case .aiVision: return "brain.head.profile"
+        case .aiVisionLocator: return "scope"
+        case .aiDataParse: return "wand.and.stars"
+        case .aiChat: return "text.bubble.fill"
         case .webAgent: return "globe.badge.chevron.backward"
         case .setVariable: return "tray.full.fill"
         case .httpRequest: return "network"
@@ -80,9 +90,6 @@ enum ActionType: String, CaseIterable, Codable {
         case .dataExtraction: return "text.magnifyingglass"
         case .windowOperation: return "uiwindow.split.2x1"
         case .loopItems: return "repeat.circle"
-        case .ocrExtract: return "doc.text.viewfinder"
-        case .aiVisionLocator: return "scope"
-        case .aiDataParse: return "wand.and.stars"
         }
     }
 }
@@ -191,6 +198,15 @@ struct RPAAction: Identifiable, Codable, Equatable, Hashable {
             let varName = parts.count > 5 ? parts[5] : "ocr_data"
             let fmt = parts.count > 2 ? (parts[2] == "json" ? "JSON" : "纯文本") : "数据"
             return "提取屏幕全文 -> [\(fmt)] {{\(varName)}}"
+        case .runWebJS: // [✨新增]
+            let parts = parameter.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+            let browser = parts.count > 0 ? parts[0] : "浏览器"
+            let targetVar = parts.count > 1 ? parts[1] : ""
+            return "网页 JS: \(browser) -> \(targetVar.isEmpty ? "无返回" : "{{\(targetVar)}}")"
+        case .aiChat: // [✨新增] AI对话展示标题
+            let parts = parameter.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+            let targetVar = parts.count > 1 ? parts[1] : "ai_result"
+            return "AI 思考对话 -> {{\(targetVar)}}"
         default: return type.rawValue
         }
     }
@@ -259,45 +275,45 @@ class AppSettings: ObservableObject {
     
     // WebAgent的AI提示词
     @AppStorage("webAgentPrompt") var webAgentPrompt: String = """
-    你是一个高效的网页自动化助手。请结合【截图】与【可见元素列表】，决定下一步一个或多个连续操作。
+    你是一个高效的网页自动化助手。请结合【截图】与【可见元素列表】，决定下一步动作。
     注意：截图中可交互元素已被打上红色数字方框，请通过图片找到正确元素，并参考DOM列表提取目标ID。
-    
+
     【任务目标】: {{TaskDesc}}
     【成功视觉断言】: {{SuccessAssertion}}
     【操作手册】: {{Manual}}
     【历史操作记录】:
     {{History}}
-    
-    ⚠️ 关键指令 ⚠️
-    1. 你的思考必须极其简短（限20字内）。
-    2. 不要一次性规划太多步骤，每次只输出 1 到 2 步当前最紧要的动作，一次没有变化换物理操作，如click换成native_click。。
-    3. 如果目标元素在截图中，但列表中没有ID，请使用 scroll_down 翻页。
-    4. 敏感信息输入必须使用占位符，例如账号填 `{{account}}`。
-    5. 降级机制：如果目标元素在截图中清晰可见，但【可见元素列表】中由于压缩原因没有它的ID，请立即输出获取完整DOM动作。
-    
+
+    ⚠️ 关键行为准则 ⚠️
+    1. 思考必须精简（限20字内）。
+    2. 如果收到【系统警告：页面无变化】，绝对不可重复上一步相同的 action_type 和 target_id！必须降级使用 scroll_down 或 wait 或 request_full_dom
+    3. 敏感信息输入必须使用占位符，例如账号填 `{{account}}`。
+    4. 降级机制：如果目标元素在截图中清晰可见，但【可见元素列表】中由于压缩原因没有它的ID，请立即输出获取完整DOM动作。
+
     【当前可见元素 (ID与截图对应)】:
     {{DOM}}
-    
-    【可选动作空间】 (请自由组合):
-    - request_full_dom: 获取完整DOM
-    - hover / click / input: 默认的底层 JS 注入操作 (速度极快)
-    - native_hover / native_click / native_input: 原生物理外设操作 (仅当普通操作失效，或遇到防爬检测时使用)
-    - scroll_down / scroll_up: 页面滚动
-    - finish / fail: 任务成功完成(包含满足【成功视觉断言】)或失败请求接管
-    
+
     严格输出如下 JSON 格式 (切勿输出其他废话):
     {
       "thought": "一句话理由",
       "steps": [
         {
-          "action_type": "hover/click/input/native_click/scroll_down/finish/fail",
+          "action_type": "hover/click/input/physical_click/scroll_down/wait/open_url/finish/fail",
           "target_id": "红框上的数字ID(无元素留空)",
-          "input_value": "如果是input，填写内容(否则留空)"
+          "input_value": "如果是input填内容，wait填秒数，open_url填链接(否则留空)"
         }
       ]
     }
     """
 }
+
+//    【可选动作空间】 (请自由组合):
+//- request_full_dom: 获取完整DOM
+//- hover / click / input: 默认的底层 JS 注入操作 (速度极快)
+//- native_hover / native_click / native_input: 原生物理外设操作 (仅当普通操作失效，或遇到防爬检测时使用)
+//- scroll_down / scroll_up: 页面滚动
+//- finish / fail: 任务成功完成(包含满足【成功视觉断言】)或失败请求接管
+
 
 // MARK: - [✨新增] AI 模型配置与全局管理器
 
@@ -443,6 +459,12 @@ extension String {
             last = cur
         }
         return last.last ?? 0
+    }
+    
+    /// 计算轻量级 MD5 哈希值，用于比对前后两轮页面状态是否发生实质性变化
+    func stateHash() -> String {
+        let digest = Insecure.MD5.hash(data: self.data(using: .utf8) ?? Data())
+        return digest.map { String(format: "%02hhx", $0) }.joined()
     }
     
     // 提炼AI对话返回的文本中的json格式，去除干扰。

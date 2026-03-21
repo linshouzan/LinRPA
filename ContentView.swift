@@ -297,35 +297,6 @@ struct ContentView: View {
         }
     }
     
-    private func toggleRecording() {
-        if isRecordingUI {
-            MacroRecorder.shared.stopRecording()
-            isRecordingUI = false
-            engine.log("⏹️ 录制结束，已在画板生成操作节点。")
-            
-            if appSettings.minimizeOnRun {
-                if let mainWindow = NSApp.windows.first(where: { $0.className.contains("AppKitWindow") }) {
-                    mainWindow.deminiaturize(nil)
-                }
-            }
-        } else {
-            Task {
-                engine.log("⏱️ 准备录制，倒计时 3 秒...")
-                await engine.showCountdownHUD(message: "系统动作录制准备中...")
-                
-                MacroRecorder.shared.startRecording()
-                isRecordingUI = true
-                engine.log("🔴 开始录制，请在系统内操作，完成后点击通知栏或回到应用停止录制...")
-                
-                if appSettings.minimizeOnRun {
-                    await MainActor.run {
-                        NSApp.windows.first(where: { $0.className.contains("AppKitWindow") })?.miniaturize(nil)
-                    }
-                }
-            }
-        }
-    }
-    
     private func getPosition(for id: UUID, in workflow: Workflow) -> CGPoint { if let pos = engine.nodePositions[id] { return pos }; if let action = workflow.actions.first(where: { $0.id == id }) { return CGPoint(x: action.positionX, y: action.positionY) }; return .zero }
     private func defaultPosition(in size: CGSize, offset: CGSize) -> CGPoint { return CGPoint(x: size.width / 2 - offset.width + CGFloat.random(in: -30...30), y: size.height / 3 - offset.height + CGFloat.random(in: -30...30)) }
     private func getPortAbsolutePosition(nodeID: UUID, port: PortPosition, in workflow: Workflow) -> CGPoint { let center = getPosition(for: nodeID, in: workflow); switch port { case .top: return CGPoint(x: center.x, y: center.y - nodeHeight / 2); case .bottom: return CGPoint(x: center.x, y: center.y + nodeHeight / 2); case .left: return CGPoint(x: center.x - nodeWidth / 2, y: center.y); case .right: return CGPoint(x: center.x + nodeWidth / 2, y: center.y) } }
@@ -368,15 +339,28 @@ struct CanvasNodeCardView: View {
                     .font(.system(size: 16))
                     .foregroundColor(isCurrent ? .white : themeColor)
                 
-                TextField(action.displayTitle, text: $action.customName)
-                    .font(.system(size: 12, weight: .bold))
-                    .strikethrough(action.isDisabled, color: .gray)
-                    .foregroundColor(isCurrent ? .white : (action.isDisabled ? .gray : .primary))
-                    .textFieldStyle(.plain)
-                    .lineLimit(1)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .layoutPriority(1)
-                    .disabled(isCurrent)
+                // [✨修复] 解决 macOS 呼吸动画时 AppKit PlatformTextFieldAdaptor 约束计算精度溢出报错的问题
+                // 当处于执行状态 (isCurrent) 且产生连续缩放动画时，替换为纯粹使用 CoreText 渲染的 Text 组件
+                Group {
+                    if isCurrent {
+                        Text(action.customName.isEmpty ? action.displayTitle : action.customName)
+                            .font(.system(size: 12, weight: .bold))
+                            .strikethrough(action.isDisabled, color: .gray)
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        TextField(action.displayTitle, text: $action.customName)
+                            .font(.system(size: 12, weight: .bold))
+                            .strikethrough(action.isDisabled, color: .gray)
+                            .foregroundColor(action.isDisabled ? .gray : .primary)
+                            .textFieldStyle(.plain)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: false, vertical: true) // 限制垂直约束，防止 Auto Layout 挤压
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .layoutPriority(1)
                 
                 Button(action: { showSettings.toggle() }) {
                     Image(systemName: "gearshape.fill")
@@ -400,7 +384,16 @@ struct CanvasNodeCardView: View {
             }
             
             if isStart || isEnd { Text(isStart ? "▶ 起点" : "🏁 终点").font(.system(size: 8, weight: .bold)).foregroundColor(.white).padding(.horizontal, 4).padding(.vertical, 2).background(isStart ? Color.green : Color.orange).clipShape(Capsule()).offset(x: cardWidth / 2 - 10, y: -cardHeight / 2 - 6) }
-            ForEach(PortPosition.allCases, id: \.self) { port in let portOffset = getPortLocalOffset(port: port); Circle().fill(Color(NSColor.controlBackgroundColor)).frame(width: 10, height: 10).overlay(Circle().stroke(themeColor.opacity(0.6), lineWidth: 2)).scaleEffect(isConnecting ? 1.3 : 1.0).animation(.spring(), value: isConnecting).offset(x: portOffset.width, y: portOffset.height).overlay(Color.white.opacity(0.001).frame(width: 25, height: 25).offset(x: portOffset.width, y: portOffset.height).gesture(DragGesture(minimumDistance: 0).onChanged { value in if value.translation.width == 0 && value.translation.height == 0 { onStartConnection(port) } else { onDragConnection(port, value.translation) } }.onEnded { value in onEndConnection(port, value.translation) })); if action.type == .ocrText || action.type == .condition { if port == .right { Text("✅").font(.system(size: 8)).foregroundColor(.green).offset(x: portOffset.width + 12, y: portOffset.height) } else if port == .bottom { Text("❌").font(.system(size: 8)).foregroundColor(.red).offset(x: portOffset.width, y: portOffset.height + 12) } } }
+            ForEach(PortPosition.allCases, id: \.self) { port in
+                let portOffset = getPortLocalOffset(port: port)
+                Circle().fill(Color(NSColor.controlBackgroundColor)).frame(width: 10, height: 10).overlay(Circle().stroke(themeColor.opacity(0.6), lineWidth: 2)).scaleEffect(isConnecting ? 1.3 : 1.0).animation(.spring(), value: isConnecting).offset(x: portOffset.width, y: portOffset.height).overlay(Color.white.opacity(0.001).frame(width: 25, height: 25).offset(x: portOffset.width, y: portOffset.height).gesture(DragGesture(minimumDistance: 0).onChanged { value in if value.translation.width == 0 && value.translation.height == 0 { onStartConnection(port) } else { onDragConnection(port, value.translation) } }.onEnded { value in onEndConnection(port, value.translation) }))
+                
+                // [✨修改点1]：增加 .webAgent，渲染成功和失败的文字徽标
+                if action.type == .ocrText || action.type == .condition || action.type == .webAgent {
+                    if port == .right { Text("✅").font(.system(size: 8)).foregroundColor(.green).offset(x: portOffset.width + 12, y: portOffset.height) }
+                    else if port == .bottom { Text("❌").font(.system(size: 8)).foregroundColor(.red).offset(x: portOffset.width, y: portOffset.height + 12) }
+                }
+            }
         }
         .onChange(of: isCurrent) { _, current in
             if current { breathePhase = 0; withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) { breathePhase = 1 } }

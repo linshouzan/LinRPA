@@ -16,6 +16,7 @@ import AppKit
 // MARK: - [✨终极修复] 网页语料录制 JS 探针 (带卸载与视觉高亮徽标)
 let corpusRecorderJS = """
 (function() {
+    if (window.console) console.log('JS探针加载...');
     if (window._rpaCorpusInjected) return;
     window._rpaCorpusInjected = true;
     window._rpaEventBuffer = [];
@@ -64,7 +65,7 @@ let corpusRecorderJS = """
         return "NOT_FOUND";
     };
 
-    function captureDOMSnapshot(interactiveEl) {
+    window._captureDOMSnapshot = function(interactiveEl) {
         try {
             let summary = []; let index = 0; let targetId = '';
             let interactiveTags = ['button', 'input', 'select', 'textarea', 'a'];
@@ -104,7 +105,7 @@ let corpusRecorderJS = """
 
     function sendEvent(type, target, extra = {}) {
         let text = target.innerText || target.value || target.getAttribute('placeholder') || target.getAttribute('aria-label') || '';
-        let snapshot = captureDOMSnapshot(target);
+        let snapshot = window._captureDOMSnapshot(target);
         flashElement(target, snapshot.targetId); 
         let ev = { event: type, element_text: text.trim().substring(0, 30), dom_summary: snapshot.summary, target_id: snapshot.targetId };
         Object.assign(ev, extra);
