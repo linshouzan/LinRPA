@@ -183,7 +183,7 @@ struct UIInteractionExecutor: RPAActionExecutor {
             func collectElementsDFS(in element: AXUIElement, currentDepth: Int) {
                 if currentDepth > 20 { return } // 防止无限循环
                 var childrenRef: CFTypeRef?
-                // [✨修复 2] 替换为 as!
+                // [修复 2] 替换为 as!
                 if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success {
                     let children = childrenRef as! [AXUIElement]
                     for child in children {
@@ -213,7 +213,7 @@ struct UIInteractionExecutor: RPAActionExecutor {
             
             // 从所有窗口中搜索
             var windowsRef: CFTypeRef?
-            // [✨修复 3] 替换为 as!
+            // [修复 3] 替换为 as!
             if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef) == .success {
                 let windows = windowsRef as! [AXUIElement]
                 for window in windows { collectElementsDFS(in: window, currentDepth: 0) }
@@ -221,7 +221,7 @@ struct UIInteractionExecutor: RPAActionExecutor {
             
             // 从顶部系统菜单栏搜索
             var menuBarRef: CFTypeRef?
-            // [✨修复 4] 替换为 as!
+            // [修复 4] 替换为 as!
             if AXUIElementCopyAttributeValue(appElement, kAXMenuBarAttribute as CFString, &menuBarRef) == .success {
                 let menuBar = menuBarRef as! AXUIElement
                 collectElementsDFS(in: menuBar, currentDepth: 0)
@@ -369,7 +369,7 @@ struct OCRTextExecutor: RPAActionExecutor {
         let fuzzyTolerance = Int(parts.count > 10 ? parts[10] : "1") ?? 1
         let enhanceContrast = parts.count > 11 ? (parts[11] == "true") : false
         
-        // [✨解析滚屏新参数]
+        // [解析滚屏新参数]
         let scrollDirection = parts.count > 12 ? parts[12] : "down"
         let scrollAmount = Int(parts.count > 13 ? parts[13] : "5") ?? 5
         
@@ -443,7 +443,7 @@ struct OCRTextExecutor: RPAActionExecutor {
                 return .success
             }
             
-            // [✨终极优化] 智能定点滚屏
+            // [终极优化] 智能定点滚屏
             if autoScroll {
                 let dirText = scrollDirection == "up" ? "向上" : "向下"
                 context.log("⏬ 未发现文字，准备\(dirText)滚动 (幅度:\(scrollAmount))...")
@@ -555,7 +555,7 @@ struct OpenURLExecutor: RPAActionExecutor {
         let silent = parts.count > 2 ? (parts[2] == "true") : false
         let incognito = parts.count > 3 ? (parts[3] == "true") : false
         
-        // [✨核心优化 1] 智能补全 HTTP 协议，防止用户只填域名导致崩溃
+        // [核心优化 1] 智能补全 HTTP 协议，防止用户只填域名导致崩溃
         var finalUrlStr = rawUrl.trimmingCharacters(in: .whitespacesAndNewlines)
         if !finalUrlStr.lowercased().hasPrefix("http") && !finalUrlStr.isEmpty {
             finalUrlStr = "https://" + finalUrlStr
@@ -593,7 +593,7 @@ struct OpenURLExecutor: RPAActionExecutor {
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             
         } else if browser == "System" {
-            // [✨核心优化 2] 采用 macOS 现代化 NSWorkspace API 打开系统默认浏览器
+            // [核心优化 2] 采用 macOS 现代化 NSWorkspace API 打开系统默认浏览器
             if let targetAppUrl = NSWorkspace.shared.urlForApplication(toOpen: url) {
                 let config = NSWorkspace.OpenConfiguration()
                 config.activates = !silent // 彻底实现静默控制
@@ -816,21 +816,27 @@ struct AskUserInputExecutor: RPAActionExecutor {
     }
 }
 
-// MARK: - 条件判断执行器
-/// 提供基础的包含、等于验证逻辑，用于指引流程在工作流中的走向
+// MARK: - [优化] 条件判断执行器 (增加类型感知校验)
 struct ConditionExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
         let parts = context.parseVariables(action.parameter).components(separatedBy: "|")
         if parts.count >= 3 {
-            let leftValue = parts[0]
+            let leftValue = parts[0].trimmingCharacters(in: .whitespaces)
             let op = parts[1]
-            let rightValue = parts[2]
+            let rightValue = parts[2].trimmingCharacters(in: .whitespaces)
             var isMatched = false
             
-            if op == "==" {
-                isMatched = (leftValue == rightValue)
-            } else if op == "contains" {
-                isMatched = leftValue.contains(rightValue)
+            // 强化处理：如果是比较数字，强转 Double 比较避免 "02" != "2" 的低级错误
+            if let leftNum = Double(leftValue), let rightNum = Double(rightValue) {
+                if op == "==" { isMatched = (leftNum == rightNum) }
+                else if op == ">" { isMatched = (leftNum > rightNum) }
+                else if op == "<" { isMatched = (leftNum < rightNum) }
+                else if op == "contains" { isMatched = leftValue.contains(rightValue) } // 降级为字符串
+            } else {
+                // 传统字符串比对
+                if op == "==" { isMatched = (leftValue == rightValue) }
+                else if op == "contains" { isMatched = leftValue.contains(rightValue) }
+                else if op == "!=" { isMatched = (leftValue != rightValue) }
             }
             
             context.log("⚖️ 判断: '\(leftValue)' \(op) '\(rightValue)' -> \(isMatched)")
@@ -859,7 +865,7 @@ struct ShowNotificationExecutor: RPAActionExecutor {
         let formattedMessage = formatToReadableText(rawMessage)
         
         if mode == "dialog" {
-            // 🌟 【原生强制弹窗模式】直接调用 AppKit 原生 NSAlert，100% 居中阻塞弹窗
+            // 【原生强制弹窗模式】直接调用 AppKit 原生 NSAlert，100% 居中阻塞弹窗
             await MainActor.run {
                 if playSound {
                     // 弹窗模式下触发清脆的系统提示音 (修复：使用字符串字面量调用 macOS 经典系统音效)
@@ -886,8 +892,17 @@ struct ShowNotificationExecutor: RPAActionExecutor {
             }
             context.log("🔔 触达原生强制弹窗 [\(title)]")
             
+        } else if mode == "hud" || mode == "floating" {
+            // 【新增：沉浸式科技悬浮窗模式】
+            await MainActor.run {
+                if playSound { NSSound(named: "Glass")?.play() }
+                // 设为 5 秒自动隐藏，防止永远留在屏幕上
+                AIThoughtHUDManager.shared.showNotification(title: title, content: formattedMessage, autoHideDelay: 5.0)
+            }
+            context.log("🔔 触达屏幕居中悬浮窗 [\(title)]")
+            
         } else {
-            // 🌟 【横幅通知模式】使用 AppleScript 触发系统级静默横幅
+            // 【横幅通知模式】使用 AppleScript 触发系统级静默横幅
             let maxLength = 300
             let finalMessage = formattedMessage.count > maxLength
                 ? String(formattedMessage.prefix(maxLength)) + "\n...(内容过长已截断)"
@@ -1576,21 +1591,47 @@ struct WebAgentExecutor: RPAActionExecutor {
     }
 }
 
+// MARK: - [✨重构] 流程调用执行器 (显式参数映射与隔离防抖)
 struct CallWorkflowExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
-        // 【✨核心修复】强力清除可能的隐藏空格和换行符
-        let targetIdStr = context.parseVariables(action.parameter).trimmingCharacters(in: .whitespacesAndNewlines)
+        // 参数格式约定: target_uuid|{"子入参名":"父变量或文本", ...}
+        let parts = action.parameter.components(separatedBy: "|")
+        let targetIdStr = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
         
         guard let targetId = UUID(uuidString: targetIdStr) else {
             context.log("❌ 调用的子工作流 ID 格式无效: [\(targetIdStr)]")
             return .failure
         }
         
-        context.log("🔗 开始进入子工作流: \(targetIdStr)...")
-        let success = await context.runWorkflow(by: targetId)
-        context.log("🔗 子工作流执行完毕，返回主流程。")
+        // 1. 显式参数映射解析 (Explicit Parameter Mapping)
+        var explicitArgs: [String: String] = [:]
+        if parts.count > 1 {
+            let mappingJsonStr = parts[1]
+            if let mappingData = mappingJsonStr.data(using: .utf8),
+               let mappingDict = try? JSONSerialization.jsonObject(with: mappingData) as? [String: String] {
+                
+                for (childKey, parentExpression) in mappingDict {
+                    // 动态解析父流程环境中的表达式或变量，赋值给子流程的 Key
+                    explicitArgs[childKey] = context.parseVariables(parentExpression)
+                }
+            }
+        }
         
-        return success ? .success : .failure
+        context.log("🔗 准备进入子工作流 (携带 \(explicitArgs.count) 个显式入参)...")
+        
+        // 2. 发起沙盒调用 (利用引擎内置深度控制，不用在此强算 depth)
+        // 注意：这里 depth 取 0 仅仅是个占位，实际深度在引擎栈内已经通过 pop/append 得到宏观管控
+        let result = await context.runWorkflow(by: targetId, args: explicitArgs, depth: 1)
+        
+        // 3. 将子工作流暴露的 isOutput 变量，合并写入到当前（父）工作流的变量池中
+        if result.success {
+            for (outKey, outValue) in result.outputs {
+                context.variables[outKey] = outValue
+                context.log("📥 接收子流程出参: [\(outKey)] = \(outValue.count > 30 ? "\(outValue.prefix(30))..." : outValue)")
+            }
+        }
+        
+        return result.success ? .success : .failure
     }
 }
 
@@ -1866,38 +1907,28 @@ struct LoopItemsExecutor: RPAActionExecutor {
         // ---------------------------------------------------------
         // 🌟 智能解析引擎 (Smart Fallback Parsing)
         // ---------------------------------------------------------
-        
-        // 1. 优先尝试标准 JSON 解析 (处理诸如 ["a", "b"] 或对象数组)
         if let jsonData = sourceData.data(using: .utf8),
            let jsonArray = try? JSONSerialization.jsonObject(with: jsonData) as? [Any] {
             itemsArray = jsonArray
         }
-        // 2. [✨新增] 尝试单引号兼容 JSON 解析 (处理 Python/JS 风格的 ['a', 'b'])
         else if let jsonData = sourceData.replacingOccurrences(of: "'", with: "\"").data(using: .utf8),
                 let jsonArray = try? JSONSerialization.jsonObject(with: jsonData) as? [Any] {
             itemsArray = jsonArray
             parseMode = "非标准 JSON 数组(单引号)"
         }
-        // 3. [✨新增] 尝试无引号简易数组强行剥离 (处理极端格式如 [a, b, c] 或 [1, 2, 3])
         else if sourceData.hasPrefix("[") && sourceData.hasSuffix("]") {
             let innerContent = String(sourceData.dropFirst().dropLast())
             itemsArray = innerContent.components(separatedBy: ",")
-                .map {
-                    $0.trimmingCharacters(in: .whitespaces)
-                      // 去除可能残存的单/双引号，将其作为纯字符串提取
-                      .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
-                }
+                .map { $0.trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\"'")) }
                 .filter { !$0.isEmpty }
             parseMode = "简易纯数组剥离"
         }
-        // 4. 降级：尝试按换行符分割 (多用于读取的多行文本 / 网页列表抓取结果)
         else if sourceData.contains("\n") {
             itemsArray = sourceData.components(separatedBy: .newlines)
                 .map { $0.trimmingCharacters(in: .whitespaces) }
                 .filter { !$0.isEmpty }
             parseMode = "多行文本"
         }
-        // 5. 降级：尝试按逗号/中文逗号分割 (多用于简单的一维输入)
         else if sourceData.contains(",") || sourceData.contains("，") {
             let normalizedData = sourceData.replacingOccurrences(of: "，", with: ",")
             itemsArray = normalizedData.components(separatedBy: ",")
@@ -1905,7 +1936,6 @@ struct LoopItemsExecutor: RPAActionExecutor {
                 .filter { !$0.isEmpty }
             parseMode = "逗号分隔文本"
         }
-        // 6. 兜底：都不满足且有实质内容，作为单个元素的数组执行
         else if !sourceData.isEmpty {
             itemsArray = [sourceData]
             parseMode = "单文本元素"
@@ -1924,7 +1954,6 @@ struct LoopItemsExecutor: RPAActionExecutor {
         for (index, item) in itemsArray.enumerated() {
             guard context.isRunning else { break }
             
-            // 将当前项转换为字符串（如果是字典或数组，序列化为 JSON 字符串；如果是标量，转为普通字符串）
             var itemString = ""
             if let dictOrArr = item as? [String: Any] {
                 if let data = try? JSONSerialization.data(withJSONObject: dictOrArr), let str = String(data: data, encoding: .utf8) { itemString = str }
@@ -1934,17 +1963,17 @@ struct LoopItemsExecutor: RPAActionExecutor {
                 itemString = "\(item)"
             }
             
-            // 注入变量池
+            // 为了向下兼容，依然向当前父上下文注入变量
             context.variables[itemVarName] = itemString
             
-            // 为了日志清晰，截断过长的 itemString 打印
             let displayString = itemString.count > 40 ? String(itemString.prefix(40)) + "..." : itemString
             context.log("🔄 [循环 \(index + 1)/\(itemsArray.count)] 已注入变量 {{\(itemVarName)}} = \(displayString)")
             
-            // 阻塞式调用子流程
-            let success = await context.runWorkflow(by: targetId)
+            // [✨修复编译错误] 适配新的元组返回值，并利用显式 args 传递单项数据
+            let result = await context.runWorkflow(by: targetId, args: [itemVarName: itemString], depth: 1)
             
-            if !success {
+            // 访问元组的 .success 属性进行逻辑判断
+            if !result.success {
                 context.log("⚠️ 循环在第 \(index + 1) 次时遇到子流程异常，循环提前终止。")
                 return .failure
             }
@@ -2315,84 +2344,90 @@ struct WebScriptExecutor: RPAActionExecutor {
     }
 }
 
-// MARK: - AI 智能对话执行器
-/// 负责处理无视觉的纯文本对话逻辑，支持系统角色前置约束，具备流式输出与变量存取能力
+// MARK: - AI 智能对话执行器 (支持后台静默与前端多轮交互)
 struct AIChatExecutor: RPAActionExecutor {
     func execute(action: RPAAction, context: WorkflowEngine) async -> ConnectionCondition {
-        let parts = action.parameter.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+        let parts = action.parameter.split(separator: "|", maxSplits: 3, omittingEmptySubsequences: false).map(String.init)
         
         let rawSystemPrompt = parts.count > 0 ? parts[0] : ""
         let targetVar = parts.count > 1 ? parts[1] : "ai_result"
         let rawUserPrompt = parts.count > 2 ? parts[2] : ""
+        let showHUD = parts.count > 3 ? (parts[3] == "true") : true
         
-        // 渲染变量
         let systemPrompt = context.parseVariables(rawSystemPrompt).trimmingCharacters(in: .whitespacesAndNewlines)
         let userPrompt = context.parseVariables(rawUserPrompt).trimmingCharacters(in: .whitespacesAndNewlines)
         
-        if userPrompt.isEmpty {
-            context.log("⚠️ AI 对话跳过：未检测到任何有效的用户提示词 (User Prompt)。")
-            return .failure
-        }
-        
-        context.log("🧠 正在请求 AI 大模型进行思考推理...")
-        
-        // 兼容性组装：将 System 设定作为强约束拼接到开头，防止部分模型不支持纯 system 角色报错
-        var finalPrompt = userPrompt
-        if !systemPrompt.isEmpty {
-            finalPrompt = "【系统设定/前提约束】\n\(systemPrompt)\n\n【用户指令】\n\(userPrompt)"
-        }
-        
-        let message = LLMMessage(role: .user, text: finalPrompt)
-        
-        do {
-            // 采用流式输出，提升极客体验
-            let stream = LLMService.shared.stream(messages: [message])
+        if showHUD {
+            context.log("🧠 正在呼出 AI 悬浮窗，移交用户控制权...")
             
-            var fullResult = ""
-            var chunkBuffer = ""
-            var lastReportTime = CFAbsoluteTimeGetCurrent()
+            // 阻塞式调用：挂起 RPA 流程，直到用户在悬浮窗中完成所有多轮交互并点击关闭
+            let finalResult = await AIThoughtHUDManager.shared.showInteractiveChat(
+                title: "AI 思考与协作中",
+                systemPrompt: systemPrompt,
+                initialInput: userPrompt
+            )
             
-            context.log("🌊 AI 响应中: ")
-            
-            for try await chunk in stream {
-                guard context.isRunning else {
-                    await MainActor.run { context.log("\n🛑 流程已终止，AI 响应流已被强制切断。") }
-                    break
-                }
-                
-                fullResult += chunk
-                chunkBuffer += chunk
-                
-                // 100ms 刷新一次日志 UI，防止高频刷新导致主线程卡顿
-                let now = CFAbsoluteTimeGetCurrent()
-                if now - lastReportTime > 0.1 {
-                    let textToAppend = chunkBuffer
-                    chunkBuffer = ""
-                    await MainActor.run { context.appendLogChunk(textToAppend) }
-                    lastReportTime = now
-                }
-            }
-            
-            guard context.isRunning else { return .failure }
-            
-            // 冲刷最后一点残余的 buffer
-            if !chunkBuffer.isEmpty {
-                await MainActor.run { context.appendLogChunk(chunkBuffer) }
-            }
-            
-            // 将结果写入全局变量池
+            // 将最后一轮的对话结果写入全局变量池，供下一个动作使用
             if !targetVar.isEmpty {
-                context.variables[targetVar] = fullResult
-                context.log("\n✅ AI 思考完成，结果已完整存入变量 {{\(targetVar)}}")
-            } else {
-                context.log("\n✅ AI 思考完成，由于未设置接收变量，结果已被丢弃。")
+                context.variables[targetVar] = finalResult
+                context.log("✅ AI 交互已由用户主动结束，最终结果已存入 {{\\(targetVar)}}")
             }
-            
             return .success
             
-        } catch {
-            context.log("\n❌ AI 对话调用异常: \(error.localizedDescription)")
-            return .failure
+        } else {
+            // ==========================================
+            // 后台静默模式 (不弹窗，直接调用 API 并保存)
+            // ==========================================
+            if userPrompt.isEmpty {
+                context.log("⚠️ AI 对话跳过：静默模式下未检测到用户提示词。")
+                return .failure
+            }
+            
+            context.log("🧠 正在后台静默请求 AI 大模型...")
+            var finalPrompt = userPrompt
+            if !systemPrompt.isEmpty {
+                finalPrompt = "【系统设定/前提约束】\\n\\(systemPrompt)\\n\\n【用户指令】\\n\\(userPrompt)"
+            }
+            
+            let message = LLMMessage(role: .user, text: finalPrompt)
+            
+            do {
+                let stream = LLMService.shared.stream(messages: [message])
+                var fullResult = ""
+                var chunkBuffer = ""
+                var lastReportTime = CFAbsoluteTimeGetCurrent()
+                
+                context.log("🌊 AI 响应中: ")
+                for try await chunk in stream {
+                    guard context.isRunning else {
+                        await MainActor.run { context.log("\\n🛑 流程已终止。") }
+                        break
+                    }
+                    fullResult += chunk
+                    chunkBuffer += chunk
+                    
+                    let now = CFAbsoluteTimeGetCurrent()
+                    if now - lastReportTime > 0.1 {
+                        let textToAppend = chunkBuffer
+                        chunkBuffer = ""
+                        await MainActor.run { context.appendLogChunk(textToAppend) }
+                        lastReportTime = now
+                    }
+                }
+                
+                guard context.isRunning else { return .failure }
+                if !chunkBuffer.isEmpty { await MainActor.run { context.appendLogChunk(chunkBuffer) } }
+                
+                if !targetVar.isEmpty {
+                    context.variables[targetVar] = fullResult
+                    context.log("\\n✅ 后台 AI 思考完成，结果已存入 {{\\(targetVar)}}")
+                }
+                return .success
+                
+            } catch {
+                context.log("\\n❌ AI 调用异常: \\(error.localizedDescription)")
+                return .failure
+            }
         }
     }
 }

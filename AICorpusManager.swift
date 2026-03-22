@@ -1624,34 +1624,32 @@ struct RecordingGlowBorder: View {
     }
 }
 
-// MARK: - [✨新增] 独立状态组件：呼吸指示灯 (解决 TextField 狂刷布局的 Bug)
+// MARK: - [✨修复] 状态指示组件：解决因动画强制刷新导致的 TextField 抖动和闪退 Bug
 struct RecordingIndicatorLight: View {
     var isPaused: Bool
-    @State private var pulseStage: CGFloat = 0.0
-    
-    private var indicatorColor: Color { isPaused ? Color.orange : (pulseStage > 0.5 ? Color.red : Color.darkRed) }
-    private var indicatorShadow: Color { isPaused ? .orange : .red }
-    private var indicatorText: String { isPaused ? "PAUSED" : "REC STEP" }
-    private var indicatorOpacity: Double { isPaused ? 1.0 : (0.7 + Double(pulseStage) * 0.3) }
-    private var indicatorBg: Color { isPaused ? Color.orange.opacity(0.8) : Color.red.opacity(0.8) }
+    @State private var isPulsing: Bool = false
     
     var body: some View {
         HStack(spacing: 6) {
             Circle()
-                .fill(indicatorColor)
+                .fill(isPaused ? Color.orange : Color.red)
                 .frame(width: 8, height: 8)
-                .shadow(color: indicatorShadow, radius: pulseStage * 6)
+                .shadow(color: isPaused ? .orange : .red, radius: isPulsing && !isPaused ? 4 : 0)
             
-            Text(indicatorText)
+            Text(isPaused ? "PAUSED" : "REC STEP")
                 .font(.system(size: 10, weight: .black))
                 .foregroundColor(.white)
-                .opacity(indicatorOpacity)
+                .opacity(isPaused ? 1.0 : (isPulsing ? 1.0 : 0.6))
         }
         .padding(.horizontal, 10).padding(.vertical, 4)
-        .background(indicatorBg)
+        .background(isPaused ? Color.orange.opacity(0.8) : Color.red.opacity(0.8))
         .clipShape(Capsule())
+        // ⚠️ 同样加入 fixedSize，阻断重新计算
+        .fixedSize()
         .onAppear {
-            withAnimation(.easeInOut(duration: 0.75).repeatForever(autoreverses: true)) { pulseStage = 1.0 }
+            withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
+                isPulsing = true
+            }
         }
     }
 }

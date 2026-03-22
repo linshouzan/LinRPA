@@ -14,6 +14,7 @@ import Vision
 import ApplicationServices
 import CoreGraphics
 import ScreenCaptureKit
+import Combine
 
 struct ScreenCaptureUtility {
     /// 截取屏幕（支持精准窗口标题过滤，解决多窗口自身干扰问题）
@@ -98,13 +99,25 @@ struct ScreenCaptureUtility {
 class WorkflowEngine {
     var workflows: [Workflow] = [] { didSet { if !isLoading { hasUnsavedChanges = true } } }
     var selectedWorkflowId: UUID? = nil
-    var isRunning = false{ didSet { if !isRunning { currentActionId = nil } } }
+    var isRunning = false { didSet { if !isRunning { currentActionId = nil; workflowExecutionStack.removeAll() } } }
     var currentActionId: UUID? = nil
     var logs: [String] = []
     
-    // [✨全局变量池]
+    // [✨全局变量池] (支持 App 级共享，如 Token 等)
+    var globalVariables: [String: String] {
+        get { UserDefaults.standard.dictionary(forKey: "RPA_GlobalVariables") as? [String: String] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: "RPA_GlobalVariables") }
+    }
+    
+    // 运行时内存变量状态 (沙盒环境)
     var variables: [String: String] = [:]
     var folders: [String] = ["默认文件夹"] { didSet { UserDefaults.standard.set(folders, forKey: "RPA_Folders") } }
+    
+    // [✨稳定性] 运行时调用栈追踪 (Execution Stack)
+    @ObservationIgnored private var workflowExecutionStack: [String] = []
+    
+    // 防崩溃基建：最大允许的子流程嵌套调用深度
+    private let maxCallDepth = 15
     
     var hasAccessibilityPermission: Bool = false
     var hasScreenRecordingPermission: Bool = false
@@ -116,26 +129,24 @@ class WorkflowEngine {
     
     @ObservationIgnored private var globalKeyMonitor: Any?
     @ObservationIgnored private var localKeyMonitor: Any?
-    
     @ObservationIgnored private var windowObservers: [Any] = []
+    
+    // [✨UX提升] 基础 UndoManager 挂载钩子，供外部 SwiftUI 视图绑定
+    @ObservationIgnored var undoManager: UndoManager?
     
     init() {
         isLoading = true; workflows = StorageManager.shared.load(); selectedWorkflowId = workflows.first?.id; isLoading = false
         hasUnsavedChanges = false; checkPermissions(); setupHotkeys()
-        // 初始化时加载文件夹
         if let savedFolders = UserDefaults.standard.stringArray(forKey: "RPA_Folders") {
             self.folders = savedFolders
         }
         if !self.folders.contains("默认文件夹") { self.folders.insert("默认文件夹", at: 0) }
-        
         setupWindowObservers()
     }
     
     deinit {
         if let monitor = globalKeyMonitor { NSEvent.removeMonitor(monitor) }
         if let monitor = localKeyMonitor { NSEvent.removeMonitor(monitor) }
-        
-        // 释放通知监听
         windowObservers.forEach { NotificationCenter.default.removeObserver($0) }
     }
     
@@ -159,7 +170,7 @@ class WorkflowEngine {
             // 🛑 核心修复：精准阻断非主窗体
             guard window.className.contains("AppKitWindow") || window.title == "我的流程" else { return }
             
-            ExecutionToolbarManager.shared.show(engine: self)
+            //ExecutionToolbarManager.shared.show(engine: self)
         }
         
         // 3. 监听主窗口关闭 (触发显示悬浮窗)
@@ -172,10 +183,23 @@ class WorkflowEngine {
             // [✨终极黑魔法] 赶在系统把主窗口释放掉之前，强行阻断销毁流程，让其处于“隐藏”而非“死亡”状态
             window.isReleasedWhenClosed = false
             
+            //ExecutionToolbarManager.shared.show(engine: self)
+        }
+        
+        // 4. [✨新增] 监听主窗口失去焦点/不再是当前激活窗口 (触发显示悬浮窗)
+        let resignKeyObserver = NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: nil, queue: .main) { [weak self] notification in
+            guard let self = self, let window = notification.object as? NSWindow else { return }
+            
+            // 🛑 核心修复：精准阻断非主窗体
+            guard window.className.contains("AppKitWindow") || window.title == "我的流程" else { return }
+            
+            // 💡 体验优化：只有当 RPA 引擎正在执行任务时，失去焦点才自动弹出 HUD 监控面板。
+            // 避免平时用户只是切换到其他软件时，HUD 频繁弹出打扰用户。
+            // (如果您希望任何时候失去焦点都无条件弹出，可以去掉 if 语句，直接保留 ExecutionToolbarManager.shared.show)
             ExecutionToolbarManager.shared.show(engine: self)
         }
         
-        windowObservers = [becomeKeyObserver, minObserver, closeObserver]
+        windowObservers = [becomeKeyObserver, minObserver, closeObserver, resignKeyObserver]
     }
     
     // 【✨新增】文件夹 CRUD 方法
@@ -379,32 +403,136 @@ class WorkflowEngine {
     func updateActionPosition(id: UUID, position: CGPoint) { guard let idx = currentWorkflowIndex else { return }; if let actionIdx = workflows[idx].actions.firstIndex(where: { $0.id == id }) { workflows[idx].actions[actionIdx].positionX = Double(position.x); workflows[idx].actions[actionIdx].positionY = Double(position.y) } }
     func addConnection(source: UUID, sourcePort: PortPosition, target: UUID, targetPort: PortPosition, condition: ConnectionCondition = .always) { guard let idx = currentWorkflowIndex else { return }; let newConn = WorkflowConnection(startNodeID: source, endNodeID: target, startPort: sourcePort, endPort: targetPort, condition: condition); if !workflows[idx].connections.contains(where: { $0.startNodeID == source && $0.endNodeID == target }) { workflows[idx].connections.append(newConn) } }
     
-    // [✨修改] 移除 private，允许外部 Executor 调用
+    // MARK: - [✨自动化] URL Scheme 外部触发调度器
+    /// 允许通过 `linrpa://run?id=xxx&var1=yyy` 触发本地自动化执行
+    @MainActor
+    func handleExternalTrigger(url: URL) {
+        guard url.scheme == "linrpa", url.host == "run" else { return }
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let queryItems = components.queryItems else { return }
+        
+        var targetID: UUID?
+        var externalArgs: [String: String] = [:]
+        
+        for item in queryItems {
+            if item.name == "id", let val = item.value {
+                targetID = UUID(uuidString: val)
+            } else if let val = item.value {
+                externalArgs[item.name] = val
+            }
+        }
+        
+        if let id = targetID {
+            log("🌐 接收到外部 URL Scheme 调用指令，准备执行流程...")
+            Task {
+                // [✨修复] 使用统一的启动壳，确保 isRunning 状态被正确设置
+                await self.startRootWorkflow(id: id, args: externalArgs, skipCountdown: true)
+            }
+        }
+    }
+
+    // MARK: - [✨重构] 变量解析引擎
     func parseVariables(_ input: String) -> String {
         var result = input
-        if result.contains("{{clipboard}}") {
-            let clipText = NSPasteboard.general.string(forType: .string) ?? ""
-            result = result.replacingOccurrences(of: "{{clipboard}}", with: clipText)
-        }
         do {
             let regex = try NSRegularExpression(pattern: "\\{\\{(.*?)\\}\\}")
-            let matches = regex.matches(in: result, range: NSRange(result.startIndex..., in: result))
-            for match in matches.reversed() {
+            var searchRange = NSRange(location: 0, length: result.utf16.count)
+            
+            while let match = regex.firstMatch(in: result, range: searchRange) {
                 if let range = Range(match.range(at: 1), in: result) {
-                    let varName = String(result[range])
-                    if varName != "clipboard" {
-                        let val = variables[varName] ?? ""
-                        result.replaceSubrange(Range(match.range, in: result)!, with: val)
+                    let varName = String(result[range]).trimmingCharacters(in: .whitespaces)
+                    let replacementValue: String
+                    
+                    if varName == "clipboard" || varName == "sys.clipboard" {
+                        replacementValue = NSPasteboard.general.string(forType: .string) ?? ""
+                    } else if varName.hasPrefix("sys.") {
+                        replacementValue = getSystemVariable(varName)
+                    } else if varName.hasPrefix("global.") {
+                        let pureKey = varName.replacingOccurrences(of: "global.", with: "")
+                        replacementValue = globalVariables[pureKey] ?? ""
+                    } else {
+                        replacementValue = variables[varName] ?? ""
+                    }
+                    
+                    if let replaceRange = Range(match.range, in: result) {
+                        result.replaceSubrange(replaceRange, with: replacementValue)
                     }
                 }
+                searchRange = NSRange(location: 0, length: result.utf16.count)
             }
-        } catch { log("❌ 变量解析失败: \(error)") }
+        } catch {
+            log("❌ 变量解析失败: \(error)")
+        }
         return result
+    }
+    
+    // MARK: - [✨终极扩充] 上帝视角的系统内置变量池
+    private func getSystemVariable(_ name: String) -> String {
+        switch name {
+        case "sys.date": return DateFormatter.localizedString(from: Date(), dateStyle: .short, timeStyle: .none)
+        case "sys.time": return DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+        case "sys.timestamp": return "\(Int(Date().timeIntervalSince1970))"
+        case "sys.uuid": return UUID().uuidString
+        case "sys.user": return NSUserName()
+        case "sys.device_name": return Host.current().localizedName ?? "Mac"
+        case "sys.os_version": return ProcessInfo.processInfo.operatingSystemVersionString
+        case "sys.home_dir": return NSHomeDirectory()
+        case "sys.desktop_dir": return NSSearchPathForDirectoriesInDomains(.desktopDirectory, .userDomainMask, true).first ?? NSHomeDirectory() + "/Desktop"
+        case "sys.downloads_dir": return NSSearchPathForDirectoriesInDomains(.downloadsDirectory, .userDomainMask, true).first ?? NSHomeDirectory() + "/Downloads"
+        case "sys.documents_dir": return NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true).first ?? NSHomeDirectory() + "/Documents"
+        case "sys.current_app": return NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
+        case "sys.current_app_bundle": return NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
+        case "sys.screen_width": return "\(Int(NSScreen.main?.frame.width ?? 0))"
+        case "sys.screen_height": return "\(Int(NSScreen.main?.frame.height ?? 0))"
+        case "sys.workflow_name": return workflowExecutionStack.last ?? "Unknown Workflow"
+        default: return ""
+        }
+    }
+    
+    // MARK: - [✨交互体验] 动态入参补全表单
+    @MainActor
+    private func promptForMissingInputs(workflowName: String, missingVars: [RPAVariable]) async -> [String: String]? {
+        return await withCheckedContinuation { continuation in
+            let alert = NSAlert()
+            alert.messageText = "需要提供运行参数"
+            alert.informativeText = "工作流 [\(workflowName)] 缺少必要的入参，请补充后继续执行："
+            alert.alertStyle = .informational
+            
+            alert.addButton(withTitle: "确定并继续")
+            alert.addButton(withTitle: "取消执行")
+            
+            let stackView = NSStackView(); stackView.orientation = .vertical; stackView.alignment = .leading; stackView.spacing = 10
+            var inputFields: [String: NSTextField] = [:]
+            
+            for v in missingVars {
+                let rowStack = NSStackView(); rowStack.orientation = .horizontal; rowStack.alignment = .centerY
+                let label = NSTextField(labelWithString: "\(v.name):")
+                label.frame = NSRect(x: 0, y: 0, width: 100, height: 20)
+                
+                let textField = v.isSecure ? NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 200, height: 24)) : NSTextField(frame: NSRect(x: 0, y: 0, width: 200, height: 24))
+                textField.placeholderString = v.description.isEmpty ? "请输入 \(v.name)" : v.description
+                
+                rowStack.addArrangedSubview(label); rowStack.addArrangedSubview(textField); stackView.addArrangedSubview(rowStack)
+                inputFields[v.name] = textField
+            }
+            
+            stackView.frame = NSRect(x: 0, y: 0, width: 320, height: missingVars.count * 34)
+            alert.accessoryView = stackView
+            NSApp.activate(ignoringOtherApps: true)
+            
+            if alert.runModal() == .alertFirstButtonReturn {
+                var collectedInputs: [String: String] = [:]
+                for (name, field) in inputFields { collectedInputs[name] = field.stringValue }
+                continuation.resume(returning: collectedInputs)
+            } else {
+                continuation.resume(returning: nil)
+            }
+        }
     }
     
     // [✨修改] 支持传入自定义文案的倒计时
     @MainActor
-    func showCountdownHUD(message: String = "按 Cmd+Opt+S 紧急取消") async {
+    func showCountdownHUD(seconds: Int, message: String = "按 Cmd+Opt+S 紧急取消") async {
         let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 260, height: 260), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.level = .floating; panel.backgroundColor = .clear; panel.isOpaque = false; panel.hasShadow = false; panel.center()
         let containerView = NSView(); containerView.wantsLayer = true; containerView.layer?.cornerRadius = 32; containerView.layer?.masksToBounds = true; containerView.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.85).cgColor
@@ -414,7 +542,7 @@ class WorkflowEngine {
         containerView.addSubview(stackView); NSLayoutConstraint.activate([stackView.centerXAnchor.constraint(equalTo: containerView.centerXAnchor), stackView.centerYAnchor.constraint(equalTo: containerView.centerYAnchor)])
         panel.contentView = containerView; panel.orderFront(nil)
         
-        for i in (1...3).reversed() {
+        for i in (1...seconds).reversed() {
             if !isRunning && message == "按 Cmd+Opt+S 紧急取消" { break }
             numberLabel.stringValue = "\(i)"
             try? await Task.sleep(for: .seconds(1))
@@ -422,97 +550,159 @@ class WorkflowEngine {
         panel.close()
     }
     
-    // MARK: - 工作流执行引擎 (支持子流程递归调用)
-    
-    /// 主流程执行入口 (由用户点击 UI 触发)
-    func runCurrentWorkflow() async {
-        guard let idx = currentWorkflowIndex, !isRunning else { return }
-        let workflow = workflows[idx]
-        guard !workflow.actions.isEmpty else { return }
+    // MARK: - 工作流执行引擎 (统一调度与沙盒隔离)
         
-        isRunning = true; logs.removeAll(); variables.removeAll()
-        if !AXIsProcessTrusted() { log("❌ 致命错误：未获得辅助功能权限！"); isRunning = false; return }
-        
-        // [✨修复点4] 修正 HUD 的弹出逻辑
-        await MainActor.run {
-            // 如果允许最小化，则隐藏主窗口
-            if AppSettings.shared.minimizeOnRun {
-                if let mainWindow = NSApp.windows.first(where: { $0.className.contains("AppKitWindow") }) {
-                    mainWindow.miniaturize(nil)
-                }
-            }
-            // 无论是否最小化，监控悬浮面板都必须展示！
-            ExecutionToolbarManager.shared.show(engine: self)
-        }
-        
-        log("⏱️ 准备执行，倒计时 3 秒...")
-        await showCountdownHUD()
-
-        guard isRunning else {
-            // 倒计时期间如果被紧急中止，也要收回工具栏
-            //await MainActor.run { ExecutionToolbarManager.shared.hide() }
+    /// 统一的根工作流启动壳 (UI点击、URL Scheme、系统触发器 均统一调用此方法)
+    func startRootWorkflow(id: UUID, args: [String: String] = [:], skipCountdown: Bool = false) async {
+        guard !isRunning else {
+            log("⚠️ 当前已有流程正在执行，忽略本次触发请求。")
             return
         }
         
-        log("🚀 开始执行工作流: \(workflow.name)")
-        let allTargetIDs = Set(workflow.connections.map { $0.endNodeID })
-        var startNodes = workflow.actions.filter { !allTargetIDs.contains($0.id) }
-        if startNodes.isEmpty { if let firstAction = workflow.actions.first { startNodes = [firstAction]; log("⚠️ 未检测到明确起点，强制从第一节点发起。") } else { isRunning = false; await MainActor.run { ExecutionToolbarManager.shared.hide() }; return; } }
-        
-        var executionQueue: [UUID] = startNodes.map { $0.id }
-        while !executionQueue.isEmpty && isRunning {
-            let actionID = executionQueue.removeFirst()
-            guard let action = workflow.actions.first(where: { $0.id == actionID }) else { continue }
-            
-            // 跳过执行，直接传导连线
-            if action.isDisabled {
-                log("⏭️ 节点被禁用，直接跳过: [\(action.displayTitle)]")
-                let nextConnections = workflow.connections.filter { $0.startNodeID == actionID }
-                for conn in nextConnections { executionQueue.append(conn.endNodeID) }
-                continue
-            }
-            
-            currentActionId = action.id
-            log("▶️ 执行: [\(action.displayTitle)]")
-            
-            let executor = ActionExecutorFactory.getExecutor(for: action.type)
-            let executeResult = await executor.execute(action: action, context: self)
-            
-            try? await Task.sleep(for: .milliseconds(50))
-            
-            let nextConnections = workflow.connections.filter { $0.startNodeID == actionID && ($0.condition == .always || $0.condition == executeResult) }
-            for conn in nextConnections { executionQueue.append(conn.endNodeID) }
-        }
-        if isRunning { log("✅ 所有流程执行完成！") }
-        currentActionId = nil; isRunning = false
-        
-        // [✨修改] 执行结束或中途被中止时，回收悬浮面板
+        // [✨修复] 自动聚焦上下文：确保后台系统触发时，前台 UI 面板能同步切换到目标工作流
+        // 从而能在悬浮窗正确读取并显示正在运行的工作流名称
         await MainActor.run {
-            //ExecutionToolbarManager.shared.hide()
+            if self.selectedWorkflowId != id {
+                self.selectedWorkflowId = id
+            }
         }
+        
+        // 1. 初始化最外层状态 (解决静默终止 Bug 的核心)
+        isRunning = true
+        logs.removeAll()
+        workflowExecutionStack.removeAll()
+        
+        // 2. 将控制权移交给底层引擎调度器
+        _ = await runWorkflow(by: id, args: args, depth: 0, isRootInvocation: true, skipCountdown: skipCountdown)
+        
+        // 3. 执行结束清理现场
+        if isRunning { log("✅ 流程执行完成！") }
+        currentActionId = nil
+        isRunning = false
+    }
+
+    /// 主流程执行入口 (由用户在主界面点击 UI 触发)
+    func runCurrentWorkflow() async {
+        guard let idx = currentWorkflowIndex else { return }
+        await startRootWorkflow(id: workflows[idx].id, args: [:])
     }
     
-    /// 独立工作流执行方法 (供主流程和子流程调度器调用)
-    func runWorkflow(by id: UUID) async -> Bool {
+    /// [✨终极重构] 统一的工作流执行引擎 (支持外部调用、子流程、以及主流程 UI 启动)
+    func runWorkflow(by id: UUID, args: [String: String] = [:], depth: Int = 0, isRootInvocation: Bool = false, skipCountdown: Bool = false) async -> (success: Bool, outputs: [String: String]) {
+        
+        guard depth <= maxCallDepth else {
+            log("🛑 致命错误：工作流嵌套层级超过极限 (\(maxCallDepth)层)，强制熔断！")
+            return (false, [:])
+        }
+        
+        // ... (查找工作流等原有代码保持不变) ...
         guard let workflow = workflows.first(where: { $0.id == id }) else {
             log("❌ 找不到 ID 为 \(id) 的工作流")
-            return false
+            return (false, [:])
+        }
+        guard !workflow.actions.isEmpty else { return (true, [:]) }
+        
+        // ==========================================
+        // 🌟 仅在“主流程/根调用”时触发的 UI 拦截逻辑
+        // ==========================================
+        if isRootInvocation {
+            if !AXIsProcessTrusted() {
+                log("❌ 致命错误：未获得辅助功能权限！")
+                return (false, [:])
+            }
+            
+            await MainActor.run {
+                if AppSettings.shared.minimizeOnRun {
+                    if let mainWindow = NSApp.windows.first(where: { $0.className.contains("AppKitWindow") }) {
+                        mainWindow.miniaturize(nil)
+                    }
+                }
+                ExecutionToolbarManager.shared.show(engine: self)
+            }
+            
+            // [✨修复] 接入 skipCountdown 标识。如果是自动化触发，强行重置为 0 秒
+            let countdown = skipCountdown ? 0 : AppSettings.shared.countdownSeconds
+            if countdown > 0 {
+                log("⏱️ 准备执行，倒计时 \(countdown) 秒...")
+                await showCountdownHUD(seconds: countdown)
+            }
+            
+            guard isRunning else { return (false, [:]) }
+            log("🚀 开始执行主工作流: \(workflow.name)")
+        }
+        // ==========================================
+        
+        let depthIndicator = String(repeating: "-", count: depth)
+        if !isRootInvocation {
+            log("📦 \(depthIndicator)> 进入子流程: [\(workflow.name)] (层级: \(depth))")
         }
         
-        guard !workflow.actions.isEmpty else {
-            log("⚠️ 工作流 [\(workflow.name)] 是空的，跳过。")
-            return true
+        workflowExecutionStack.append(workflow.name)
+        
+        let parentVariablesSnapshot = self.variables
+        var childContext: [String: String] = [:]
+        var missingRequiredVars: [RPAVariable] = []
+        
+        // 动态扫描与参数初始化
+        for v in workflow.variables {
+            let parsedDefault = parseVariables(v.defaultValue)
+            let finalValue = args[v.name] ?? parsedDefault
+            
+            if v.isInput && v.isRequired && finalValue.trimmingCharacters(in: .whitespaces).isEmpty {
+                missingRequiredVars.append(v)
+            } else {
+                childContext[v.name] = finalValue
+            }
         }
         
-        log("🚀 开始执行工作流: [\(workflow.name)]")
+        // 触发动态补全弹窗 (主流程和子流程通用)
+        if !missingRequiredVars.isEmpty {
+            log("⚠️ 检测到流程缺少 \(missingRequiredVars.count) 个必填参数，挂起流程等待用户输入...")
+            if let userProvidedInputs = await promptForMissingInputs(workflowName: workflow.name, missingVars: missingRequiredVars) {
+                for (k, v) in userProvidedInputs { childContext[k] = v }
+                log("✅ 用户已补全必填参数，流程恢复执行。")
+            } else {
+                log("❌ 用户取消了参数录入，执行中止。")
+                _ = workflowExecutionStack.popLast()
+                return (false, [:])
+            }
+        }
+        
+        self.variables = childContext
+        
+        // 核心节点执行
+        let executeSuccess = await executeNodes(workflow: workflow)
+        
+        // [✨稳定性] 全局异常捕获与兜底触发 (主子流程完美共用)
+        if !executeSuccess && isRunning {
+            if let fallbackID = workflow.onErrorWorkflowID {
+                let prefix = isRootInvocation ? "主流程" : "子流程"
+                log("⚠️ \(prefix) [\(workflow.name)] 执行异常，触发专属兜底流程...")
+                _ = await runWorkflow(by: fallbackID, args: ["error_source": workflow.name], depth: depth + 1, isRootInvocation: false)
+            }
+        }
+        
+        // 出参提取与现场恢复
+        var outputs: [String: String] = [:]
+        for v in workflow.variables where v.isOutput { outputs[v.name] = self.variables[v.name] ?? "" }
+        
+        self.variables = parentVariablesSnapshot
+        _ = workflowExecutionStack.popLast()
+        
+        if !isRootInvocation {
+            log("📤 \(depthIndicator)< 离开子流程 [\(workflow.name)]，返回 \(outputs.count) 个出参。")
+        }
+        
+        return (executeSuccess, outputs)
+    }
+    
+    /// 将具体的图遍历执行逻辑抽取为私有方法
+    private func executeNodes(workflow: Workflow) async -> Bool {
         let allTargetIDs = Set(workflow.connections.map { $0.endNodeID })
         var startNodes = workflow.actions.filter { !allTargetIDs.contains($0.id) }
         
         if startNodes.isEmpty {
-            if let firstAction = workflow.actions.first {
-                startNodes = [firstAction]
-                log("⚠️ 未检测到明确起点，强制从第一节点发起。")
-            } else { return false }
+            if let firstAction = workflow.actions.first { startNodes = [firstAction] } else { return false }
         }
         
         var executionQueue: [UUID] = startNodes.map { $0.id }
@@ -521,9 +711,8 @@ class WorkflowEngine {
             let actionID = executionQueue.removeFirst()
             guard let action = workflow.actions.first(where: { $0.id == actionID }) else { continue }
             
-            // [✨修改] 子流程同样需要支持节点禁用跳过
             if action.isDisabled {
-                log("⏭️ 节点被禁用，直接跳过: [\(action.displayTitle)]")
+                log("⏭️ 节点被禁用，跳过: [\(action.displayTitle)]")
                 let nextConnections = workflow.connections.filter { $0.startNodeID == actionID }
                 for conn in nextConnections { executionQueue.append(conn.endNodeID) }
                 continue
@@ -537,9 +726,12 @@ class WorkflowEngine {
             
             try? await Task.sleep(for: .milliseconds(50))
             
-            let nextConnections = workflow.connections.filter {
-                $0.startNodeID == actionID && ($0.condition == .always || $0.condition == executeResult)
+            // 如果遇到 failure，则阻断后续执行，抛出失败给调度层
+            if executeResult == .failure {
+                return false
             }
+            
+            let nextConnections = workflow.connections.filter { $0.startNodeID == actionID && ($0.condition == .always || $0.condition == executeResult) }
             for conn in nextConnections { executionQueue.append(conn.endNodeID) }
         }
         return isRunning
@@ -883,7 +1075,7 @@ class WorkflowEngine {
             try? await Task.sleep(for: .milliseconds(500))
             
         } else if browser == "Safari" || browser == "Google Chrome" {
-            // [✨修改] 支持通用外部浏览器的唤醒机制
+            // 支持通用外部浏览器的唤醒机制
             let bundleId = browser == "Safari" ? "com.apple.Safari" : "com.google.Chrome"
             if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) {
                 let config = NSWorkspace.OpenConfiguration()
@@ -960,7 +1152,18 @@ class ExecutionToolbarManager {
     private var panel: NSPanel?
     private var cachedMainWindow: NSWindow?
     
+    // 定时器，用于追踪第三方窗口的物理坐标
+    private var trackingTimer: Timer?
+    
     func show(engine: WorkflowEngine) {
+        // 检查全局设置，如果用户选择了隐蔽模式，则阻断经典悬浮窗的展示
+        if AppSettings.shared.hudStyle == .stealth {
+            // 确保如果之前开了经典面板，这里把它关掉
+            self.hide()
+            // 依靠菜单栏静默提供控制，不展示任何屏幕内 UI，绝对防打扰！
+            return
+        }
+        
         if cachedMainWindow == nil {
             if let mw = NSApp.windows.first(where: { !($0 is NSPanel) && String(describing: type(of: $0)).contains("Window") }) {
                 mw.isReleasedWhenClosed = false
@@ -968,6 +1171,8 @@ class ExecutionToolbarManager {
             }
         }
         
+        let isStealth = AppSettings.shared.hudStyle == .stealth
+
         if panel == nil {
             let p = NSPanel(
                 contentRect: NSRect(x: 0, y: 0, width: 126, height: 52), // 默认收缩尺寸
@@ -994,7 +1199,7 @@ class ExecutionToolbarManager {
     
     func hide() { panel?.orderOut(nil) }
     
-    // [✨协程重构] 精简的两段式动画执行器，锚定物理右上角
+    // 精简的两段式动画执行器，锚定物理右上角
     func updatePanelSizeAsync(to size: CGSize, duration: TimeInterval = 0.15) async {
         guard let panel = panel else { return }
         await withCheckedContinuation { continuation in
@@ -1051,7 +1256,7 @@ struct ExecutionToolbarView: View {
         .background(VisualEffectBackground().clipShape(RoundedRectangle(cornerRadius: 16)))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.white.opacity(0.15), lineWidth: 1))
         .onChange(of: engine.isRunning) { _, isRunning in
-            if isRunning && !isExpanded { toggleExpansion(targetExpanded: true) }
+            //if isRunning && !isExpanded { toggleExpansion(targetExpanded: true) }
         }
     }
     
@@ -1089,7 +1294,7 @@ struct ExecutionToolbarView: View {
                 let wfName = engine.currentWorkflowIndex != nil ? engine.workflows[engine.currentWorkflowIndex!].name : "工作流执行监控"
                 Text(wfName).font(.system(size: 13, weight: .bold)).foregroundColor(.primary.opacity(0.8)).lineLimit(1).transition(.opacity)
                 
-                // [✨修改] 更多菜单接入真实窗口路由
+                // 更多菜单接入真实窗口路由
                 Menu {
                     Button {
                         engine.log("🌐 唤起内置浏览器")
@@ -1098,13 +1303,11 @@ struct ExecutionToolbarView: View {
                     
                     Button {
                         engine.log("📚 唤起语料库")
-                        // TODO: 替换为你实际的语料库窗体调度器
                         openWindow(id: "corpus-manager")
                     } label: { Label("语料库管理", systemImage: "text.book.closed") }
                     
                     Button {
                         engine.log("🤖 唤起 WebAgent")
-                        // TODO: 替换为你实际的 WebAgent 窗体调度器
                         openWindow(id: "agentMonitor")
                     } label: { Label("WebAgent 监控", systemImage: "network") }
                 } label: {
@@ -1127,6 +1330,7 @@ struct ExecutionToolbarView: View {
                 }) {
                     HStack(spacing: 4) {
                         Image(systemName: engine.isRunning ? "stop.circle.fill" : "play.circle.fill")
+                            .symbolEffect(.pulse, options: .repeating, isActive: engine.isRunning)
                         if showContent { Text(engine.isRunning ? "终止" : "运行").transition(.opacity) }
                     }
                     .font(.system(size: 12, weight: .bold))
@@ -1135,6 +1339,7 @@ struct ExecutionToolbarView: View {
                     .padding(.vertical, 4)
                     .background(engine.isRunning ? Color.red.opacity(0.8) : Color.green.opacity(0.8))
                     .cornerRadius(12)
+                    .shadow(color: engine.isRunning ? Color.red.opacity(0.5) : Color.clear, radius: engine.isRunning ? 4 : 0)
                 }
                 
                 // 展开/收缩
@@ -1206,13 +1411,449 @@ struct VisualEffectBackground: NSViewRepresentable {
     func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
 
+// MARK: - [✨修复] 彻底解决由于动画高频触发重绘导致 TextField 崩溃的 Bug
 struct ExecutionBreatheLight: View {
     var isRunning: Bool
-    @State private var breathePhase: CGFloat = 0.0
+    // 弃用高频修改浮点数的 @State 方式，改用 Bool 结合原生的 repeatForever 动画引擎
+    @State private var isBreathing: Bool = false
+    
     var body: some View {
-        Circle().fill(Color.green).frame(width: 10, height: 10)
-            .opacity(isRunning ? (0.4 + breathePhase * 0.6) : 0.2)
-            .shadow(color: .green, radius: isRunning ? (2 + breathePhase * 3) : 0)
-            .onAppear { withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) { breathePhase = 1.0 } }
+        Circle()
+            .fill(Color.green)
+            .frame(width: 10, height: 10)
+            .opacity(isRunning ? (isBreathing ? 1.0 : 0.3) : 0.2)
+            // 加入 fixedSize 彻底阻断因动画导致的外层父视图及兄弟节点(如TextField)重新计算布局
+            .fixedSize()
+            .onAppear {
+                if isRunning { startBreathing() }
+            }
+            .onChange(of: isRunning) { _, running in
+                if running {
+                    startBreathing()
+                } else {
+                    withAnimation { isBreathing = false }
+                }
+            }
     }
+    
+    private func startBreathing() {
+        withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
+            isBreathing = true
+        }
+    }
+}
+
+// MARK: - [✨新增] macOS 系统事件监听与调度中心
+class SystemTriggerManager {
+    static let shared = SystemTriggerManager()
+    private var engine: WorkflowEngine?
+    private var observers: [Any] = []
+    
+    func setup(engine: WorkflowEngine) {
+        self.engine = engine
+        startObserving()
+    }
+    
+    private func startObserving() {
+        observers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
+        DistributedNotificationCenter.default().removeObserver(self)
+        observers.removeAll()
+        
+        let nc = NSWorkspace.shared.notificationCenter
+        
+        // 1. 监听应用启动
+        observers.append(nc.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] notif in
+            guard let app = notif.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  let bundleId = app.bundleIdentifier else { return }
+            self?.checkTriggers(for: .appLaunched, appBundleId: bundleId)
+        })
+        
+        // 2. 监听应用退出
+        observers.append(nc.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] notif in
+            guard let app = notif.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  let bundleId = app.bundleIdentifier else { return }
+            self?.checkTriggers(for: .appTerminated, appBundleId: bundleId)
+        })
+        
+        // 3. 监听系统唤醒
+        observers.append(nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.checkTriggers(for: .systemWake)
+        })
+        
+        // 4. 监听屏幕解锁
+        DistributedNotificationCenter.default().addObserver(forName: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in
+            self?.checkTriggers(for: .screenUnlocked)
+        }
+    }
+    
+    private func checkTriggers(for eventType: TriggerEventType, appBundleId: String? = nil) {
+        // 筛选开启且类型匹配的触发器
+        let activeTriggers = AppSettings.shared.systemTriggers.filter { $0.isEnabled && $0.eventType == eventType }
+        
+        for trigger in activeTriggers {
+            if eventType == .appLaunched || eventType == .appTerminated {
+                // 如果用户填写了特定应用包名，且不匹配，则跳过
+                if !trigger.targetAppBundleId.isEmpty && trigger.targetAppBundleId != appBundleId {
+                    continue
+                }
+            }
+            
+            guard let workflowId = trigger.workflowId else { continue }
+            
+            // [✨修复] 发起自动化调用，使用 startRootWorkflow
+            Task {
+                await self.engine?.startRootWorkflow(
+                    id: workflowId,
+                    args: [
+                        "sys_trigger_event": eventType.rawValue,
+                        "sys_trigger_app": appBundleId ?? ""
+                    ],
+                    skipCountdown: true
+                )
+            }
+        }
+    }
+}
+
+
+//////////////////////////////////////////////////////////////////
+// 功能说明：AI 思考悬浮窗
+//////////////////////////////////////////////////////////////////
+
+// MARK: - [✨新增] 自定义允许输入的幽灵面板
+// 默认的 nonactivatingPanel 是不接受键盘输入的，我们需要重写这两个属性
+class HUDPanel: NSPanel {
+    override var canBecomeKey: Bool { return true }
+    override var canBecomeMain: Bool { return true }
+}
+
+// MARK: - [✨新增] 对话消息模型
+struct HUDMessage: Identifiable, Equatable {
+    let id = UUID()
+    let isUser: Bool
+    var content: String
+}
+
+// MARK: - 全局科技感悬浮窗管理器 (HUD)
+@MainActor
+class AIThoughtHUDManager: ObservableObject {
+    static let shared = AIThoughtHUDManager()
+    
+    private var panel: HUDPanel?
+    private var hideTask: Task<Void, Never>?
+    
+    @Published var title: String = "系统通知"
+    @Published var messages: [HUDMessage] = []
+    
+    // 对话交互状态
+    @Published var inputText: String = ""
+    @Published var isInteractive: Bool = false
+    @Published var isThinking: Bool = false
+    @Published var isVisible: Bool = false
+    
+    private var systemPrompt: String = ""
+    private var chatContinuation: CheckedContinuation<String, Never>?
+    
+    /// 模式 A：单向系统通知模式 (自动隐藏，无输入框)
+    func showNotification(title: String = "系统通知", content: String = "", autoHideDelay: TimeInterval? = nil) {
+        hideTask?.cancel()
+        self.title = title
+        self.messages = [HUDMessage(isUser: false, content: content)]
+        self.isInteractive = false
+        self.isVisible = true
+        
+        setupPanel()
+        panel?.ignoresMouseEvents = true // 单向通知鼠标完全穿透
+        panel?.orderFrontRegardless()
+        
+        if let delay = autoHideDelay {
+            hideTask = Task {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                if !Task.isCancelled { self.hide() }
+            }
+        }
+    }
+    
+    /// 模式 B：交互式对话模式 (需手动关闭，支持输入和多轮流式对话)
+    func showInteractiveChat(title: String, systemPrompt: String, initialInput: String) async -> String {
+        hideTask?.cancel()
+        self.title = title
+        self.systemPrompt = systemPrompt
+        self.messages = []
+        self.inputText = initialInput
+        self.isInteractive = true
+        self.isThinking = false
+        self.isVisible = true
+        
+        setupPanel()
+        panel?.ignoresMouseEvents = false // 允许鼠标点击交互
+        panel?.makeKeyAndOrderFront(nil)  // 强制接收焦点以允许键盘输入
+        
+        return await withCheckedContinuation { continuation in
+            self.chatContinuation = continuation
+            
+            // 如果 RPA 节点传递了初始提示词，立刻自动发送发起第一轮对话
+//            if !initialInput.isEmpty {
+//                self.inputText = initialInput
+//                self.sendMessage()
+//            }
+        }
+    }
+    
+    private func setupPanel() {
+        if panel == nil {
+            let p = HUDPanel(
+                contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+                styleMask: [.borderless, .nonactivatingPanel],
+                backing: .buffered,
+                defer: false
+            )
+            p.level = .floating
+            p.backgroundColor = .clear
+            p.isOpaque = false
+            p.hasShadow = true
+            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+            
+            p.contentView = NSHostingView(rootView: AIThoughtHUDView(manager: self))
+            self.panel = p
+        }
+        
+        if let screen = NSScreen.main {
+            let screenRect = screen.visibleFrame
+            let x = screenRect.midX - 300
+            let y = screenRect.midY - (isInteractive ? 200 : 110)
+            panel?.setFrameOrigin(NSPoint(x: x, y: y))
+        }
+        
+        panel?.alphaValue = 0.0
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.3
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel?.animator().alphaValue = 1.0
+        }
+    }
+    
+    // MARK: - 发送消息与大模型流式请求
+    func sendMessage() {
+        guard !inputText.isEmpty && !isThinking else { return }
+        let text = inputText
+        inputText = ""
+        messages.append(HUDMessage(isUser: true, content: text))
+        
+        isThinking = true
+        messages.append(HUDMessage(isUser: false, content: ""))
+        let aiIndex = messages.count - 1
+        
+        Task {
+            // 构建上下文历史
+            var historyStr = ""
+            if !systemPrompt.isEmpty {
+                historyStr += "【系统设定/约束】\\n\\(systemPrompt)\\n\\n"
+            }
+            for msg in messages.dropLast() { // 排除刚刚添加的空 AI 气泡
+                historyStr += (msg.isUser ? "【用户】\\n" : "【AI】\\n") + msg.content + "\\n\\n"
+            }
+            
+            let message = LLMMessage(role: .user, text: historyStr.trimmingCharacters(in: .whitespacesAndNewlines))
+            
+            do {
+                let stream = LLMService.shared.stream(messages: [message])
+                for try await chunk in stream {
+                    await MainActor.run {
+                        self.messages[aiIndex].content += chunk
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    self.messages[aiIndex].content += "\\n[请求异常: \\(error.localizedDescription)]"
+                }
+            }
+            
+            await MainActor.run {
+                self.isThinking = false
+            }
+        }
+    }
+    
+    // 手动关闭面板并恢复 RPA 流程
+    func closeChat() {
+        // 将最后一轮 AI 的回答提取出来，交还给 RPA 引擎变量
+        let lastAI = messages.last(where: { !$0.isUser })?.content ?? ""
+        chatContinuation?.resume(returning: lastAI)
+        chatContinuation = nil
+        hide()
+    }
+    
+    func hide() {
+        hideTask?.cancel()
+        self.isVisible = false
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.4
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            panel?.animator().alphaValue = 0.0
+        }, completionHandler: {
+            self.panel?.orderOut(nil)
+        })
+    }
+}
+
+// MARK: - 悬浮窗 SwiftUI 视图
+struct AIThoughtHUDView: View {
+    @ObservedObject var manager: AIThoughtHUDManager
+    @FocusState private var isInputFocused: Bool
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // 顶部 Header
+            HStack {
+                Image(systemName: "sparkles")
+                    .foregroundColor(.purple)
+                    .symbolEffect(.variableColor.iterative, options: .repeating)
+                
+                Text(manager.title)
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(.primary)
+                    .opacity(0.8)
+                
+                Spacer()
+                
+                // 仅在交互模式下显示关闭按钮
+                if manager.isInteractive {
+                    Button(action: { manager.closeChat() }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.title2)
+                            .foregroundColor(.gray.opacity(0.6))
+                    }
+                    .buttonStyle(.plain)
+                    .help("结束对话并继续自动化流程")
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 20)
+            .padding(.bottom, 12)
+            
+            Divider()
+            
+            // 对话记录列表
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: manager.isInteractive) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        ForEach(manager.messages) { msg in
+                            ChatBubble(message: msg)
+                        }
+                        Color.clear.frame(height: 1).id("Bottom")
+                    }
+                    .padding(20)
+                }
+                .onChange(of: manager.messages.last?.content) { _ in
+                    withAnimation(.easeOut(duration: 0.1)) { proxy.scrollTo("Bottom", anchor: .bottom) }
+                }
+                .onChange(of: manager.messages.count) { _ in
+                    withAnimation(.easeOut(duration: 0.1)) { proxy.scrollTo("Bottom", anchor: .bottom) }
+                }
+            }
+            .frame(maxHeight: manager.isInteractive ? 400 : 200)
+            
+            // 底部输入框 (仅在交互模式开启)
+            if manager.isInteractive {
+                Divider()
+                HStack(spacing: 12) {
+                    TextField("输入提示词，按回车发送...", text: $manager.inputText)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 14))
+                        .focused($isInputFocused)
+                        .onSubmit { manager.sendMessage() }
+                        .disabled(manager.isThinking)
+                    
+                    Button(action: { manager.sendMessage() }) {
+                        Image(systemName: manager.isThinking ? "ellipsis" : "paperplane.fill")
+                            .font(.system(size: 18))
+                            .foregroundColor(manager.isThinking ? .gray : .purple)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(manager.inputText.isEmpty || manager.isThinking)
+                }
+                .padding(14)
+                .background(Color.black.opacity(0.1))
+                .cornerRadius(10)
+                .padding(14)
+            }
+        }
+        .background(VisualEffectView().clipShape(RoundedRectangle(cornerRadius: 16)))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.purple.opacity(0.3), lineWidth: 1))
+        .shadow(color: .purple.opacity(0.15), radius: 20, y: 10)
+        .onAppear {
+            if manager.isInteractive {
+                // 延迟极短时间确保窗口完成构建后获取焦点
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    isInputFocused = true
+                }
+            }
+        }
+    }
+}
+
+// MARK: - 气泡视图 (支持 Markdown 自动渲染和选中复制)
+struct ChatBubble: View {
+    let message: HUDMessage
+    
+    var body: some View {
+        HStack {
+            if message.isUser { Spacer(minLength: 40) }
+            
+            // 🔪 核心：使用 .init 语法让 SwiftUI 自动解析内部的 Markdown 标记，同时赋予 selectable
+            Text(.init(message.content))
+                .font(.system(size: 14, weight: .regular))
+                .foregroundColor(message.isUser ? .white : .primary.opacity(0.9))
+                .lineSpacing(4)
+                .padding(12)
+                .background(message.isUser ? Color.purple.opacity(0.8) : Color.black.opacity(0.15))
+                .cornerRadius(12)
+                .textSelection(.enabled) // 允许鼠标选中和复制！
+            
+            if !message.isUser { Spacer(minLength: 40) }
+        }
+    }
+}
+
+// MARK: - 核心性能武器：全局 Markdown 渲染池
+class MarkdownRenderCache {
+    static let shared = MarkdownRenderCache()
+    private var cache: [Int: AttributedString] = [:]
+    private let lock = NSLock()
+    
+    func get(from text: String) -> AttributedString {
+        let hash = text.hashValue
+        lock.lock()
+        if let cached = cache[hash] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+        
+        let processedText = text.replacingOccurrences(of: "\n", with: "  \n")
+        var options = AttributedString.MarkdownParsingOptions()
+        options.interpretedSyntax = .full
+        let result = (try? AttributedString(markdown: processedText, options: options)) ?? AttributedString(text)
+        
+        lock.lock()
+        if cache.count > 500 { cache.removeAll() }
+        cache[hash] = result
+        lock.unlock()
+        
+        return result
+    }
+}
+
+// 辅助组件：磨砂玻璃桥接
+struct VisualEffectView: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.blendingMode = .behindWindow // 采集屏幕背景
+        view.material = .hudWindow       // 专用的 HUD 材质
+        view.state = .active             // 保持激活状态的模糊效果
+        return view
+    }
+    
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }

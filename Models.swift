@@ -1,7 +1,7 @@
 //////////////////////////////////////////////////////////////////
 // 文件名：Models.swift
 // 文件说明：这是适用于 macos 14+ 的RPA数据模型与存储层
-// 功能说明：包含 Web Agent 3.0 的数据结构与枚举定义
+// 功能说明：包含 Web Agent 3.0 的数据结构与枚举定义，已升级企业级变量体系与调度钩子
 // 代码要求：保留了所有的极客级小组件和底层原生 UI 元素拾取防死锁逻辑。
 //////////////////////////////////////////////////////////////////
 
@@ -10,6 +10,53 @@ import Combine
 import Foundation
 import AppKit
 import CryptoKit
+
+// MARK: - [✨新增] 系统事件触发器模型
+enum TriggerEventType: String, Codable, CaseIterable {
+    case appLaunched = "打开特定应用"
+    case appTerminated = "关闭特定应用"
+    case systemWake = "系统唤醒"
+    case screenUnlocked = "屏幕解锁"
+}
+
+struct SystemTrigger: Identifiable, Codable {
+    var id = UUID()
+    var eventType: TriggerEventType = .appLaunched
+    var targetAppBundleId: String = "" // 例如: com.apple.Safari
+    var workflowId: UUID? = nil
+    var isEnabled: Bool = true
+}
+
+// MARK: - [✨新增] RPA 变量类型与模型 (企业级沙盒)
+enum VariableType: String, Codable, CaseIterable {
+    case string = "文本"
+    case number = "数字"
+    case boolean = "布尔"
+    case json = "JSON"
+    case array = "数组"
+}
+
+struct RPAVariable: Identifiable, Codable, Hashable {
+    var id = UUID()
+    var name: String
+    var type: VariableType = .string
+    var defaultValue: String = ""
+    var description: String = ""
+    
+    // I/O 边界定义
+    var isInput: Bool = false      // 是否作为入参（允许外部传入）
+    var isRequired: Bool = false   // 作为入参时，是否必填
+    var isOutput: Bool = false     // 是否作为出参（执行结束后返回给调用方）
+    
+    // 安全与隐私控制
+    var isSecure: Bool = false     // 是否为敏感数据（密码、Token）。UI上掩码显示，导出时清空值
+}
+
+// [✨新增] HUD 样式枚举
+enum HUDStyle: String, CaseIterable {
+    case classic = "经典监控面板"
+    case stealth = "极简隐蔽模式"
+}
 
 // MARK: - 动作分类与定义
 enum ActionCategory: String, CaseIterable, Codable {
@@ -135,8 +182,10 @@ struct RPAAction: Identifiable, Codable, Equatable, Hashable {
     var offsetX: Double = 0.0
     var offsetY: Double = 0.0
     var sampleImageBase64: String = ""
-    // [✨新增] 节点是否被禁用（运行时跳过）
     var isDisabled: Bool = false
+    
+    // [✨UX交互提升] 允许UI上将多个节点划分为一个组 (Group Box)
+    var groupId: UUID? = nil
     
     var displayTitle: String {
         if !customName.isEmpty { return customName }
@@ -198,12 +247,12 @@ struct RPAAction: Identifiable, Codable, Equatable, Hashable {
             let varName = parts.count > 5 ? parts[5] : "ocr_data"
             let fmt = parts.count > 2 ? (parts[2] == "json" ? "JSON" : "纯文本") : "数据"
             return "提取屏幕全文 -> [\(fmt)] {{\(varName)}}"
-        case .runWebJS: // [✨新增]
+        case .runWebJS:
             let parts = parameter.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
             let browser = parts.count > 0 ? parts[0] : "浏览器"
             let targetVar = parts.count > 1 ? parts[1] : ""
             return "网页 JS: \(browser) -> \(targetVar.isEmpty ? "无返回" : "{{\(targetVar)}}")"
-        case .aiChat: // [✨新增] AI对话展示标题
+        case .aiChat:
             let parts = parameter.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
             let targetVar = parts.count > 1 ? parts[1] : "ai_result"
             return "AI 思考对话 -> {{\(targetVar)}}"
@@ -219,31 +268,37 @@ struct Workflow: Identifiable, Codable, Hashable {
     var actions: [RPAAction]
     var connections: [WorkflowConnection]
     
-    // 手动映射字段
+    var variables: [RPAVariable] // 流程专属变量池
+    
+    // [✨稳定性与自动化提升]
+    var onErrorWorkflowID: UUID? // 失败兜底钩子
+    var cronExpression: String?  // 定时任务调度器
+    var triggerURLPath: String?  // URL Scheme 外部触发标识
+    
     enum CodingKeys: String, CodingKey {
-        case id, name, folderName, actions, connections
+        case id, name, folderName, actions, connections, variables, onErrorWorkflowID, cronExpression, triggerURLPath
     }
     
-    // 默认初始化
-    init(id: UUID = UUID(), name: String, folderName: String = "默认文件夹", actions: [RPAAction] = [], connections: [WorkflowConnection] = []) {
+    init(id: UUID = UUID(), name: String, folderName: String = "默认文件夹", actions: [RPAAction] = [], connections: [WorkflowConnection] = [], variables: [RPAVariable] = []) {
         self.id = id
         self.name = name
         self.folderName = folderName
         self.actions = actions
         self.connections = connections
+        self.variables = variables
     }
     
-    // 【✨核心修复】兼容旧版本 JSON 数据的解码器
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
         self.name = try container.decodeIfPresent(String.self, forKey: .name) ?? "未命名流程"
-        
-        // 如果旧 JSON 里没有 folderName 字段，自动赋值为 "默认文件夹" 而不是崩溃
         self.folderName = try container.decodeIfPresent(String.self, forKey: .folderName) ?? "默认文件夹"
-        
         self.actions = try container.decodeIfPresent([RPAAction].self, forKey: .actions) ?? []
         self.connections = try container.decodeIfPresent([WorkflowConnection].self, forKey: .connections) ?? []
+        self.variables = try container.decodeIfPresent([RPAVariable].self, forKey: .variables) ?? []
+        self.onErrorWorkflowID = try container.decodeIfPresent(UUID.self, forKey: .onErrorWorkflowID)
+        self.cronExpression = try container.decodeIfPresent(String.self, forKey: .cronExpression)
+        self.triggerURLPath = try container.decodeIfPresent(String.self, forKey: .triggerURLPath)
     }
 }
 
@@ -267,14 +322,34 @@ class StorageManager {
 class AppSettings: ObservableObject {
     static let shared = AppSettings()
     
+    @AppStorage("hudStyle") var hudStyle: HUDStyle = .classic
+    
     // [✨新增] WebAgent 最大思考与动作执行轮数限制
     @AppStorage("webAgent_max_rounds") var webAgentMaxRounds: Int = 10
     
     // 运行偏好 (默认运行时不最小化窗口)
     @AppStorage("minimize_on_run") var minimizeOnRun: Bool = false
     
+    // 运行前的倒计时秒数 (默认 3 秒)
+    @AppStorage("countdownSeconds") var countdownSeconds: Int = 3
+    
+    // [✨新增] 持久化触发器数据
+    @AppStorage("systemTriggersData") private var systemTriggersData: Data = Data()
+    
+    var systemTriggers: [SystemTrigger] {
+        get {
+            if let decoded = try? JSONDecoder().decode([SystemTrigger].self, from: systemTriggersData) { return decoded }
+            return []
+        }
+        set {
+            if let encoded = try? JSONEncoder().encode(newValue) { systemTriggersData = encoded }
+        }
+    }
+    
     // WebAgent的AI提示词
-    @AppStorage("webAgentPrompt") var webAgentPrompt: String = """
+    @AppStorage("webAgentPrompt") var webAgentPrompt: String = AppSettings.defaultWebAgentPrompt
+    
+    static let defaultWebAgentPrompt = """
     你是一个高效的网页自动化助手。请结合【截图】与【可见元素列表】，决定下一步动作。
     注意：截图中可交互元素已被打上红色数字方框，请通过图片找到正确元素，并参考DOM列表提取目标ID。
 

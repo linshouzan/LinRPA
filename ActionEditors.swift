@@ -15,6 +15,8 @@ struct ActionSettingsPopoverView: View {
     @Binding var action: RPAAction
     @Binding var showSettings: Bool
     
+    var engine: WorkflowEngine
+    
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -31,6 +33,7 @@ struct ActionSettingsPopoverView: View {
     
     @ViewBuilder private func actionParameterView() -> some View {
         switch action.type {
+        case .callWorkflow:     CallWorkflowEditor(action: $action, allWorkflows: engine.workflows)
         case .openURL:          OpenURLEditor(action: $action)
         case .openApp:          OpenAppEditor(action: $action)
         case .webAgent:         WebAgentEditor(action: $action)
@@ -45,7 +48,6 @@ struct ActionSettingsPopoverView: View {
         case .typeText:         TypeTextEditor(action: $action)
         case .wait:             WaitEditor(action: $action)
         case .askUserInput:     AskUserInputEditor(action: $action)
-        case .callWorkflow:     CallWorkflowEditor(action: $action)
         case .fileOperation:    FileOperationEditor(action: $action)
         case .dataExtraction:   DataExtractionEditor(action: $action)
         case .windowOperation:  WindowOperationEditor(action: $action)
@@ -363,37 +365,111 @@ struct RunScriptEditor: View {
     }
 }
 
-// MARK: - [逻辑与数据] 子工作流调用编辑器
-/// 提供从系统中读取可用工作流并防止死循环的调用机制
+// MARK: - [✨修复] 动态映射子工作流编辑器
 struct CallWorkflowEditor: View {
     @Binding var action: RPAAction
+    let allWorkflows: [Workflow]
+    
+    @State private var selectedTargetID: UUID?
+    @State private var parameterMapping: [String: String] = [:]
+    
+    private var targetWorkflow: Workflow? {
+        allWorkflows.first(where: { $0.id == selectedTargetID })
+    }
+    
+    private var targetInputs: [RPAVariable] {
+        targetWorkflow?.variables.filter { $0.isInput } ?? []
+    }
     
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("选择要执行的子工作流：").font(.caption)
-            
-            let allWorkflows = StorageManager.shared.load()
-            
-            // 【✨核心修复 1】通过当前 action 的 ID 反查它属于哪个工作流，从而拿到“当前工作流 ID”
-            let currentWorkflowId = allWorkflows.first(where: { wf in
-                wf.actions.contains(where: { $0.id == action.id })
-            })?.id.uuidString ?? ""
-            
-            // 使用原生的 Picker 绑定
-            Picker("", selection: $action.parameter) {
-                Text("请选择...").tag("")
-                
+        VStack(alignment: .leading, spacing: 16) {
+            Picker("目标子流程:", selection: $selectedTargetID) {
+                Text("请选择要调用的工作流...").tag(UUID?.none)
                 ForEach(allWorkflows) { wf in
-                    // 【✨核心修复 2】只排除“当前工作流”自己，彻底杜绝死循环，且不会导致选中后变空白
-                    if wf.id.uuidString != currentWorkflowId {
-                        Text(wf.name).tag(wf.id.uuidString)
-                    }
+                    Text(wf.name).tag(UUID?.some(wf.id))
                 }
             }
-            .labelsHidden()
+            .onChange(of: selectedTargetID) { _, _ in
+                parameterMapping.removeAll()
+                saveToParameter()
+            }
             
-            Text("执行到此节点时，将挂起当前流程，等待子流程执行完毕后继续。").font(.caption2).foregroundColor(.secondary)
+            Divider()
+            
+            if let targetWf = targetWorkflow {
+                if targetInputs.isEmpty {
+                    Text("💡 该工作流没有定义任何入参 (Inputs)。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else {
+                    Text("参数映射 (Parameter Mapping)")
+                        .font(.headline)
+                    
+                    VStack(spacing: 10) {
+                        ForEach(targetInputs) { inputVar in
+                            HStack {
+                                HStack(spacing: 4) {
+                                    Text(inputVar.name).fontWeight(.medium)
+                                    if inputVar.isRequired { Text("*").foregroundColor(.red) }
+                                }
+                                .frame(width: 100, alignment: .trailing)
+                                
+                                Image(systemName: "arrow.left").foregroundColor(.secondary)
+                                
+                                // [✨防编译器超时] 使用抽离的 binding 方法
+                                TextField("输入值或 {{当前流程变量}}", text: binding(for: inputVar.name))
+                                    .textFieldStyle(.roundedBorder)
+                            }
+                        }
+                    }
+                    .padding(10)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(6)
+                }
+            } else {
+                Text("请先选择一个有效的子工作流。")
+                    .foregroundColor(.secondary)
+                    .font(.caption)
+            }
         }
+        .onAppear(perform: loadFromParameter)
+    }
+    
+    // MARK: - [✨防编译器超时] 抽离字典 Binding 的生成
+    private func binding(for key: String) -> Binding<String> {
+        Binding<String>(
+            get: { self.parameterMapping[key] ?? "" },
+            set: { newValue in
+                self.parameterMapping[key] = newValue
+                self.saveToParameter()
+            }
+        )
+    }
+    
+    private func loadFromParameter() {
+        let parts = action.parameter.components(separatedBy: "|")
+        if let idStr = parts.first, let uuid = UUID(uuidString: idStr) {
+            self.selectedTargetID = uuid
+        }
+        if parts.count > 1 {
+            let jsonStr = parts[1]
+            if let data = jsonStr.data(using: .utf8),
+               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+                self.parameterMapping = dict
+            }
+        }
+    }
+    
+    private func saveToParameter() {
+        guard let targetId = selectedTargetID else { action.parameter = ""; return }
+        var result = "\(targetId.uuidString)"
+        if !parameterMapping.isEmpty {
+            if let jsonData = try? JSONSerialization.data(withJSONObject: parameterMapping),
+               let jsonStr = String(data: jsonData, encoding: .utf8) {
+                result += "|\(jsonStr)"
+            }
+        }
+        action.parameter = result
     }
 }
 
@@ -987,6 +1063,7 @@ struct NotificationEditor: View {
                         Picker("", selection: updateBinding(index: 2, defaultVal: "banner")) {
                             Text("消息横幅 (后台闪过，不阻塞)").tag("banner")
                             Text("系统弹窗 (暂停流程，等待点击)").tag("dialog")
+                            Text("科技悬浮窗 (HUD)").tag("hud")
                         }
                         .labelsHidden()
                         .frame(width: 220)
@@ -2307,6 +2384,7 @@ struct OCRExtractEditor: View {
 /// 提供独立大模型对话能力，支持角色扮演与文本推理，并将结果持久化至变量
 struct AIChatEditor: View {
     @Binding var action: RPAAction
+    @State private var showHUD = true
     
     var body: some View {
         // 参数格式约定: systemPrompt | targetVar | userPrompt
@@ -2360,6 +2438,179 @@ struct AIChatEditor: View {
                 ))
                 .textFieldStyle(.roundedBorder)
             }
+            
+            Toggle("在屏幕中央实时显示 AI 思考过程 (科技感悬浮窗)", isOn: $showHUD)
+                .padding(.top, 4)
+        }
+    }
+}
+
+
+// MARK: - 工作流配置相关
+
+// MARK: - [✨修复] 工作流全局属性与变量设置面板
+struct WorkflowPropertiesView: View {
+    @Binding var workflow: Workflow
+    let allWorkflows: [Workflow]
+    @Environment(\.dismiss) var dismiss
+    
+    @State private var selectedTab = 0
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("", selection: $selectedTab) {
+                Text("I/O 变量管理").tag(0)
+                Text("调度与容错").tag(1)
+            }
+            .pickerStyle(.segmented)
+            .padding()
+            
+            Divider()
+            
+            Group {
+                if selectedTab == 0 {
+                    variablesTab
+                } else {
+                    advancedTab
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            
+            Divider()
+            
+            HStack {
+                Spacer()
+                Button("完成") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+                    .controlSize(.large)
+            }
+            .padding()
+        }
+        .frame(width: 600, height: 450)
+    }
+    
+    private var variablesTab: some View {
+        VStack(alignment: .leading) {
+            HStack {
+                Text("流程变量定义").font(.headline)
+                Spacer()
+                Button(action: addVariable) {
+                    Label("添加变量", systemImage: "plus")
+                }
+            }
+            .padding(.horizontal)
+            .padding(.top)
+            
+            List {
+                ForEach($workflow.variables) { $variable in
+                    VariableEditRow(variable: $variable)
+                        .padding(.vertical, 4)
+                }
+                .onDelete { indices in
+                    workflow.variables.remove(atOffsets: indices)
+                }
+            }
+            .listStyle(.inset(alternatesRowBackgrounds: true))
+        }
+    }
+    
+    private var advancedTab: some View {
+        Form {
+            Section {
+                Text("异常兜底 (Error Handling)")
+                    .font(.headline)
+                    .foregroundColor(.secondary)
+                
+                Picker("全局失败触发:", selection: $workflow.onErrorWorkflowID) {
+                    Text("无 (直接中断报错)").tag(UUID?.none)
+                    Divider()
+                    ForEach(allWorkflows.filter { $0.id != workflow.id }) { wf in
+                        Text(wf.name).tag(UUID?.some(wf.id))
+                    }
+                }
+                .help("当本流程中任何节点执行失败时，将自动挂起并触发此兜底工作流。")
+            }
+            
+            Divider().padding(.vertical, 8)
+            
+            Section {
+                Text("自动化调度 (Automation)")
+                    .font(.headline)
+                    .foregroundColor(.secondary)
+                
+                TextField("Cron 定时表达式:", text: cronBinding)
+                    .textFieldStyle(.roundedBorder)
+                    .help("例如 '0 9 * * *' 表示每天上午 9 点执行。留空则表示不启用定时任务。")
+                
+                TextField("外部调用 URL Scheme:", text: triggerURLBinding)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(true)
+                    .help("外部程序可通过 linrpa://run?id=\(workflow.id.uuidString) 触发此流程。")
+            }
+        }
+        .padding()
+    }
+    
+    private func addVariable() {
+        let newVar = RPAVariable(name: "new_var_\(workflow.variables.count + 1)")
+        workflow.variables.append(newVar)
+    }
+    
+    // MARK: - [✨防编译器超时] 抽离独立的 Binding
+    private var cronBinding: Binding<String> {
+        Binding<String>(
+            get: { self.workflow.cronExpression ?? "" },
+            set: { self.workflow.cronExpression = $0.isEmpty ? nil : $0 }
+        )
+    }
+    
+    private var triggerURLBinding: Binding<String> {
+        Binding<String>(
+            get: { self.workflow.triggerURLPath ?? self.workflow.id.uuidString },
+            set: { self.workflow.triggerURLPath = $0.isEmpty ? nil : $0 }
+        )
+    }
+}
+
+// 变量编辑单行组件
+struct VariableEditRow: View {
+    @Binding var variable: RPAVariable
+    
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack {
+                TextField("变量名", text: $variable.name)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 120)
+                
+                Picker("", selection: $variable.type) {
+                    ForEach(VariableType.allCases, id: \.self) { type in
+                        Text(type.rawValue).tag(type)
+                    }
+                }
+                .frame(width: 80)
+                
+                if variable.isSecure {
+                    SecureField("默认值 (掩码)", text: $variable.defaultValue)
+                        .textFieldStyle(.roundedBorder)
+                } else {
+                    TextField("默认值/测试值", text: $variable.defaultValue)
+                        .textFieldStyle(.roundedBorder)
+                }
+            }
+            
+            HStack(spacing: 16) {
+                Toggle("作为入参 (Input)", isOn: $variable.isInput)
+                if variable.isInput {
+                    Toggle("必填", isOn: $variable.isRequired)
+                }
+                Toggle("作为出参 (Output)", isOn: $variable.isOutput)
+                Toggle("安全掩码 (Secure)", isOn: $variable.isSecure)
+                    .toggleStyle(.switch)
+                    .tint(.red)
+                Spacer()
+            }
+            .font(.caption)
         }
     }
 }
